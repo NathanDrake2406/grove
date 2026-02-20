@@ -67,6 +67,298 @@ mod tests {
     use std::cmp::Ordering;
     use uuid::Uuid;
 
+    // ── Property-based tests ──────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // ── Strategies ────────────────────────────────────────────────────────
+
+        fn arb_hunk() -> impl Strategy<Value = Hunk> {
+            // new_lines=0 produces zero-length hunks (edge case to cover)
+            (0u32..10_000u32, 0u32..500u32, 0u32..10_000u32, 0u32..500u32).prop_map(
+                |(old_start, old_lines, new_start, new_lines)| Hunk {
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                },
+            )
+        }
+
+        fn arb_change_type() -> impl Strategy<Value = ChangeType> {
+            prop_oneof![
+                Just(ChangeType::Added),
+                Just(ChangeType::Modified),
+                Just(ChangeType::Deleted),
+                Just(ChangeType::Renamed),
+            ]
+        }
+
+        fn arb_file_change_for_path(path: PathBuf) -> impl Strategy<Value = FileChange> {
+            (
+                arb_change_type(),
+                prop::collection::vec(arb_hunk(), 0..6),
+            )
+                .prop_map(move |(change_type, hunks)| FileChange {
+                    path: path.clone(),
+                    change_type,
+                    hunks,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                })
+        }
+
+        fn make_cs(files: Vec<FileChange>) -> WorkspaceChangeset {
+            WorkspaceChangeset {
+                workspace_id: uuid::Uuid::new_v4(),
+                merge_base: "prop".into(),
+                changed_files: files,
+                commits_ahead: 1,
+                commits_behind: 0,
+            }
+        }
+
+        // ── Property: file_overlap is commutative ─────────────────────────────
+        //
+        // The set of overlapping file paths must be identical regardless of
+        // argument order. We compare normalized (path, min_change, max_change)
+        // tuples to handle field swapping.
+        proptest! {
+            #[test]
+            fn prop_file_overlap_is_commutative(
+                fc_a in arb_file_change_for_path(PathBuf::from("src/shared.ts")),
+                fc_b in arb_file_change_for_path(PathBuf::from("src/shared.ts")),
+                fc_only_a in arb_file_change_for_path(PathBuf::from("src/only_a.ts")),
+                fc_only_b in arb_file_change_for_path(PathBuf::from("src/only_b.ts")),
+            ) {
+                let cs_a = make_cs(vec![fc_a, fc_only_a]);
+                let cs_b = make_cs(vec![fc_b, fc_only_b]);
+
+                fn rank(ct: ChangeType) -> u8 {
+                    match ct {
+                        ChangeType::Added    => 0,
+                        ChangeType::Modified => 1,
+                        ChangeType::Deleted  => 2,
+                        ChangeType::Renamed  => 3,
+                    }
+                }
+                fn normalize(o: &Overlap) -> (PathBuf, u8, u8) {
+                    match o {
+                        Overlap::File { path, a_change, b_change } => {
+                            let ra = rank(*a_change);
+                            let rb = rank(*b_change);
+                            (path.clone(), ra.min(rb), ra.max(rb))
+                        }
+                        _ => panic!("unexpected overlap variant"),
+                    }
+                }
+
+                let mut left: Vec<_> = compute_file_overlaps(&cs_a, &cs_b)
+                    .iter().map(normalize).collect();
+                let mut right: Vec<_> = compute_file_overlaps(&cs_b, &cs_a)
+                    .iter().map(normalize).collect();
+                left.sort();
+                right.sort();
+
+                prop_assert_eq!(&left, &right,
+                    "file_overlap must be commutative: left={:?} right={:?}", left, right);
+            }
+        }
+
+        // ── Property: hunk_overlap distance is commutative ────────────────────
+        //
+        // compute_hunk_overlaps(a, b) and compute_hunk_overlaps(b, a) must
+        // produce the same set of (path, distance) pairs after normalizing
+        // range order. Crucially, no panic must occur for any input.
+        proptest! {
+            #[test]
+            fn prop_hunk_overlap_is_commutative(
+                hunks_a in prop::collection::vec(arb_hunk(), 0..5),
+                hunks_b in prop::collection::vec(arb_hunk(), 0..5),
+                threshold in 0u32..50u32,
+            ) {
+                let cs_a = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/shared.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: hunks_a,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+                let cs_b = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/shared.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: hunks_b,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+
+                fn key(o: &Overlap) -> (std::path::PathBuf, u32, u32, u32, u32, u32) {
+                    match o {
+                        Overlap::Hunk { path, a_range, b_range, distance } => {
+                            let mut ranges = [
+                                (a_range.start, a_range.end),
+                                (b_range.start, b_range.end),
+                            ];
+                            ranges.sort();
+                            (path.clone(), *distance, ranges[0].0, ranges[0].1, ranges[1].0, ranges[1].1)
+                        }
+                        _ => panic!("unexpected overlap variant"),
+                    }
+                }
+
+                let mut left: Vec<_> = compute_hunk_overlaps(&cs_a, &cs_b, threshold)
+                    .iter().map(key).collect();
+                let mut right: Vec<_> = compute_hunk_overlaps(&cs_b, &cs_a, threshold)
+                    .iter().map(key).collect();
+                left.sort();
+                right.sort();
+
+                prop_assert_eq!(&left, &right,
+                    "hunk_overlap must be commutative for threshold={}", threshold);
+            }
+        }
+
+        // ── Property: zero-length hunks never panic ───────────────────────────
+        //
+        // Hunks with new_lines=0 represent pure deletions. The distance
+        // computation must handle them gracefully (no overflow, no panic).
+        proptest! {
+            #[test]
+            fn prop_zero_length_hunks_do_not_panic(
+                start_a in 0u32..50_000u32,
+                start_b in 0u32..50_000u32,
+                threshold in 0u32..100u32,
+            ) {
+                let zero_hunk_a = Hunk {
+                    old_start: start_a,
+                    old_lines: 1,
+                    new_start: start_a,
+                    new_lines: 0, // zero-length
+                };
+                let zero_hunk_b = Hunk {
+                    old_start: start_b,
+                    old_lines: 1,
+                    new_start: start_b,
+                    new_lines: 0, // zero-length
+                };
+
+                let cs_a = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/zero.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: vec![zero_hunk_a],
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+                let cs_b = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/zero.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: vec![zero_hunk_b],
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+
+                // Must not panic — we don't assert specific counts,
+                // only that the call completes without panicking.
+                let _ = compute_hunk_overlaps(&cs_a, &cs_b, threshold);
+                let _ = compute_hunk_overlaps(&cs_b, &cs_a, threshold);
+            }
+        }
+
+        // ── Property: hunk_overlap is monotone with threshold ─────────────────
+        //
+        // A strictly larger proximity threshold must produce a superset of
+        // overlaps compared to a smaller threshold (superset, not necessarily
+        // strict superset — equal is fine when nothing is in between).
+        proptest! {
+            #[test]
+            fn prop_hunk_overlap_threshold_monotone(
+                hunks_a in prop::collection::vec(arb_hunk(), 1..4),
+                hunks_b in prop::collection::vec(arb_hunk(), 1..4),
+                small_threshold in 0u32..20u32,
+                extra in 0u32..20u32,
+            ) {
+                let large_threshold = small_threshold + extra;
+
+                fn key(o: &Overlap) -> (u32, u32, u32, u32, u32) {
+                    match o {
+                        Overlap::Hunk { a_range, b_range, distance, .. } => {
+                            let mut ranges = [
+                                (a_range.start, a_range.end),
+                                (b_range.start, b_range.end),
+                            ];
+                            ranges.sort();
+                            (*distance, ranges[0].0, ranges[0].1, ranges[1].0, ranges[1].1)
+                        }
+                        _ => panic!("unexpected overlap variant"),
+                    }
+                }
+
+                let cs_a = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/mono.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: hunks_a,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+                let cs_b = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/mono.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: hunks_b,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+
+                let small_set: std::collections::HashSet<_> =
+                    compute_hunk_overlaps(&cs_a, &cs_b, small_threshold)
+                        .iter().map(key).collect();
+                let large_set: std::collections::HashSet<_> =
+                    compute_hunk_overlaps(&cs_a, &cs_b, large_threshold)
+                        .iter().map(key).collect();
+
+                prop_assert!(small_set.is_subset(&large_set),
+                    "threshold={small_threshold} overlaps must be a subset of \
+                     threshold={large_threshold} overlaps");
+            }
+        }
+
+        // ── Property: no overlaps when file sets are disjoint ─────────────────
+        proptest! {
+            #[test]
+            fn prop_no_overlap_for_disjoint_files(
+                hunks_a in prop::collection::vec(arb_hunk(), 0..5),
+                hunks_b in prop::collection::vec(arb_hunk(), 0..5),
+                threshold in 0u32..100u32,
+            ) {
+                let cs_a = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/only_a.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: hunks_a,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+                let cs_b = make_cs(vec![FileChange {
+                    path: PathBuf::from("src/only_b.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: hunks_b,
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                }]);
+
+                let file_overlaps = compute_file_overlaps(&cs_a, &cs_b);
+                let hunk_overlaps = compute_hunk_overlaps(&cs_a, &cs_b, threshold);
+
+                prop_assert!(file_overlaps.is_empty(),
+                    "disjoint files must produce no file overlaps");
+                prop_assert!(hunk_overlaps.is_empty(),
+                    "disjoint files must produce no hunk overlaps, \
+                     got {} at threshold={threshold}", hunk_overlaps.len());
+            }
+        }
+    } // mod prop_tests
+
     fn make_changeset(files: Vec<FileChange>) -> WorkspaceChangeset {
         WorkspaceChangeset {
             workspace_id: Uuid::new_v4(),

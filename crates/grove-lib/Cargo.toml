@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = "1"

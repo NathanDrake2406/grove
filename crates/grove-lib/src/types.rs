@@ -256,6 +256,224 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    // ── Property-based tests ──────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // ── Strategy: arbitrary LineRange ─────────────────────────────────────
+
+        fn arb_line_range() -> impl Strategy<Value = LineRange> {
+            // start in 0..u32::MAX/2 so start+width cannot overflow
+            (0u32..2_000_000_000u32).prop_flat_map(|start| {
+                (0u32..100_000u32).prop_map(move |width| LineRange {
+                    start,
+                    end: start + width,
+                })
+            })
+        }
+
+        // ── Property: LineRange::overlaps is commutative ──────────────────────
+        //
+        // For any two ranges a and b, a.overlaps(b) == b.overlaps(a).
+        // This is a fundamental semantic requirement: conflict is symmetric.
+        proptest! {
+            #[test]
+            fn prop_overlaps_is_commutative(
+                a in arb_line_range(),
+                b in arb_line_range(),
+            ) {
+                prop_assert_eq!(a.overlaps(&b), b.overlaps(&a),
+                    "overlaps must be commutative: \
+                     ({},{}).overlaps({},{}) = {} but reverse = {}",
+                    a.start, a.end, b.start, b.end,
+                    a.overlaps(&b), b.overlaps(&a));
+            }
+        }
+
+        // ── Property: LineRange::distance is commutative ──────────────────────
+        //
+        // For any two ranges, distance(a, b) == distance(b, a).
+        proptest! {
+            #[test]
+            fn prop_distance_is_commutative(
+                a in arb_line_range(),
+                b in arb_line_range(),
+            ) {
+                prop_assert_eq!(a.distance(&b), b.distance(&a),
+                    "distance must be commutative: \
+                     dist({},{},{},{}) = {} but dist({},{},{},{}) = {}",
+                    a.start, a.end, b.start, b.end, a.distance(&b),
+                    b.start, b.end, a.start, a.end, b.distance(&a));
+            }
+        }
+
+        // ── Property: overlapping ranges have distance 0 ──────────────────────
+        //
+        // If two ranges overlap (share at least one line), their distance
+        // must be exactly 0. This ties the two methods together.
+        proptest! {
+            #[test]
+            fn prop_overlapping_ranges_have_distance_zero(
+                a in arb_line_range(),
+                b in arb_line_range(),
+            ) {
+                if a.overlaps(&b) {
+                    prop_assert_eq!(a.distance(&b), 0,
+                        "overlapping ranges ({},{}) and ({},{}) must have distance 0, \
+                         got {}", a.start, a.end, b.start, b.end, a.distance(&b));
+                }
+            }
+        }
+
+        // ── Property: non-overlapping ranges have positive distance ───────────
+        //
+        // If two ranges do NOT overlap, their distance must be strictly > 0.
+        proptest! {
+            #[test]
+            fn prop_non_overlapping_ranges_have_positive_distance(
+                a in arb_line_range(),
+                b in arb_line_range(),
+            ) {
+                if !a.overlaps(&b) {
+                    prop_assert!(a.distance(&b) > 0,
+                        "non-overlapping ranges ({},{}) and ({},{}) must have distance > 0, \
+                         got {}", a.start, a.end, b.start, b.end, a.distance(&b));
+                }
+            }
+        }
+
+        // ── Property: a range always overlaps itself ──────────────────────────
+        //
+        // Reflexivity: any well-formed range overlaps with itself, and the
+        // self-distance is always 0.
+        proptest! {
+            #[test]
+            fn prop_range_overlaps_itself(a in arb_line_range()) {
+                prop_assert!(a.overlaps(&a),
+                    "a range ({},{}) must overlap itself", a.start, a.end);
+                prop_assert_eq!(a.distance(&a), 0,
+                    "self-distance of ({},{}) must be 0", a.start, a.end);
+            }
+        }
+
+        // ── Property: distance is non-negative (no underflow) ─────────────────
+        //
+        // Since distance returns u32, underflow would wrap. We verify that
+        // large/edge values do not produce obviously wrong results.
+        proptest! {
+            #[test]
+            fn prop_distance_no_underflow(
+                a in arb_line_range(),
+                b in arb_line_range(),
+            ) {
+                // Both directions must produce the same non-overflowing u32.
+                // If they're equal and large, subtraction could underflow;
+                // the impl must use saturating_sub or the overlap check.
+                let d_ab = a.distance(&b);
+                let d_ba = b.distance(&a);
+                prop_assert_eq!(d_ab, d_ba,
+                    "distance must not underflow: d({},{},{},{})={} d_rev={}",
+                    a.start, a.end, b.start, b.end, d_ab, d_ba);
+            }
+        }
+
+        // ── Property: extreme u32 boundary values do not panic ────────────────
+        //
+        // Ranges touching u32::MAX must be handled without overflow or panic.
+        proptest! {
+            #[test]
+            fn prop_extreme_values_do_not_panic(
+                start_a in (u32::MAX - 100)..=u32::MAX,
+                end_offset_a in 0u32..=0u32,  // end = start to avoid overflow
+                start_b in 0u32..100u32,
+            ) {
+                let a = LineRange { start: start_a, end: start_a.saturating_add(end_offset_a) };
+                let b = LineRange { start: start_b, end: start_b + 10 };
+                // Must not panic
+                let _ = a.overlaps(&b);
+                let _ = b.overlaps(&a);
+                let _ = a.distance(&b);
+                let _ = b.distance(&a);
+            }
+        }
+
+        // ── Property: OrthogonalityScore ordering is transitive ───────────────
+        //
+        // Green < Yellow < Red < Black must hold transitively: if a < b and
+        // b < c, then a < c.
+        proptest! {
+            #[test]
+            fn prop_orthogonality_score_ordering_transitive(
+                a_idx in 0usize..4usize,
+                b_idx in 0usize..4usize,
+                c_idx in 0usize..4usize,
+            ) {
+                let scores = [
+                    OrthogonalityScore::Green,
+                    OrthogonalityScore::Yellow,
+                    OrthogonalityScore::Red,
+                    OrthogonalityScore::Black,
+                ];
+                let a = scores[a_idx];
+                let b = scores[b_idx];
+                let c = scores[c_idx];
+
+                if a < b && b < c {
+                    prop_assert!(a < c,
+                        "transitivity violated: {:?} < {:?} and {:?} < {:?} but not {:?} < {:?}",
+                        a, b, b, c, a, c);
+                }
+            }
+        }
+
+        // ── Property: Overlap::severity always returns a valid score ──────────
+        //
+        // The severity method must return one of the four valid score values
+        // for any well-formed Overlap variant.
+        proptest! {
+            #[test]
+            fn prop_overlap_severity_always_valid(
+                distance in 0u32..10_000u32,
+            ) {
+                let valid = [
+                    OrthogonalityScore::Green,
+                    OrthogonalityScore::Yellow,
+                    OrthogonalityScore::Red,
+                    OrthogonalityScore::Black,
+                ];
+
+                let file_overlap = Overlap::File {
+                    path: PathBuf::from("a.ts"),
+                    a_change: ChangeType::Modified,
+                    b_change: ChangeType::Added,
+                };
+                prop_assert!(valid.contains(&file_overlap.severity()),
+                    "File overlap severity must be a valid score");
+
+                let hunk_overlap = Overlap::Hunk {
+                    path: PathBuf::from("a.ts"),
+                    a_range: LineRange { start: 1, end: 5 },
+                    b_range: LineRange { start: 10, end: 15 },
+                    distance,
+                };
+                prop_assert!(valid.contains(&hunk_overlap.severity()),
+                    "Hunk overlap severity must be a valid score");
+
+                let sym_overlap = Overlap::Symbol {
+                    path: PathBuf::from("a.ts"),
+                    symbol_name: "fn".into(),
+                    a_modification: "a".into(),
+                    b_modification: "b".into(),
+                };
+                prop_assert!(valid.contains(&sym_overlap.severity()),
+                    "Symbol overlap severity must be a valid score");
+            }
+        }
+    } // mod prop_tests
+
     #[test]
     fn line_range_overlaps_when_intersecting() {
         let a = LineRange { start: 10, end: 30 };

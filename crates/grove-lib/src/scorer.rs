@@ -95,6 +95,318 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    // ── Property-based tests ──────────────────────────────────────────────────
+    //
+    // These use proptest to verify invariants that must hold for all possible
+    // WorkspaceChangeset inputs, not just the hand-crafted cases above.
+
+    #[cfg(test)]
+    mod prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // ── Strategies ────────────────────────────────────────────────────────
+
+        fn arb_line_range() -> impl Strategy<Value = LineRange> {
+            (0u32..10_000u32).prop_flat_map(|start| {
+                (0u32..500u32).prop_map(move |width| LineRange {
+                    start,
+                    end: start + width,
+                })
+            })
+        }
+
+        fn arb_hunk() -> impl Strategy<Value = Hunk> {
+            (0u32..5_000u32, 0u32..200u32, 0u32..5_000u32, 0u32..200u32).prop_map(
+                |(old_start, old_lines, new_start, new_lines)| Hunk {
+                    old_start,
+                    old_lines,
+                    new_start,
+                    new_lines,
+                },
+            )
+        }
+
+        fn arb_symbol_kind() -> impl Strategy<Value = SymbolKind> {
+            prop_oneof![
+                Just(SymbolKind::Function),
+                Just(SymbolKind::Class),
+                Just(SymbolKind::Interface),
+                Just(SymbolKind::TypeAlias),
+                Just(SymbolKind::Enum),
+                Just(SymbolKind::Constant),
+                Just(SymbolKind::Variable),
+                Just(SymbolKind::Method),
+            ]
+        }
+
+        fn arb_symbol(name: impl Strategy<Value = String>) -> impl Strategy<Value = Symbol> {
+            (name, arb_symbol_kind(), arb_line_range()).prop_map(|(n, kind, range)| Symbol {
+                name: n,
+                kind,
+                range,
+                signature: None,
+            })
+        }
+
+        fn arb_change_type() -> impl Strategy<Value = ChangeType> {
+            prop_oneof![
+                Just(ChangeType::Added),
+                Just(ChangeType::Modified),
+                Just(ChangeType::Deleted),
+                Just(ChangeType::Renamed),
+            ]
+        }
+
+        fn arb_file_path() -> impl Strategy<Value = PathBuf> {
+            prop_oneof![
+                Just(PathBuf::from("src/shared.ts")),
+                Just(PathBuf::from("src/auth.ts")),
+                Just(PathBuf::from("src/payment.ts")),
+                Just(PathBuf::from("src/utils.ts")),
+            ]
+        }
+
+        fn arb_symbol_name() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("processPayment".to_string()),
+                Just("authenticate".to_string()),
+                Just("formatUser".to_string()),
+                Just("DataStore".to_string()),
+            ]
+        }
+
+        fn arb_file_change_for(path: PathBuf) -> impl Strategy<Value = FileChange> {
+            (
+                arb_change_type(),
+                prop::collection::vec(arb_hunk(), 0..4),
+                prop::collection::vec(arb_symbol(arb_symbol_name()), 0..3),
+            )
+                .prop_map(move |(change_type, hunks, symbols_modified)| FileChange {
+                    path: path.clone(),
+                    change_type,
+                    hunks,
+                    symbols_modified,
+                    exports_changed: vec![],
+                })
+        }
+
+        // Generates a changeset with *unique* file paths to avoid duplicate-path
+        // ambiguity in the scorer (which uses `Iterator::find` on changed_files).
+        // Duplicate paths in a real changeset are invalid; we produce canonical inputs.
+        fn arb_changeset() -> impl Strategy<Value = WorkspaceChangeset> {
+            // Fixed pool of 4 unique paths; generate 0..=4 distinct entries
+            let paths: [PathBuf; 4] = [
+                PathBuf::from("src/shared.ts"),
+                PathBuf::from("src/auth.ts"),
+                PathBuf::from("src/payment.ts"),
+                PathBuf::from("src/utils.ts"),
+            ];
+
+            // Choose how many files to include (subset of pool by index)
+            (0usize..=4usize).prop_flat_map(move |count| {
+                let chosen_paths: Vec<PathBuf> = paths[..count].to_vec();
+                let strategies: Vec<_> = chosen_paths
+                    .into_iter()
+                    .map(arb_file_change_for)
+                    .collect();
+
+                (
+                    strategies,
+                    0u32..10u32,
+                    0u32..10u32,
+                )
+                    .prop_map(|(changed_files, commits_ahead, commits_behind)| {
+                        WorkspaceChangeset {
+                            workspace_id: Uuid::new_v4(),
+                            merge_base: "abc123".into(),
+                            changed_files,
+                            commits_ahead,
+                            commits_behind,
+                        }
+                    })
+            })
+        }
+
+        fn ts() -> DateTime<Utc> {
+            DateTime::from_timestamp(1_700_000_000, 0).expect("fixed timestamp")
+        }
+
+        // ── Property: score_pair is symmetric ────────────────────────────────
+        //
+        // score_pair(a, b) and score_pair(b, a) must produce the same
+        // OrthogonalityScore for any input pair. The merge_order_hint may
+        // differ (AFirst vs BFirst), but the conflict severity cannot.
+        //
+        // Note: overlap *count* is not required to be symmetric because the
+        // input may have duplicate file paths in `changed_files`, which causes
+        // the Cartesian product of matching entries to differ depending on
+        // which side is `a` vs `b`. The score (max severity) is the invariant.
+        proptest! {
+            #[test]
+            fn prop_score_pair_is_symmetric(a in arb_changeset(), b in arb_changeset()) {
+                let ab = super::super::score_pair(&a, &b, vec![], ts());
+                let ba = super::super::score_pair(&b, &a, vec![], ts());
+                prop_assert_eq!(ab.score, ba.score,
+                    "score_pair must be symmetric: score(a,b)={:?} != score(b,a)={:?}",
+                    ab.score, ba.score);
+            }
+        }
+
+        // ── Property: score is monotone — adding overlaps never decreases it ─
+        //
+        // If we start with a pair's score and then add a dependency overlap,
+        // the resulting score must be >= the original. Scores are ordered:
+        // Green < Yellow < Red < Black.
+        proptest! {
+            #[test]
+            fn prop_adding_dependency_overlap_never_decreases_score(
+                a in arb_changeset(),
+                b in arb_changeset(),
+            ) {
+                let base_score = super::super::score_pair(&a, &b, vec![], ts()).score;
+
+                // A dependency overlap always adds a Black-severity item
+                let dep = vec![Overlap::Dependency {
+                    changed_in: a.workspace_id,
+                    changed_file: PathBuf::from("src/dep.ts"),
+                    changed_export: ExportDelta::Added(Symbol {
+                        name: "newExport".into(),
+                        kind: SymbolKind::Function,
+                        range: LineRange { start: 1, end: 1 },
+                        signature: None,
+                    }),
+                    affected_file: PathBuf::from("src/consumer.ts"),
+                    affected_usage: vec![],
+                }];
+                let higher_score = super::super::score_pair(&a, &b, dep, ts()).score;
+
+                prop_assert!(higher_score >= base_score,
+                    "adding a dependency overlap must not decrease score: \
+                     base={:?} higher={:?}", base_score, higher_score);
+                // With a dependency overlap, the result must be exactly Black
+                prop_assert_eq!(higher_score, OrthogonalityScore::Black,
+                    "dependency overlap must always produce Black score");
+            }
+        }
+
+        // ── Property: score never exceeds Black ───────────────────────────────
+        //
+        // Black is the maximum severity. No combination of inputs should
+        // produce a score that violates the OrthogonalityScore ordering.
+        proptest! {
+            #[test]
+            fn prop_score_never_exceeds_black(
+                a in arb_changeset(),
+                b in arb_changeset(),
+            ) {
+                let result = super::super::score_pair(&a, &b, vec![], ts());
+                prop_assert!(result.score <= OrthogonalityScore::Black,
+                    "score {:?} exceeds Black (maximum)", result.score);
+            }
+        }
+
+        // ── Property: score equals max severity across all overlaps ───────────
+        //
+        // The reported score must exactly equal the maximum severity of
+        // all individual overlaps. An empty overlap list must produce Green.
+        proptest! {
+            #[test]
+            fn prop_score_equals_max_overlap_severity(
+                a in arb_changeset(),
+                b in arb_changeset(),
+            ) {
+                let result = super::super::score_pair(&a, &b, vec![], ts());
+                let expected = result
+                    .overlaps
+                    .iter()
+                    .map(|o| o.severity())
+                    .max()
+                    .unwrap_or(OrthogonalityScore::Green);
+                prop_assert_eq!(result.score, expected,
+                    "score {:?} must equal max overlap severity {:?}",
+                    result.score, expected);
+            }
+        }
+
+        // ── Property: empty changesets always score Green ─────────────────────
+        //
+        // If both workspaces have no changed files, there can be no overlaps,
+        // so the result must always be Green with zero overlaps.
+        proptest! {
+            #[test]
+            fn prop_empty_changesets_score_green(
+                _seed in 0u32..1000u32,
+            ) {
+                let a = WorkspaceChangeset {
+                    workspace_id: Uuid::new_v4(),
+                    merge_base: "abc".into(),
+                    changed_files: vec![],
+                    commits_ahead: 0,
+                    commits_behind: 0,
+                };
+                let b = WorkspaceChangeset {
+                    workspace_id: Uuid::new_v4(),
+                    merge_base: "abc".into(),
+                    changed_files: vec![],
+                    commits_ahead: 0,
+                    commits_behind: 0,
+                };
+                let result = super::super::score_pair(&a, &b, vec![], ts());
+                prop_assert_eq!(result.score, OrthogonalityScore::Green,
+                    "empty changesets must score Green, got {:?}", result.score);
+                prop_assert!(result.overlaps.is_empty(),
+                    "empty changesets must produce no overlaps, got {} overlaps",
+                    result.overlaps.len());
+            }
+        }
+
+        // ── Property: disjoint file sets always score Green ───────────────────
+        //
+        // If worktrees touch completely different files, no file-level,
+        // hunk-level, or symbol-level overlaps are possible.
+        proptest! {
+            #[test]
+            fn prop_disjoint_file_sets_score_green(
+                hunks_a in prop::collection::vec(arb_hunk(), 0..5),
+                hunks_b in prop::collection::vec(arb_hunk(), 0..5),
+            ) {
+                let a = WorkspaceChangeset {
+                    workspace_id: Uuid::new_v4(),
+                    merge_base: "abc".into(),
+                    changed_files: vec![FileChange {
+                        path: PathBuf::from("src/only_a.ts"),
+                        change_type: ChangeType::Modified,
+                        hunks: hunks_a,
+                        symbols_modified: vec![],
+                        exports_changed: vec![],
+                    }],
+                    commits_ahead: 1,
+                    commits_behind: 0,
+                };
+                let b = WorkspaceChangeset {
+                    workspace_id: Uuid::new_v4(),
+                    merge_base: "abc".into(),
+                    changed_files: vec![FileChange {
+                        path: PathBuf::from("src/only_b.ts"),
+                        change_type: ChangeType::Modified,
+                        hunks: hunks_b,
+                        symbols_modified: vec![],
+                        exports_changed: vec![],
+                    }],
+                    commits_ahead: 1,
+                    commits_behind: 0,
+                };
+                let result = super::super::score_pair(&a, &b, vec![], ts());
+                prop_assert_eq!(result.score, OrthogonalityScore::Green,
+                    "disjoint file sets must score Green, got {:?}", result.score);
+                prop_assert!(result.overlaps.is_empty(),
+                    "disjoint file sets must produce no overlaps, got {}: {:?}",
+                    result.overlaps.len(), result.overlaps);
+            }
+        }
+    } // mod prop_tests
+
     fn deterministic_timestamp() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("valid fixed timestamp")
     }
