@@ -249,6 +249,7 @@ impl DaemonState {
                     if reply.send(result).is_err() {
                         debug!("sync reply channel dropped");
                     }
+                    self.dispatch_dirty_workspaces().await;
                     false
                 }
                 StateMessage::AttachWorker { worker_tx } => {
@@ -518,6 +519,13 @@ impl DaemonState {
                 added.push(*id);
             }
             self.handle_register_workspace(ws.clone())?;
+        }
+
+        // Mark all synced workspaces as dirty so the worker runs initial analysis.
+        for id in added.iter().chain(unchanged.iter()) {
+            if !self.dirty_workspaces.contains(id) {
+                self.dirty_workspaces.push(*id);
+            }
         }
 
         let workspaces: Vec<Workspace> = self.workspaces.values().cloned().collect();
