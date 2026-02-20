@@ -65,7 +65,7 @@ pub fn ensure_grove_dir(ctx: &GitContext) -> Result<PathBuf, String> {
     Ok(grove_dir)
 }
 
-fn add_to_git_exclude(grove_dir: &std::path::Path) -> Result<(), String> {
+fn add_to_git_exclude(_grove_dir: &std::path::Path) -> Result<(), String> {
     let exclude_path_output = run_git(&["rev-parse", "--git-path", "info/exclude"])?;
     let exclude_path = PathBuf::from(exclude_path_output.trim());
 
@@ -78,10 +78,10 @@ fn add_to_git_exclude(grove_dir: &std::path::Path) -> Result<(), String> {
     let entry = ".grove/";
 
     // Check if already present
-    if let Ok(contents) = std::fs::read_to_string(&exclude_path) {
-        if contents.lines().any(|line| line.trim() == entry) {
-            return Ok(());
-        }
+    if let Ok(contents) = std::fs::read_to_string(&exclude_path)
+        && contents.lines().any(|line| line.trim() == entry)
+    {
+        return Ok(());
     }
 
     // Append
@@ -173,7 +173,7 @@ pub async fn ensure_daemon(grove_dir: &std::path::Path) -> Result<DaemonClient, 
     Err("daemon failed to start within 3 seconds".to_string())
 }
 
-fn spawn_daemon(grove_dir: &std::path::Path) -> Result<(), String> {
+fn spawn_daemon(_grove_dir: &std::path::Path) -> Result<(), String> {
     let exe =
         std::env::current_exe().map_err(|e| format!("cannot find grove executable: {e}"))?;
 
@@ -188,7 +188,7 @@ fn spawn_daemon(grove_dir: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn derive_name(path: &PathBuf, branch: Option<&str>) -> String {
+fn derive_name(path: &std::path::Path, branch: Option<&str>) -> String {
     match branch {
         Some(b) => b.strip_prefix("refs/heads/").unwrap_or(b).to_string(),
         None => path
