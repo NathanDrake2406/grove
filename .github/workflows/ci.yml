@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  ci:
+    name: CI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # SQLite is compiled from source via `rusqlite/bundled`, so no system
+      # SQLite is required. On Windows, MSVC's link.exe is used; the C toolchain
+      # is pre-installed on GitHub-hosted windows-latest runners.
+
+      - name: Build workspace
+        run: cargo build --workspace
+
+      # grove-daemon and grove-cli use Unix sockets (UnixListener / UnixStream),
+      # which are not available on Windows. Run the full test suite on Unix
+      # platforms; on Windows, exclude the two Unix-socket-dependent crates.
+      - name: Test workspace (Unix)
+        if: runner.os != 'Windows'
+        run: cargo test --workspace
+
+      - name: Test workspace (Windows — grove-lib and grove only)
+        if: runner.os == 'Windows'
+        run: |
+          cargo test -p grove-lib
+          cargo test -p grove
+
+      - name: Clippy (deny warnings)
+        # Clippy is run on all platforms so platform-specific lint regressions
+        # are caught early. Warnings are denied to keep the codebase clean.
+        run: cargo clippy --workspace -- -D warnings
