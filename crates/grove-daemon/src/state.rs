@@ -540,7 +540,11 @@ impl DaemonState {
         let mut still_dirty = Vec::new();
 
         for workspace_id in dirty {
-            if self.dispatch_pairs_for_workspace(workspace_id).await.is_err() {
+            if self
+                .dispatch_pairs_for_workspace(workspace_id)
+                .await
+                .is_err()
+            {
                 still_dirty.push(workspace_id);
             }
         }
@@ -1235,9 +1239,15 @@ mod tests {
         let ws_id = ws.id;
         state.handle_register_workspace(ws).unwrap();
 
-        state.handle_file_changed(ws_id, Path::new("src/a.rs")).await;
-        state.handle_file_changed(ws_id, Path::new("src/b.rs")).await;
-        state.handle_file_changed(ws_id, Path::new("src/c.rs")).await;
+        state
+            .handle_file_changed(ws_id, Path::new("src/a.rs"))
+            .await;
+        state
+            .handle_file_changed(ws_id, Path::new("src/b.rs"))
+            .await;
+        state
+            .handle_file_changed(ws_id, Path::new("src/c.rs"))
+            .await;
 
         assert_eq!(state.dirty_workspaces().len(), 1);
         assert_eq!(state.dirty_workspaces()[0], ws_id);

@@ -4,8 +4,8 @@ use grove_lib::graph::{ImportGraph, compute_dependency_overlaps};
 use grove_lib::languages::LanguageRegistry;
 use grove_lib::scorer;
 use grove_lib::{
-    ChangeType, ExportDelta, ExportedSymbol, FileChange, Hunk, LineRange, OrthogonalityScore,
-    Signature, Symbol, Workspace, WorkspaceChangeset, WorkspacePairAnalysis,
+    ChangeType, ExportDelta, ExportedSymbol, FileChange, Hunk, LineRange, Signature, Symbol,
+    Workspace, WorkspaceChangeset, WorkspacePairAnalysis,
 };
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -48,8 +48,7 @@ pub fn spawn_worker_pool(config: GroveConfig, state_tx: mpsc::Sender<StateMessag
     let worker_count = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(2)
-        .max(1)
-        .min(8);
+        .clamp(1, 8);
 
     let handle = tokio::spawn(async move {
         let semaphore = Arc::new(Semaphore::new(worker_count));
@@ -78,7 +77,11 @@ pub fn spawn_worker_pool(config: GroveConfig, state_tx: mpsc::Sender<StateMessag
     WorkerPool { tx, handle }
 }
 
-async fn process_message(msg: WorkerMessage, config: GroveConfig, state_tx: mpsc::Sender<StateMessage>) {
+async fn process_message(
+    msg: WorkerMessage,
+    config: GroveConfig,
+    state_tx: mpsc::Sender<StateMessage>,
+) {
     match msg {
         WorkerMessage::AnalyzePair {
             workspace_a,
@@ -91,9 +94,17 @@ async fn process_message(msg: WorkerMessage, config: GroveConfig, state_tx: mpsc
             let b_id = workspace_b.id;
             let analysis_config = config.clone();
 
-            let result = timeout(timeout_duration, tokio::task::spawn_blocking(move || {
-                analyze_workspace_pair(&analysis_config, &workspace_a, &workspace_b, &base_graph)
-            }))
+            let result = timeout(
+                timeout_duration,
+                tokio::task::spawn_blocking(move || {
+                    analyze_workspace_pair(
+                        &analysis_config,
+                        &workspace_a,
+                        &workspace_b,
+                        &base_graph,
+                    )
+                }),
+            )
             .await;
 
             match result {
@@ -167,7 +178,10 @@ pub(crate) fn analyze_workspace_pair(
     Ok(analysis)
 }
 
-fn extract_changeset(config: &GroveConfig, workspace: &Workspace) -> Result<WorkspaceChangeset, WorkerError> {
+fn extract_changeset(
+    config: &GroveConfig,
+    workspace: &Workspace,
+) -> Result<WorkspaceChangeset, WorkerError> {
     let base_ref = if workspace.base_ref.is_empty() {
         config.base_branch.as_str()
     } else {
@@ -182,7 +196,12 @@ fn extract_changeset(config: &GroveConfig, workspace: &Workspace) -> Result<Work
 
     let ahead_behind = git_output_line(
         &workspace.path,
-        ["rev-list", "--left-right", "--count", &format!("{base_ref}...HEAD")],
+        [
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{base_ref}...HEAD"),
+        ],
         "rev-list --left-right --count",
     )
     .ok()
@@ -344,7 +363,7 @@ fn parse_unified_diff_hunks(output: &str) -> HashMap<PathBuf, Vec<Hunk>> {
 
     for line in output.lines() {
         if let Some((old_path, new_path)) = parse_diff_header_paths(line) {
-            current_path = if new_path == PathBuf::from("/dev/null") {
+            current_path = if new_path == Path::new("/dev/null") {
                 Some(old_path)
             } else {
                 Some(new_path)
@@ -373,7 +392,10 @@ fn parse_diff_header_paths(line: &str) -> Option<(PathBuf, PathBuf)> {
     let old = tokens.next()?;
     let new = tokens.next()?;
 
-    Some((PathBuf::from(strip_diff_prefix(old)), PathBuf::from(strip_diff_prefix(new))))
+    Some((
+        PathBuf::from(strip_diff_prefix(old)),
+        PathBuf::from(strip_diff_prefix(new)),
+    ))
 }
 
 fn strip_diff_prefix(value: &str) -> &str {
@@ -495,7 +517,10 @@ fn extract_exports(
     analyzer.extract_exports(bytes).unwrap_or_default()
 }
 
-fn compute_export_deltas(old_exports: &[ExportedSymbol], new_exports: &[ExportedSymbol]) -> Vec<ExportDelta> {
+fn compute_export_deltas(
+    old_exports: &[ExportedSymbol],
+    new_exports: &[ExportedSymbol],
+) -> Vec<ExportDelta> {
     let old_by_name: BTreeMap<&str, &ExportedSymbol> = old_exports
         .iter()
         .map(|exported| (exported.name.as_str(), exported))
@@ -637,7 +662,7 @@ pub(crate) fn canonical_pair(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use grove_lib::{MergeOrder, WorkspaceMetadata};
+    use grove_lib::{MergeOrder, OrthogonalityScore, WorkspaceMetadata};
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -778,7 +803,10 @@ mod tests {
         );
         assert!(matches!(
             analysis.merge_order_hint,
-            MergeOrder::AFirst | MergeOrder::BFirst | MergeOrder::NeedsCoordination | MergeOrder::Either
+            MergeOrder::AFirst
+                | MergeOrder::BFirst
+                | MergeOrder::NeedsCoordination
+                | MergeOrder::Either
         ));
     }
 }

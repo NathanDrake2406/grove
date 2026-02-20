@@ -8,15 +8,17 @@ pub mod worker;
 use std::path::Path;
 use std::time::Duration;
 
+use notify::{RecursiveMode, Watcher};
 use thiserror::Error;
-use tracing::info;
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::db::Database;
 use crate::lifecycle::DaemonPaths;
 use crate::socket::SocketServer;
-use crate::state::{GroveConfig, StateMessage};
-use crate::watcher::{Debouncer, WatcherConfig};
+use crate::state::{GroveConfig, QueryRequest, QueryResponse, StateMessage};
+use crate::watcher::{Debouncer, WatchEvent, WatcherConfig};
+use crate::worker::spawn_worker_pool;
 
 /// Errors that can occur during daemon operation.
 #[derive(Debug, Error)]
@@ -29,6 +31,9 @@ pub enum DaemonError {
 
     #[error("socket error: {0}")]
     Socket(#[from] socket::SocketError),
+
+    #[error("watcher error: {0}")]
+    Watcher(#[from] notify::Error),
 }
 
 /// Initialize tracing with stderr output.
@@ -51,7 +56,7 @@ fn init_tracing(_log_path: &Path) {
 /// 3. Initializes tracing
 /// 4. Opens the SQLite database
 /// 5. Starts the state actor
-/// 6. Constructs the watcher debouncer (not yet watching — needs worker pool)
+/// 6. Starts worker pool + filesystem watcher pipeline
 /// 7. Runs the socket server until SIGTERM/SIGINT
 /// 8. Performs graceful shutdown and cleanup
 pub async fn run(config: GroveConfig, grove_dir: &Path) -> Result<(), DaemonError> {
@@ -101,20 +106,32 @@ async fn run_inner(
     let (state_tx, state_handle) = state::spawn_state_actor(config.clone(), Some(db));
     info!("state actor started");
 
-    // Create watcher debouncer (not started yet — needs worker pool integration)
-    // TODO: Wire up filesystem watching once the worker pool is implemented.
-    // The debouncer is ready; it needs a notify::RecommendedWatcher feeding events
-    // into `debouncer.process_event()`, plus a worker pool to dispatch WatchEvents to.
+    let worker_pool = spawn_worker_pool(config.clone(), state_tx.clone());
+    state_tx
+        .send(StateMessage::AttachWorker {
+            worker_tx: worker_pool.sender(),
+        })
+        .await
+        .map_err(|_| socket::SocketError::StateChannelClosed)?;
+    info!("worker pool started");
+
     let watcher_config = WatcherConfig {
         debounce_ms: config.watch_interval_ms,
         circuit_breaker_threshold: config.circuit_breaker_threshold,
         ignore_patterns: config.ignore_patterns.clone(),
         respect_gitignore: config.respect_gitignore,
     };
-    let _debouncer = Debouncer::new(watcher_config);
 
     // Create broadcast channel for coordinating shutdown across subsystems
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let watcher_shutdown_rx = shutdown_tx.subscribe();
+
+    let watcher_handle = tokio::spawn(run_watcher_loop(
+        state_tx.clone(),
+        watcher_config,
+        config.base_branch.clone(),
+        watcher_shutdown_rx,
+    ));
 
     // Create and run socket server
     let server = SocketServer::new(&paths.socket_file, state_tx.clone())
@@ -131,11 +148,12 @@ async fn run_inner(
     let server_run = server.run(shutdown_rx);
     tokio::pin!(server_run);
 
+    let mut socket_error: Option<socket::SocketError> = None;
     tokio::select! {
         result = &mut server_run => {
             if let Err(e) = result {
-                tracing::error!(error = %e, "socket server error");
-                return Err(DaemonError::Socket(e));
+                error!(error = %e, "socket server error");
+                socket_error = Some(e);
             }
         }
         () = lifecycle::shutdown_signal() => {
@@ -146,26 +164,248 @@ async fn run_inner(
             match server_run.await {
                 Ok(()) => {}
                 Err(e) => {
-                    tracing::error!(error = %e, "socket server error");
-                    return Err(DaemonError::Socket(e));
+                    error!(error = %e, "socket server error");
+                    socket_error = Some(e);
                 }
             }
         }
     }
 
+    // Ensure watcher loop exits even if server exited for another reason.
+    let _ = shutdown_tx.send(());
+    match watcher_handle.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "watcher loop exited with error"),
+        Err(e) => warn!(error = %e, "watcher loop task panicked"),
+    }
+
     // Graceful shutdown: tell the state actor to drain and stop
     info!("sending shutdown to state actor");
     if let Err(e) = state_tx.send(StateMessage::Shutdown).await {
-        tracing::warn!(error = %e, "failed to send shutdown to state actor (already stopped?)");
+        warn!(error = %e, "failed to send shutdown to state actor (already stopped?)");
     }
 
     // Wait for the state actor to finish processing
     if let Err(e) = state_handle.await {
-        tracing::warn!(error = %e, "state actor task panicked");
+        warn!(error = %e, "state actor task panicked");
     }
+    worker_pool.shutdown().await;
 
     info!("grove daemon stopped");
+    if let Some(err) = socket_error {
+        return Err(DaemonError::Socket(err));
+    }
+
     Ok(())
+}
+
+async fn run_watcher_loop(
+    state_tx: tokio::sync::mpsc::Sender<StateMessage>,
+    watcher_config: WatcherConfig,
+    base_branch: String,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) -> Result<(), notify::Error> {
+    use std::collections::HashMap;
+
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |result| {
+        let _ = event_tx.send(result);
+    })?;
+
+    let mut debouncer = Debouncer::new(watcher_config);
+    let mut watched_workspaces: HashMap<grove_lib::WorkspaceId, std::path::PathBuf> =
+        HashMap::new();
+    refresh_watched_workspaces(
+        &state_tx,
+        &mut watcher,
+        &mut debouncer,
+        &mut watched_workspaces,
+    )
+    .await;
+
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
+    let mut refresh_interval = tokio::time::interval(Duration::from_secs(2));
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+            maybe_event = event_rx.recv() => {
+                let Some(event_result) = maybe_event else {
+                    break;
+                };
+
+                match event_result {
+                    Ok(event) => {
+                        let mut watch_events = debouncer.process_event(&event);
+                        if !watch_events.is_empty() {
+                            forward_watch_events(
+                                &state_tx,
+                                &watch_events,
+                                &watched_workspaces,
+                                &base_branch,
+                            ).await;
+                            watch_events.clear();
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "watcher event error"),
+                }
+            }
+            _ = flush_interval.tick() => {
+                let watch_events = debouncer.flush_debounced();
+                if !watch_events.is_empty() {
+                    forward_watch_events(&state_tx, &watch_events, &watched_workspaces, &base_branch).await;
+                }
+            }
+            _ = refresh_interval.tick() => {
+                refresh_watched_workspaces(
+                    &state_tx,
+                    &mut watcher,
+                    &mut debouncer,
+                    &mut watched_workspaces,
+                ).await;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn forward_watch_events(
+    state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
+    events: &[WatchEvent],
+    watched_workspaces: &std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf>,
+    base_branch: &str,
+) {
+    for event in events {
+        match event {
+            WatchEvent::FilesChanged {
+                workspace_id,
+                paths,
+            } => {
+                for path in paths {
+                    if let Err(e) = state_tx
+                        .send(StateMessage::FileChanged {
+                            workspace_id: *workspace_id,
+                            path: path.clone(),
+                        })
+                        .await
+                    {
+                        warn!(error = %e, "failed to forward FilesChanged event");
+                        return;
+                    }
+                }
+            }
+            WatchEvent::FullReindexNeeded { workspace_id } => {
+                let fallback_path = watched_workspaces
+                    .get(workspace_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Err(e) = state_tx
+                    .send(StateMessage::FileChanged {
+                        workspace_id: *workspace_id,
+                        path: fallback_path,
+                    })
+                    .await
+                {
+                    warn!(error = %e, "failed to forward FullReindexNeeded event");
+                    return;
+                }
+            }
+            WatchEvent::BaseRefChanged { .. } => {
+                if let Some(commit) = resolve_base_branch_commit(state_tx, base_branch).await
+                    && let Err(e) = state_tx
+                        .send(StateMessage::BaseRefChanged { new_commit: commit })
+                        .await
+                {
+                    warn!(error = %e, "failed to forward BaseRefChanged event");
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn refresh_watched_workspaces(
+    state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
+    watcher: &mut notify::RecommendedWatcher,
+    debouncer: &mut Debouncer,
+    watched_workspaces: &mut std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf>,
+) {
+    use std::collections::HashSet;
+
+    let workspaces = list_workspaces(state_tx).await;
+    let desired: std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf> = workspaces
+        .into_iter()
+        .map(|workspace| (workspace.id, workspace.path))
+        .collect();
+
+    let current_ids: HashSet<_> = watched_workspaces.keys().copied().collect();
+    let desired_ids: HashSet<_> = desired.keys().copied().collect();
+
+    for removed_id in current_ids.difference(&desired_ids) {
+        if let Some(path) = watched_workspaces.remove(removed_id) {
+            if let Err(e) = watcher.unwatch(&path) {
+                warn!(path = %path.display(), error = %e, "failed to unwatch workspace");
+            }
+            debouncer.unregister_worktree(removed_id);
+        }
+    }
+
+    for added_id in desired_ids.difference(&current_ids) {
+        if let Some(path) = desired.get(added_id) {
+            if let Err(e) = watcher.watch(path, RecursiveMode::Recursive) {
+                warn!(path = %path.display(), error = %e, "failed to watch workspace");
+                continue;
+            }
+
+            debouncer.register_worktree(*added_id, path.clone());
+            watched_workspaces.insert(*added_id, path.clone());
+            info!(workspace_id = %added_id, path = %path.display(), "watching workspace");
+        }
+    }
+}
+
+async fn list_workspaces(
+    state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
+) -> Vec<grove_lib::Workspace> {
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    if state_tx
+        .send(StateMessage::Query {
+            request: QueryRequest::ListWorkspaces,
+            reply: reply_tx,
+        })
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+
+    match reply_rx.await {
+        Ok(QueryResponse::Workspaces(workspaces)) => workspaces,
+        _ => Vec::new(),
+    }
+}
+
+async fn resolve_base_branch_commit(
+    state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
+    base_branch: &str,
+) -> Option<String> {
+    let workspaces = list_workspaces(state_tx).await;
+    let repo_path = workspaces.into_iter().next()?.path;
+    let output = std::process::Command::new("git")
+        .current_dir(&repo_path)
+        .args(["rev-parse", base_branch])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let commit = String::from_utf8(output.stdout).ok()?;
+    Some(commit.trim().to_string())
 }
 
 fn write_shutdown_token_file(path: &Path) -> Result<String, lifecycle::LifecycleError> {
