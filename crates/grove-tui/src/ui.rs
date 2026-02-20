@@ -183,57 +183,97 @@ fn render_pair_detail(app: &App, analysis: &WorkspacePairAnalysis, frame: &mut F
         return;
     }
 
-    let mut lines = vec![];
+    // Group overlaps by type.
+    let mut files = vec![];
+    let mut hunks = vec![];
+    let mut symbols = vec![];
+    let mut deps = vec![];
+    let mut schemas = vec![];
 
     for overlap in &analysis.overlaps {
         match overlap {
-            Overlap::File { path, .. } => {
-                lines.push(Line::from(vec![
-                    Span::styled("same file      ", Style::default().fg(Color::Yellow)),
-                    Span::raw(path.to_string_lossy().to_string()),
-                ]));
-            }
-            Overlap::Hunk { path, a_range, distance, .. } => {
-                let color = if *distance == 0 { Color::Red } else { Color::Yellow };
-                lines.push(Line::from(vec![
-                    Span::styled("same lines     ", Style::default().fg(color)),
-                    Span::raw(format!("{}:{}-{}", path.to_string_lossy(), a_range.start, a_range.end)),
-                ]));
-            }
-            Overlap::Symbol { path, symbol_name, .. } => {
-                lines.push(Line::from(vec![
-                    Span::styled("same function  ", Style::default().fg(Color::Red)),
-                    Span::raw(format!("{}() in {}", symbol_name, path.to_string_lossy())),
-                ]));
-            }
-            Overlap::Dependency { changed_file, affected_file, .. } => {
-                lines.push(Line::from(vec![
-                    Span::styled("import chain   ", Style::default().fg(Color::Magenta)),
-                    Span::raw(format!(
-                        "{} -> {}",
-                        changed_file.to_string_lossy(),
-                        affected_file.to_string_lossy()
-                    )),
-                ]));
-            }
-            Overlap::Schema { category, a_file, b_file, detail } => {
-                lines.push(Line::from(vec![
-                    Span::styled("config conflict ", Style::default().fg(Color::Yellow)),
-                    Span::raw(format!(
-                        "[{:?}] {} vs {} ({})",
-                        category,
-                        a_file.to_string_lossy(),
-                        b_file.to_string_lossy(),
-                        detail
-                    )),
-                ]));
-            }
+            Overlap::File { path, .. } => files.push(path),
+            Overlap::Hunk { path, a_range, distance, .. } => hunks.push((path, a_range, *distance)),
+            Overlap::Symbol { path, symbol_name, .. } => symbols.push((path, symbol_name)),
+            Overlap::Dependency { changed_file, affected_file, .. } => deps.push((changed_file, affected_file)),
+            Overlap::Schema { category, a_file, b_file, detail } => schemas.push((category, a_file, b_file, detail)),
         }
+    }
+
+    let mut lines: Vec<Line> = vec![];
+
+    if !files.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Both branches edit the same files:",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+        for path in &files {
+            lines.push(Line::from(format!("  {}", path.to_string_lossy())));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !hunks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Both branches change the same lines:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for (path, range, distance) in &hunks {
+            let color = if *distance == 0 { Color::Red } else { Color::Yellow };
+            lines.push(Line::from(Span::styled(
+                format!("  {}:{}-{}", path.to_string_lossy(), range.start, range.end),
+                Style::default().fg(color),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !symbols.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Both branches modify the same functions:",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        for (path, name) in &symbols {
+            lines.push(Line::from(format!("  {name}() in {}", path.to_string_lossy())));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !deps.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "One branch's changes affect the other's imports:",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        )));
+        for (changed, affected) in &deps {
+            lines.push(Line::from(format!(
+                "  {} \u{2192} {}",
+                changed.to_string_lossy(),
+                affected.to_string_lossy()
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    if !schemas.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "Both branches touch shared config/schemas:",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+        for (category, a_file, b_file, detail) in &schemas {
+            lines.push(Line::from(format!(
+                "  [{:?}] {} vs {} ({})",
+                category,
+                a_file.to_string_lossy(),
+                b_file.to_string_lossy(),
+                detail
+            )));
+        }
+        lines.push(Line::from(""));
     }
 
     let p = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
-    
+
     frame.render_widget(p, area);
 }

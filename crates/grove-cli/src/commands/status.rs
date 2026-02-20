@@ -156,10 +156,8 @@ pub fn format_smart_status(
             .cloned()
             .unwrap_or_default();
 
-        out.push_str(&format!("  [{score}] {name_a} <-> {name_b}\n"));
-        for overlap in &overlaps {
-            out.push_str(&format!("    {}\n", format_overlap_short(overlap)));
-        }
+        out.push_str(&format!("  [{score}] {name_a} <-> {name_b}\n\n"));
+        out.push_str(&format_overlaps_grouped(&overlaps));
         out.push('\n');
     }
 
@@ -182,48 +180,80 @@ fn build_id_name_map(workspaces: &serde_json::Value) -> std::collections::HashMa
     map
 }
 
-/// Format a single overlap as a compact one-liner for the status view.
-fn format_overlap_short(overlap: &serde_json::Value) -> String {
-    if let Some(data) = overlap.get("Symbol") {
-        let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let name = data
-            .get("symbol_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        return format!("same function  {name}() in {path}");
+/// Group overlaps by type and format with section headers.
+fn format_overlaps_grouped(overlaps: &[serde_json::Value]) -> String {
+    let mut files: Vec<String> = Vec::new();
+    let mut hunks: Vec<String> = Vec::new();
+    let mut symbols: Vec<String> = Vec::new();
+    let mut deps: Vec<String> = Vec::new();
+    let mut schemas: Vec<String> = Vec::new();
+
+    for overlap in overlaps {
+        if let Some(data) = overlap.get("File") {
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            files.push(path.to_string());
+        } else if let Some(data) = overlap.get("Hunk") {
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let a_start = data.get("a_range").and_then(|v| v.get("start")).and_then(|v| v.as_u64());
+            let a_end = data.get("a_range").and_then(|v| v.get("end")).and_then(|v| v.as_u64());
+            match (a_start, a_end) {
+                (Some(s), Some(e)) => hunks.push(format!("{path}:{s}-{e}")),
+                _ => hunks.push(path.to_string()),
+            }
+        } else if let Some(data) = overlap.get("Symbol") {
+            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            let name = data.get("symbol_name").and_then(|v| v.as_str()).unwrap_or("?");
+            symbols.push(format!("{name}() in {path}"));
+        } else if let Some(data) = overlap.get("Dependency") {
+            let changed = data.get("changed_file").and_then(|v| v.as_str()).unwrap_or("?");
+            let affected = data.get("affected_file").and_then(|v| v.as_str()).unwrap_or("?");
+            deps.push(format!("{changed} \u{2192} {affected}"));
+        } else if let Some(data) = overlap.get("Schema") {
+            let cat = data.get("category").and_then(|v| v.as_str()).unwrap_or("?");
+            let a_file = data.get("a_file").and_then(|v| v.as_str()).unwrap_or("?");
+            let b_file = data.get("b_file").and_then(|v| v.as_str()).unwrap_or("?");
+            schemas.push(format!("[{cat}] {a_file} vs {b_file}"));
+        }
     }
-    if let Some(data) = overlap.get("Hunk") {
-        let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let a_start = data.get("a_range").and_then(|v| v.get("start")).and_then(|v| v.as_u64());
-        let a_end = data.get("a_range").and_then(|v| v.get("end")).and_then(|v| v.as_u64());
-        return match (a_start, a_end) {
-            (Some(s), Some(e)) => format!("same lines     {path}:{s}-{e}"),
-            _ => format!("same lines     {path}"),
-        };
+
+    let mut out = String::new();
+
+    if !files.is_empty() {
+        out.push_str("    Both branches edit the same files:\n");
+        for f in &files {
+            out.push_str(&format!("      {f}\n"));
+        }
     }
-    if let Some(data) = overlap.get("File") {
-        let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        return format!("same file      {path}");
+
+    if !hunks.is_empty() {
+        out.push_str("    Both branches change the same lines:\n");
+        for h in &hunks {
+            out.push_str(&format!("      {h}\n"));
+        }
     }
-    if let Some(data) = overlap.get("Dependency") {
-        let changed = data
-            .get("changed_file")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let affected = data
-            .get("affected_file")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        return format!("import chain   {changed} -> {affected}");
+
+    if !symbols.is_empty() {
+        out.push_str("    Both branches modify the same functions:\n");
+        for s in &symbols {
+            out.push_str(&format!("      {s}\n"));
+        }
     }
-    if let Some(data) = overlap.get("Schema") {
-        let cat = data
-            .get("category")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        return format!("config conflict [{cat}]");
+
+    if !deps.is_empty() {
+        out.push_str("    One branch's changes affect the other's imports:\n");
+        for d in &deps {
+            out.push_str(&format!("      {d}\n"));
+        }
     }
-    serde_json::to_string(overlap).unwrap_or_default()
+
+    if !schemas.is_empty() {
+        out.push_str("    Both branches touch shared config/schemas:\n");
+        for s in &schemas {
+            out.push_str(&format!("      {s}\n"));
+        }
+    }
+
+    out
 }
 
 fn format_commit(commit: &str) -> &str {
@@ -365,7 +395,8 @@ mod tests {
         let output = format_smart_status(&data, &workspaces, &analyses);
         assert!(output.contains("1 conflict(s)"));
         assert!(output.contains("[Red] feature/auth <-> feature/payment"));
-        assert!(output.contains("same function  updateUser() in src/auth.ts"));
+        assert!(output.contains("Both branches modify the same functions:"));
+        assert!(output.contains("updateUser() in src/auth.ts"));
     }
 
     #[test]
@@ -388,26 +419,38 @@ mod tests {
     }
 
     #[test]
-    fn format_overlap_short_all_variants() {
-        assert_eq!(
-            format_overlap_short(&serde_json::json!({"File": {"path": "a.ts"}})),
-            "same file      a.ts"
-        );
-        assert_eq!(
-            format_overlap_short(&serde_json::json!({"Hunk": {"path": "b.ts"}})),
-            "same lines     b.ts"
-        );
-        assert_eq!(
-            format_overlap_short(&serde_json::json!({"Symbol": {"path": "c.ts", "symbol_name": "foo"}})),
-            "same function  foo() in c.ts"
-        );
-        assert_eq!(
-            format_overlap_short(&serde_json::json!({"Dependency": {"changed_file": "a.ts", "affected_file": "b.ts"}})),
-            "import chain   a.ts -> b.ts"
-        );
-        assert_eq!(
-            format_overlap_short(&serde_json::json!({"Schema": {"category": "Migration"}})),
-            "config conflict [Migration]"
-        );
+    fn format_overlaps_grouped_separates_by_type() {
+        let overlaps = vec![
+            serde_json::json!({"File": {"path": "src/auth.ts"}}),
+            serde_json::json!({"Symbol": {"path": "src/auth.ts", "symbol_name": "login"}}),
+            serde_json::json!({"File": {"path": "src/utils.ts"}}),
+            serde_json::json!({"Dependency": {"changed_file": "src/db.ts", "affected_file": "src/auth.ts"}}),
+        ];
+        let output = format_overlaps_grouped(&overlaps);
+
+        // Files grouped together
+        assert!(output.contains("Both branches edit the same files:"));
+        assert!(output.contains("      src/auth.ts\n"));
+        assert!(output.contains("      src/utils.ts\n"));
+
+        // Symbols in their own section
+        assert!(output.contains("Both branches modify the same functions:"));
+        assert!(output.contains("      login() in src/auth.ts\n"));
+
+        // Deps in their own section
+        assert!(output.contains("One branch's changes affect the other's imports:"));
+        assert!(output.contains("src/db.ts"));
+    }
+
+    #[test]
+    fn format_overlaps_grouped_omits_empty_sections() {
+        let overlaps = vec![
+            serde_json::json!({"Hunk": {"path": "a.ts", "a_range": {"start": 10, "end": 20}}}),
+        ];
+        let output = format_overlaps_grouped(&overlaps);
+        assert!(output.contains("Both branches change the same lines:"));
+        assert!(output.contains("a.ts:10-20"));
+        assert!(!output.contains("same files"));
+        assert!(!output.contains("same functions"));
     }
 }
