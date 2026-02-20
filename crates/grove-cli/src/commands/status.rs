@@ -70,6 +70,89 @@ pub fn format_status_output(data: &serde_json::Value) -> String {
     out
 }
 
+/// Format a smart status view combining workspace list, conflicts, and merge guidance.
+pub fn format_smart_status(
+    data: &serde_json::Value,
+    workspaces: &serde_json::Value,
+    analyses: &serde_json::Value,
+) -> String {
+    let workspace_count = data
+        .get("workspace_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let base_commit = data
+        .get("base_commit")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(none)");
+
+    let mut out = String::new();
+    out.push_str("Grove Status\n");
+    out.push_str(&"\u{2500}".repeat(50));
+    out.push('\n');
+    out.push_str(&format!(
+        "  {} worktrees  |  base: {}\n",
+        workspace_count,
+        format_commit(base_commit)
+    ));
+    out.push('\n');
+
+    // List worktrees
+    if let Some(ws_array) = workspaces.as_array() {
+        out.push_str("  Worktrees:\n");
+        for ws in ws_array {
+            let name = ws.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("    - {name}\n"));
+        }
+        out.push('\n');
+    }
+
+    // Show conflicts or "clean"
+    let has_conflicts = analyses
+        .as_array()
+        .map(|arr| {
+            arr.iter().any(|a| {
+                let score = a.get("score").and_then(|v| v.as_str()).unwrap_or("Green");
+                score != "Green"
+            })
+        })
+        .unwrap_or(false);
+
+    if has_conflicts {
+        out.push_str("  Conflicts:\n");
+        if let Some(arr) = analyses.as_array() {
+            for analysis in arr {
+                let score = analysis
+                    .get("score")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                if score == "Green" {
+                    continue;
+                }
+                let ws_a = analysis
+                    .get("workspace_a")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let ws_b = analysis
+                    .get("workspace_b")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let overlap_count = analysis
+                    .get("overlaps")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                out.push_str(&format!(
+                    "    [{score}] {ws_a} <-> {ws_b} ({overlap_count} overlaps)\n"
+                ));
+            }
+        }
+    } else {
+        out.push_str("  All worktrees clean \u{2014} no conflicts detected.\n");
+    }
+
+    out
+}
+
 fn format_commit(commit: &str) -> &str {
     if commit.is_empty() {
         "(none)"
@@ -169,5 +252,44 @@ mod tests {
     #[should_panic]
     fn format_commit_panics_when_truncating_unicode_mid_codepoint() {
         let _ = format_commit("你好你好你好");
+    }
+
+    #[test]
+    fn format_smart_status_all_clean() {
+        let data = serde_json::json!({
+            "workspace_count": 3,
+            "analysis_count": 3,
+            "base_commit": "abc123def456",
+        });
+        let workspaces = serde_json::json!([
+            {"name": "main", "id": "id-1"},
+            {"name": "auth-refactor", "id": "id-2"},
+            {"name": "payment-fix", "id": "id-3"},
+        ]);
+        let analyses = serde_json::json!([]);
+        let output = format_smart_status(&data, &workspaces, &analyses);
+        assert!(output.contains("3 worktrees"));
+        assert!(output.contains("clean"));
+    }
+
+    #[test]
+    fn format_smart_status_with_conflicts() {
+        let data = serde_json::json!({
+            "workspace_count": 2,
+            "analysis_count": 1,
+            "base_commit": "abc123def456",
+        });
+        let workspaces = serde_json::json!([
+            {"name": "auth", "id": "id-1"},
+            {"name": "payment", "id": "id-2"},
+        ]);
+        let analyses = serde_json::json!([{
+            "workspace_a": "id-1",
+            "workspace_b": "id-2",
+            "score": "Red",
+            "overlaps": [{"Symbol": {"path": "src/auth.ts", "symbol_name": "updateUser", "a_modification": "changed", "b_modification": "also changed"}}],
+        }]);
+        let output = format_smart_status(&data, &workspaces, &analyses);
+        assert!(output.contains("Conflicts"));
     }
 }
