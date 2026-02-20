@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::client::DaemonClient;
+
 /// Git repository context resolved from `git rev-parse`.
 #[derive(Debug, Clone)]
 pub struct GitContext {
@@ -143,6 +145,47 @@ pub fn parse_worktree_list(output: &str) -> Vec<DiscoveredWorktree> {
     }
 
     worktrees
+}
+
+/// Check if the daemon is running; start it if not.
+/// Returns a connected `DaemonClient`.
+pub async fn ensure_daemon(grove_dir: &std::path::Path) -> Result<DaemonClient, String> {
+    let socket_path = grove_dir.join("daemon.sock");
+    let client = DaemonClient::new(&socket_path);
+
+    // Try socket ping first (source of truth for liveness)
+    if client.status().await.is_ok() {
+        return Ok(client);
+    }
+
+    // Daemon not responding -- spawn it
+    spawn_daemon(grove_dir)?;
+
+    // Poll for readiness
+    let max_attempts = 30; // 3 seconds with 100ms intervals
+    for _ in 0..max_attempts {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if client.status().await.is_ok() {
+            return Ok(client);
+        }
+    }
+
+    Err("daemon failed to start within 3 seconds".to_string())
+}
+
+fn spawn_daemon(grove_dir: &std::path::Path) -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("cannot find grove executable: {e}"))?;
+
+    std::process::Command::new(exe)
+        .args(["daemon", "start"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn daemon: {e}"))?;
+
+    Ok(())
 }
 
 fn derive_name(path: &PathBuf, branch: Option<&str>) -> String {
