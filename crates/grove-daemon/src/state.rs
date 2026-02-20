@@ -81,7 +81,19 @@ pub enum StateMessage {
         workspace_id: WorkspaceId,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    SyncWorktrees {
+        desired: Vec<Workspace>,
+        reply: oneshot::Sender<Result<SyncResult, String>>,
+    },
     Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncResult {
+    pub workspaces: Vec<Workspace>,
+    pub added: Vec<WorkspaceId>,
+    pub removed: Vec<WorkspaceId>,
+    pub unchanged: Vec<WorkspaceId>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +236,13 @@ impl DaemonState {
                     }
                     false
                 }
+                StateMessage::SyncWorktrees { desired, reply } => {
+                    let result = self.handle_sync_worktrees(desired);
+                    if reply.send(result).is_err() {
+                        debug!("sync reply channel dropped");
+                    }
+                    false
+                }
                 StateMessage::Shutdown => {
                     info!("state actor shutting down");
                     true
@@ -263,6 +282,14 @@ impl DaemonState {
                         .is_err()
                     {
                         debug!("remove reply channel dropped during shutdown drain");
+                    }
+                }
+                StateMessage::SyncWorktrees { reply, .. } => {
+                    if reply
+                        .send(Err("daemon is shutting down".to_string()))
+                        .is_err()
+                    {
+                        debug!("sync reply channel dropped during shutdown drain");
                     }
                 }
                 StateMessage::FileChanged { .. }
@@ -436,6 +463,44 @@ impl DaemonState {
         }
 
         Ok(())
+    }
+
+    fn handle_sync_worktrees(&mut self, desired: Vec<Workspace>) -> Result<SyncResult, String> {
+        let desired_ids: HashMap<WorkspaceId, Workspace> =
+            desired.into_iter().map(|ws| (ws.id, ws)).collect();
+
+        let current_ids: Vec<WorkspaceId> = self.workspaces.keys().cloned().collect();
+
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        let mut unchanged = Vec::new();
+
+        // Remove stale workspaces
+        for id in &current_ids {
+            if !desired_ids.contains_key(id) {
+                self.handle_remove_workspace(*id)?;
+                removed.push(*id);
+            }
+        }
+
+        // Add or update desired workspaces
+        for (id, ws) in &desired_ids {
+            if self.workspaces.contains_key(id) {
+                unchanged.push(*id);
+            } else {
+                added.push(*id);
+            }
+            self.handle_register_workspace(ws.clone())?;
+        }
+
+        let workspaces: Vec<Workspace> = self.workspaces.values().cloned().collect();
+
+        Ok(SyncResult {
+            workspaces,
+            added,
+            removed,
+            unchanged,
+        })
     }
 
     // === Accessors (for testing) ===
@@ -1261,5 +1326,62 @@ mod tests {
             }
             other => panic!("expected status response, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_worktrees_adds_new_and_removes_stale() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        // Register two workspaces
+        let ws_a = make_workspace("alpha");
+        let ws_b = make_workspace("beta");
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+        for ws in [ws_a.clone(), ws_b.clone()] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(StateMessage::RegisterWorkspace {
+                workspace: ws,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        // Sync with only alpha + a new gamma — beta should be removed
+        let ws_gamma = make_workspace("gamma");
+        let id_gamma = ws_gamma.id;
+        let desired = vec![ws_a, ws_gamma];
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::SyncWorktrees {
+            desired,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        let result = reply_rx.await.unwrap().unwrap();
+
+        assert!(result.added.contains(&id_gamma));
+        assert!(result.removed.contains(&id_b));
+        assert!(result.unchanged.contains(&id_a));
+
+        // Verify state: 2 workspaces (alpha + gamma)
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        match reply_rx.await.unwrap() {
+            QueryResponse::Status {
+                workspace_count, ..
+            } => assert_eq!(workspace_count, 2),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
     }
 }
