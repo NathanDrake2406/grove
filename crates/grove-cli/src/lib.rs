@@ -83,14 +83,18 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Commands that manage the daemon directly — use existing find_grove_dir (no auto-spawn).
     match &args.command {
-        Some(Commands::Daemon { action: DaemonAction::Stop }) => {
+        Some(Commands::Daemon {
+            action: DaemonAction::Stop,
+        }) => {
             let grove_dir = find_grove_dir(std::env::current_dir()?)?;
             let socket_path = grove_dir.join("daemon.sock");
             let client = DaemonClient::new(&socket_path);
             handle_daemon_stop(&client, &grove_dir, args.json).await?;
             return Ok(());
         }
-        Some(Commands::Daemon { action: DaemonAction::Status }) => {
+        Some(Commands::Daemon {
+            action: DaemonAction::Status,
+        }) => {
             let grove_dir = find_grove_dir(std::env::current_dir()?)?;
             let socket_path = grove_dir.join("daemon.sock");
             let client = DaemonClient::new(&socket_path);

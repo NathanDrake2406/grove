@@ -852,8 +852,16 @@ async fn sync_worktrees_registers_and_removes_via_socket() {
     // desired workspaces (alpha + gamma) are added as new.
     let added = data["added"].as_array().unwrap();
     let removed = data["removed"].as_array().unwrap();
-    assert_eq!(added.len(), 2, "should add 2 workspaces (alpha+gamma with v5 IDs)");
-    assert_eq!(removed.len(), 2, "should remove 2 workspaces (original v4 IDs)");
+    assert_eq!(
+        added.len(),
+        2,
+        "should add 2 workspaces (alpha+gamma with v5 IDs)"
+    );
+    assert_eq!(
+        removed.len(),
+        2,
+        "should remove 2 workspaces (original v4 IDs)"
+    );
 
     // Verify final state: 2 workspaces (alpha + gamma)
     let resp = daemon.client.status().await.unwrap();

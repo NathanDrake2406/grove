@@ -174,8 +174,7 @@ pub async fn ensure_daemon(grove_dir: &std::path::Path) -> Result<DaemonClient, 
 }
 
 fn spawn_daemon(_grove_dir: &std::path::Path) -> Result<(), String> {
-    let exe =
-        std::env::current_exe().map_err(|e| format!("cannot find grove executable: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find grove executable: {e}"))?;
 
     std::process::Command::new(exe)
         .args(["daemon", "start"])

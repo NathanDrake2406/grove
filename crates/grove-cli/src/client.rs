@@ -139,8 +139,11 @@ impl DaemonClient {
         &self,
         worktrees: serde_json::Value,
     ) -> Result<DaemonResponse, ClientError> {
-        self.request("sync_worktrees", serde_json::json!({ "worktrees": worktrees }))
-            .await
+        self.request(
+            "sync_worktrees",
+            serde_json::json!({ "worktrees": worktrees }),
+        )
+        .await
     }
 }
 

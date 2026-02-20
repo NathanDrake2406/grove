@@ -609,8 +609,11 @@ async fn handle_request_with_options(
                 Ok(Ok(Ok(sync_result))) => {
                     let added: Vec<String> =
                         sync_result.added.iter().map(|id| id.to_string()).collect();
-                    let removed: Vec<String> =
-                        sync_result.removed.iter().map(|id| id.to_string()).collect();
+                    let removed: Vec<String> = sync_result
+                        .removed
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect();
                     let unchanged: Vec<String> = sync_result
                         .unchanged
                         .iter()
