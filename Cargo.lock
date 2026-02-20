@@ -1530,11 +1530,16 @@ dependencies = [
 name = "grove"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "daemonize",
  "grove-cli",
  "grove-daemon",
+ "grove-lib",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

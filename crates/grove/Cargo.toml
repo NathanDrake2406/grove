@@ -13,3 +13,11 @@ grove-daemon = { path = "../grove-daemon" }
 daemonize = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+grove-lib = { path = "../grove-lib" }
+chrono = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
