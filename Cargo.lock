@@ -1543,9 +1543,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "colored",
+ "futures",
  "grove-lib",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]
