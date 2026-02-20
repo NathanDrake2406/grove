@@ -3,6 +3,7 @@ pub mod lifecycle;
 pub mod socket;
 pub mod state;
 pub mod watcher;
+pub mod worker;
 
 use std::path::Path;
 use std::time::Duration;
