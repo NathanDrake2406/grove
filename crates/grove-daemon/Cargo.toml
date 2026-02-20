@@ -7,6 +7,7 @@ edition.workspace = true
 grove-lib = { path = "../grove-lib" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 notify = { workspace = true }
 ignore = { workspace = true }
 rusqlite = { workspace = true }
@@ -17,6 +18,8 @@ tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

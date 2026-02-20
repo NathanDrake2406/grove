@@ -1,4 +1,6 @@
 pub mod db;
+pub mod lifecycle;
+pub mod socket;
 pub mod state;
 pub mod watcher;
 
