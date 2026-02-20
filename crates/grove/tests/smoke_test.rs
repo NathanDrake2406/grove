@@ -817,3 +817,58 @@ async fn in_flight_status_requests_during_shutdown_do_not_hang() {
         }
     }
 }
+
+#[tokio::test]
+async fn sync_worktrees_registers_and_removes_via_socket() {
+    let daemon = TestDaemon::start().await;
+
+    // Register two workspaces manually first (these use UUID v4)
+    let ws_a = make_workspace("ws-alpha", "feat/alpha");
+    let ws_b = make_workspace("ws-beta", "feat/beta");
+    daemon.register_workspace(ws_a).await.unwrap();
+    daemon.register_workspace(ws_b).await.unwrap();
+
+    // Verify 2 workspaces registered
+    let resp = daemon.client.status().await.unwrap();
+    assert_eq!(resp.data.unwrap()["workspace_count"], 2);
+
+    // Sync with alpha + a new gamma.
+    // sync_worktrees derives IDs via UUID v5 from path, so the v5 IDs won't match
+    // the v4 IDs we registered above. The sync will treat all manually-registered
+    // workspaces as stale and remove them, then add both alpha and gamma with v5 IDs.
+    let resp = daemon
+        .client
+        .sync_worktrees(serde_json::json!([
+            {"name": "ws-alpha", "path": "/worktrees/ws-alpha", "branch": "refs/heads/feat/alpha", "head": "abc123"},
+            {"name": "ws-gamma", "path": "/worktrees/ws-gamma", "branch": "refs/heads/feat/gamma", "head": "def456"},
+        ]))
+        .await
+        .unwrap();
+
+    assert!(resp.ok, "sync_worktrees should succeed: {:?}", resp.error);
+    let data = resp.data.unwrap();
+
+    // The v5 IDs won't match the v4 IDs, so all 2 originals are removed and both
+    // desired workspaces (alpha + gamma) are added as new.
+    let added = data["added"].as_array().unwrap();
+    let removed = data["removed"].as_array().unwrap();
+    assert_eq!(added.len(), 2, "should add 2 workspaces (alpha+gamma with v5 IDs)");
+    assert_eq!(removed.len(), 2, "should remove 2 workspaces (original v4 IDs)");
+
+    // Verify final state: 2 workspaces (alpha + gamma)
+    let resp = daemon.client.status().await.unwrap();
+    assert_eq!(resp.data.unwrap()["workspace_count"], 2);
+
+    // Verify the workspace names are present
+    let resp = daemon.client.list_workspaces().await.unwrap();
+    let workspaces = resp.data.unwrap();
+    let names: Vec<&str> = workspaces
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["name"].as_str())
+        .collect();
+    assert!(names.contains(&"ws-alpha") || names.iter().any(|n| n.contains("alpha")));
+
+    daemon.shutdown().await;
+}
