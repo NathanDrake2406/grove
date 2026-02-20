@@ -134,4 +134,41 @@ mod tests {
     fn format_commit_shows_none_for_empty() {
         assert_eq!(format_commit(""), "(none)");
     }
+
+    #[test]
+    fn format_status_with_invalid_field_types_uses_defaults() {
+        let data = serde_json::json!({
+            "workspace_count": "3",
+            "analysis_count": {"n": 2},
+            "base_commit": 12345,
+        });
+        let output = format_status_output(&data);
+        assert!(output.contains("Workspaces:  0"));
+        assert!(output.contains("Analyses:    0"));
+        assert!(output.contains("Base commit: (none)"));
+    }
+
+    #[test]
+    fn format_status_output_is_deterministic_for_same_input() {
+        let data = serde_json::json!({
+            "workspace_count": 5,
+            "analysis_count": 4,
+            "base_commit": "deadbeefcafebabe",
+            "unexpected": "ignored",
+        });
+        let first = format_status_output(&data);
+        let second = format_status_output(&data);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn format_commit_keeps_exactly_eight_chars() {
+        assert_eq!(format_commit("deadbeef"), "deadbeef");
+    }
+
+    #[test]
+    #[should_panic]
+    fn format_commit_panics_when_truncating_unicode_mid_codepoint() {
+        let _ = format_commit("你好你好你好");
+    }
 }

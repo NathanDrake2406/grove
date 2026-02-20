@@ -729,4 +729,369 @@ mod tests {
         tx.send(StateMessage::Shutdown).await.unwrap();
         handle.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn rapid_register_and_query_all_responses_arrive() {
+        let config = GroveConfig {
+            max_worktrees: 200,
+            ..GroveConfig::default()
+        };
+        let (tx, handle) = spawn_state_actor(config, None);
+
+        let mut tasks = Vec::new();
+        for i in 0..100 {
+            let tx_cloned = tx.clone();
+            tasks.push(tokio::spawn(async move {
+                let ws = make_workspace(&format!("ws-{i:03}"));
+                let ws_id = ws.id;
+
+                let (reg_reply_tx, reg_reply_rx) = oneshot::channel();
+                tx_cloned
+                    .send(StateMessage::RegisterWorkspace {
+                        workspace: ws,
+                        reply: reg_reply_tx,
+                    })
+                    .await
+                    .unwrap();
+                assert!(reg_reply_rx.await.unwrap().is_ok());
+
+                let (query_reply_tx, query_reply_rx) = oneshot::channel();
+                tx_cloned
+                    .send(StateMessage::Query {
+                        request: QueryRequest::GetWorkspace {
+                            workspace_id: ws_id,
+                        },
+                        reply: query_reply_tx,
+                    })
+                    .await
+                    .unwrap();
+
+                match query_reply_rx.await.unwrap() {
+                    QueryResponse::Workspace(Some(found)) => assert_eq!(found.id, ws_id),
+                    other => panic!("unexpected query response: {other:?}"),
+                }
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::ListWorkspaces,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        match reply_rx.await.unwrap() {
+            QueryResponse::Workspaces(workspaces) => assert_eq!(workspaces.len(), 100),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_then_remove_same_workspace_immediately() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws = make_workspace("quick-remove");
+        let ws_id = ws.id;
+
+        let (reg_reply_tx, reg_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RegisterWorkspace {
+            workspace: ws,
+            reply: reg_reply_tx,
+        })
+        .await
+        .unwrap();
+
+        let (remove_reply_tx, remove_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RemoveWorkspace {
+            workspace_id: ws_id,
+            reply: remove_reply_tx,
+        })
+        .await
+        .unwrap();
+
+        assert!(reg_reply_rx.await.unwrap().is_ok());
+        assert!(remove_reply_rx.await.unwrap().is_ok());
+
+        let (query_reply_tx, query_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetWorkspace {
+                workspace_id: ws_id,
+            },
+            reply: query_reply_tx,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            query_reply_rx.await.unwrap(),
+            QueryResponse::Workspace(None)
+        ));
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn query_after_remove_message_returns_none() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws = make_workspace("remove-query");
+        let ws_id = ws.id;
+
+        let (reg_reply_tx, reg_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RegisterWorkspace {
+            workspace: ws,
+            reply: reg_reply_tx,
+        })
+        .await
+        .unwrap();
+        reg_reply_rx.await.unwrap().unwrap();
+
+        let (remove_reply_tx, remove_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RemoveWorkspace {
+            workspace_id: ws_id,
+            reply: remove_reply_tx,
+        })
+        .await
+        .unwrap();
+        remove_reply_rx.await.unwrap().unwrap();
+
+        let (query_reply_tx, query_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetWorkspace {
+                workspace_id: ws_id,
+            },
+            reply: query_reply_tx,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            query_reply_rx.await.unwrap(),
+            QueryResponse::Workspace(None)
+        ));
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_pair_analysis_query_is_order_insensitive() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws_a = make_workspace("pair-a");
+        let ws_b = make_workspace("pair-b");
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+
+        for ws in [ws_a, ws_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(StateMessage::RegisterWorkspace {
+                workspace: ws,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        let analysis = WorkspacePairAnalysis {
+            workspace_a: id_a,
+            workspace_b: id_b,
+            score: OrthogonalityScore::Red,
+            overlaps: vec![],
+            merge_order_hint: MergeOrder::NeedsCoordination,
+            last_computed: Utc::now(),
+        };
+        tx.send(StateMessage::AnalysisComplete {
+            pair: (id_a, id_b),
+            result: analysis,
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetPairAnalysis {
+                workspace_a: id_b,
+                workspace_b: id_a,
+            },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+
+        match reply_rx.await.unwrap() {
+            QueryResponse::PairAnalysis(Some(found)) => {
+                assert_eq!(found.workspace_a, id_a);
+                assert_eq!(found.workspace_b, id_b);
+                assert_eq!(found.score, OrthogonalityScore::Red);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn duplicate_file_changed_messages_do_not_duplicate_dirty_workspace() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let ws = make_workspace("dup-dirty");
+        let ws_id = ws.id;
+        state.handle_register_workspace(ws).unwrap();
+
+        state.handle_file_changed(ws_id, Path::new("src/a.rs"));
+        state.handle_file_changed(ws_id, Path::new("src/b.rs"));
+        state.handle_file_changed(ws_id, Path::new("src/c.rs"));
+
+        assert_eq!(state.dirty_workspaces().len(), 1);
+        assert_eq!(state.dirty_workspaces()[0], ws_id);
+    }
+
+    #[test]
+    fn file_changed_for_unknown_workspace_is_ignored() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state.handle_file_changed(Uuid::new_v4(), Path::new("src/ghost.rs"));
+        assert!(state.dirty_workspaces().is_empty());
+    }
+
+    #[test]
+    fn removing_unknown_workspace_returns_error_without_side_effects() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        state
+            .handle_register_workspace(make_workspace("still-here"))
+            .unwrap();
+        assert_eq!(state.workspace_count(), 1);
+
+        let err = state
+            .handle_remove_workspace(Uuid::new_v4())
+            .expect_err("unknown workspace should fail");
+        assert!(err.contains("not found"));
+        assert_eq!(state.workspace_count(), 1);
+    }
+
+    #[test]
+    fn base_ref_same_commit_does_not_clear_analyses() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        state.handle_base_ref_changed("base-123".to_string());
+        state.handle_analysis_complete(
+            (id_a, id_b),
+            WorkspacePairAnalysis {
+                workspace_a: id_a,
+                workspace_b: id_b,
+                score: OrthogonalityScore::Yellow,
+                overlaps: vec![],
+                merge_order_hint: MergeOrder::Either,
+                last_computed: Utc::now(),
+            },
+        );
+        assert_eq!(state.analysis_count(), 1);
+
+        state.handle_base_ref_changed("base-123".to_string());
+        assert_eq!(state.analysis_count(), 1);
+        assert_eq!(state.base_commit(), "base-123");
+    }
+
+    #[tokio::test]
+    async fn dropped_query_reply_channel_does_not_break_actor() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let (dropped_reply_tx, dropped_reply_rx) = oneshot::channel();
+        drop(dropped_reply_rx);
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: dropped_reply_tx,
+        })
+        .await
+        .unwrap();
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        match reply_rx.await.unwrap() {
+            QueryResponse::Status {
+                workspace_count,
+                analysis_count,
+                ..
+            } => {
+                assert_eq!(workspace_count, 0);
+                assert_eq!(analysis_count, 0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_file_change_burst_keeps_actor_responsive() {
+        let (tx, handle) = spawn_state_actor(
+            GroveConfig {
+                max_worktrees: 5,
+                ..GroveConfig::default()
+            },
+            None,
+        );
+        let ws = make_workspace("burst");
+        let ws_id = ws.id;
+
+        let (register_reply_tx, register_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RegisterWorkspace {
+            workspace: ws,
+            reply: register_reply_tx,
+        })
+        .await
+        .unwrap();
+        register_reply_rx.await.unwrap().unwrap();
+
+        let mut tasks = Vec::new();
+        for i in 0..256 {
+            let tx_cloned = tx.clone();
+            tasks.push(tokio::spawn(async move {
+                tx_cloned
+                    .send(StateMessage::FileChanged {
+                        workspace_id: ws_id,
+                        path: PathBuf::from(format!("src/{i}.rs")),
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        match reply_rx.await.unwrap() {
+            QueryResponse::Status {
+                workspace_count,
+                analysis_count,
+                ..
+            } => {
+                assert_eq!(workspace_count, 1);
+                assert_eq!(analysis_count, 0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
 }

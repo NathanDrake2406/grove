@@ -399,4 +399,192 @@ export interface PaymentResult {
         assert_eq!(exports[1].name, "PaymentResult");
         assert_eq!(exports[1].kind, SymbolKind::Interface);
     }
+
+    #[test]
+    fn complex_typescript_parsing_handles_nested_and_dynamic_constructs() {
+        let source = br#"
+class Outer {
+    classField = 1;
+    method() {
+        class Inner {
+            deep() {}
+        }
+        return new Inner();
+    }
+}
+
+const { alpha, beta: renamed } = someObject;
+export default class DefaultExported {}
+export { renamed as reRenamed } from "./other";
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Outer"));
+        assert!(symbols.iter().any(|s| s.name == "alpha"));
+        assert!(symbols.iter().any(|s| s.name == "renamed"));
+        assert!(symbols.iter().any(|s| s.name == "method"));
+        assert!(symbols.iter().any(|s| s.name == "Inner"));
+    }
+
+    #[test]
+    fn extract_imports_supports_default_named_and_skips_dynamic_imports() {
+        let source = br#"
+import React, { useMemo as memo } from "react";
+import * as fs from "node:fs";
+const mod = await import("./dynamic");
+"#;
+
+        let analyzer = TypeScriptAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 3);
+        assert_eq!(imports[0].source, "react");
+        assert_eq!(imports[0].symbols[0].name, "default");
+        assert_eq!(imports[0].symbols[0].alias.as_deref(), Some("React"));
+        assert_eq!(imports[0].symbols[1].name, "useMemo");
+        assert_eq!(imports[0].symbols[1].alias.as_deref(), Some("memo"));
+        assert_eq!(imports[1].source, "node:fs");
+        assert_eq!(imports[1].symbols.len(), 1);
+        assert_eq!(imports[1].symbols[0].name, "*");
+        assert_eq!(imports[1].symbols[0].alias.as_deref(), Some("fs"));
+        assert_eq!(imports[2].source, "./dynamic");
+    }
+
+    #[test]
+    fn extract_exports_handles_default_and_reexport_current_behavior() {
+        let source = br#"
+export default class DefaultThing {}
+export { foo as bar } from "./foo";
+export function named() {}
+"#;
+
+        let analyzer = TypeScriptAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert!(exports.iter().any(|e| e.name == "DefaultThing"));
+        assert!(exports.iter().any(|e| e.name == "named"));
+        assert!(exports.iter().any(|e| e.name == "bar"));
+    }
+
+    #[test]
+    fn schema_file_detection_handles_nested_paths_and_spaces() {
+        let analyzer = TypeScriptAnalyzer::new();
+        assert!(analyzer.is_schema_file(Path::new(
+            "a/b/c with spaces/next.config.ts"
+        )));
+        assert!(analyzer.is_schema_file(Path::new(
+            "deep/nested/project/tsconfig.json"
+        )));
+    }
+
+    #[test]
+    fn malformed_source_recovers_and_keeps_earlier_symbols() {
+        let source = br#"
+function stableTopLevel() {}
+
+type Broken<T = ;
+
+function mayRecoverLater() {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "stableTopLevel"));
+    }
+
+    #[test]
+    fn import_alias_collisions_preserve_each_specifier() {
+        let source = br#"
+import { foo as value, bar as value, value as foo } from "./dep";
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "./dep");
+        assert_eq!(imports[0].symbols.len(), 3);
+        assert_eq!(imports[0].symbols[0].name, "foo");
+        assert_eq!(imports[0].symbols[0].alias.as_deref(), Some("value"));
+        assert_eq!(imports[0].symbols[1].name, "bar");
+        assert_eq!(imports[0].symbols[1].alias.as_deref(), Some("value"));
+        assert_eq!(imports[0].symbols[2].name, "value");
+        assert_eq!(imports[0].symbols[2].alias.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn nested_namespace_and_class_methods_are_not_emitted_as_top_level_symbols() {
+        let source = br#"
+namespace Internal {
+    export function hidden() {}
+}
+
+class Api {
+    method() {}
+}
+
+function topLevel() {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Api"));
+        assert!(symbols.iter().any(|s| s.name == "topLevel"));
+        assert!(!symbols.iter().any(|s| s.name == "hidden"));
+        assert!(!symbols.iter().any(|s| s.name == "method"));
+    }
+
+    #[test]
+    fn extract_exports_collects_declarations_but_not_reexport_aliases() {
+        let source = br#"
+export { foo as bar } from "./foo";
+export * from "./other";
+export type { ShapeLike } from "./types";
+export function declared() {}
+export interface DeclaredShape {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert!(exports.iter().any(|e| e.name == "declared"));
+        assert!(exports.iter().any(|e| e.name == "DeclaredShape"));
+        assert!(!exports.iter().any(|e| e.name == "bar"));
+    }
+
+    #[test]
+    fn default_anonymous_export_is_ignored_but_named_default_class_is_captured() {
+        let source = br#"
+export default function () {
+    return 42;
+}
+
+export default class NamedDefault {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "NamedDefault");
+        assert_eq!(exports[0].kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn side_effect_and_default_named_imports_are_separated_correctly() {
+        let source = br#"
+import "./polyfill";
+import Client, { connect as openConnection } from "./client";
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "./polyfill");
+        assert!(imports[0].symbols.is_empty());
+
+        assert_eq!(imports[1].source, "./client");
+        assert_eq!(imports[1].symbols.len(), 2);
+        assert_eq!(imports[1].symbols[0].name, "default");
+        assert_eq!(imports[1].symbols[0].alias.as_deref(), Some("Client"));
+        assert_eq!(imports[1].symbols[1].name, "connect");
+        assert_eq!(imports[1].symbols[1].alias.as_deref(), Some("openConnection"));
+    }
 }

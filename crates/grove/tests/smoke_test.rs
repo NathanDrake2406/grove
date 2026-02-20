@@ -5,16 +5,18 @@
 //! `DaemonClient` — the same client the real CLI uses.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
-use grove_cli::client::DaemonClient;
+use grove_cli::client::{ClientError, DaemonClient};
 use grove_daemon::socket::SocketServer;
 use grove_daemon::state::{GroveConfig, StateMessage, spawn_state_actor};
 use grove_lib::{
     ChangeType, MergeOrder, OrthogonalityScore, Overlap, Workspace, WorkspaceMetadata,
     WorkspacePairAnalysis,
 };
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{Barrier, broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
 // === Test Harness ===
@@ -102,6 +104,19 @@ fn make_workspace(name: &str, branch: &str) -> Workspace {
         created_at: Utc::now(),
         last_activity: Utc::now(),
         metadata: WorkspaceMetadata::default(),
+    }
+}
+
+fn unix_socket_bind_supported() -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("bind-probe.sock");
+    match std::os::unix::net::UnixListener::bind(&socket_path) {
+        Ok(listener) => {
+            drop(listener);
+            let _ = std::fs::remove_file(&socket_path);
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -655,4 +670,115 @@ async fn full_workflow_register_analyze_query_remove() {
     assert!(resp.ok); // still exists
 
     daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_readiness_retry_loop_eventually_reaches_daemon() {
+    if !unix_socket_bind_supported() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("grove.sock");
+
+    let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+    let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
+
+    // Simulate caller-side startup retries while the socket is still coming up.
+    let client = DaemonClient::new(&socket_path);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut reached_daemon = false;
+    while tokio::time::Instant::now() < deadline {
+        match client.status().await {
+            Ok(response) => {
+                assert!(response.ok);
+                reached_daemon = true;
+                break;
+            }
+            Err(ClientError::DaemonNotRunning(_) | ClientError::Connection(_)) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(other) => panic!("unexpected startup error during retry loop: {other}"),
+        }
+    }
+    assert!(reached_daemon, "daemon never became reachable before deadline");
+
+    drop(shutdown_tx);
+    state_tx.send(StateMessage::Shutdown).await.unwrap();
+    let _ = server_handle.await;
+    state_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_removes_socket_and_subsequent_requests_fail_fast() {
+    if !unix_socket_bind_supported() {
+        return;
+    }
+
+    let daemon = TestDaemon::start().await;
+    let socket_path = daemon.client.socket_path().to_path_buf();
+
+    let warmup = daemon.client.status().await.unwrap();
+    assert!(warmup.ok);
+
+    daemon.shutdown().await;
+
+    for _ in 0..100 {
+        if !socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !socket_path.exists(),
+        "socket path should be removed on shutdown: {}",
+        socket_path.display()
+    );
+
+    let client = DaemonClient::new(&socket_path);
+    match client.status().await {
+        Err(ClientError::DaemonNotRunning(path)) => assert_eq!(path, socket_path),
+        Err(other) => panic!("unexpected post-shutdown client error: {other}"),
+        Ok(response) => panic!("expected failure after shutdown, got: {response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn in_flight_status_requests_during_shutdown_do_not_hang() {
+    if !unix_socket_bind_supported() {
+        return;
+    }
+
+    let daemon = TestDaemon::start().await;
+    let socket_path = daemon.client.socket_path().to_path_buf();
+
+    let barrier = Arc::new(Barrier::new(17));
+    let mut tasks = Vec::new();
+    for _ in 0..16 {
+        let path = socket_path.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            let client = DaemonClient::new(&path);
+            barrier.wait().await;
+            tokio::time::timeout(Duration::from_secs(1), client.status()).await
+        }));
+    }
+
+    barrier.wait().await;
+    daemon.shutdown().await;
+
+    for task in tasks {
+        match task.await.unwrap() {
+            Ok(Ok(response)) => assert!(response.ok),
+            Ok(Err(
+                ClientError::DaemonNotRunning(_)
+                | ClientError::Connection(_)
+                | ClientError::Protocol(_),
+            )) => {}
+            Ok(Err(other)) => panic!("unexpected client error during shutdown race: {other}"),
+            Err(_) => panic!("status request timed out during shutdown race"),
+        }
+    }
 }

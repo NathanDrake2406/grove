@@ -148,4 +148,67 @@ mod tests {
     fn truncate_exact_length_unchanged() {
         assert_eq!(truncate("exactly10!", 10), "exactly10!");
     }
+
+    #[test]
+    fn format_table_with_invalid_field_types_uses_defaults() {
+        let workspaces = vec![serde_json::json!({
+            "id": 123,
+            "name": true,
+            "branch": {"nested": "value"},
+            "path": null,
+        })];
+        let output = format_workspace_table(&workspaces);
+
+        assert!(output.contains("(unknown)"));
+        assert!(output.contains("(unnamed)"));
+        assert!(output.contains("(no branch)"));
+        assert!(output.contains("(no path)"));
+    }
+
+    #[test]
+    fn format_table_preserves_workspace_input_order() {
+        let workspaces = vec![
+            serde_json::json!({
+                "id": "z-id",
+                "name": "zebra",
+                "branch": "z-branch",
+                "path": "/worktrees/z",
+            }),
+            serde_json::json!({
+                "id": "a-id",
+                "name": "alpha",
+                "branch": "a-branch",
+                "path": "/worktrees/a",
+            }),
+        ];
+        let output = format_workspace_table(&workspaces);
+        let zebra_idx = output.find("zebra").unwrap();
+        let alpha_idx = output.find("alpha").unwrap();
+        assert!(zebra_idx < alpha_idx);
+    }
+
+    #[test]
+    fn truncate_max_len_one_returns_ellipsis_for_long_strings() {
+        assert_eq!(truncate("abcd", 1), "…");
+    }
+
+    #[test]
+    #[should_panic]
+    fn truncate_panics_when_cutting_unicode_mid_codepoint() {
+        let _ = truncate("ééééé", 4);
+    }
+
+    #[test]
+    fn format_table_renders_unicode_without_loss_when_not_truncated() {
+        let workspaces = vec![serde_json::json!({
+            "id": "id-1",
+            "name": "名字",
+            "branch": "feat/🚀",
+            "path": "/tmp/こんにちは",
+        })];
+        let output = format_workspace_table(&workspaces);
+        assert!(output.contains("名字"));
+        assert!(output.contains("feat/🚀"));
+        assert!(output.contains("/tmp/こんにちは"));
+    }
 }

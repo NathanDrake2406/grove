@@ -861,4 +861,219 @@ mod tests {
         assert_eq!(loaded[0].branch, "feat/evolved");
         assert_eq!(loaded[0].metadata.description, Some("updated".to_string()));
     }
+
+    #[test]
+    fn corrupted_workspace_metadata_json_returns_error() {
+        let db = Database::open_in_memory().unwrap();
+        let ws = make_workspace("corrupt-metadata");
+        db.save_workspace(&ws).unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE workspaces SET metadata_json = '{\"description\":' WHERE id = ?1",
+                rusqlite::params![ws.id.to_string()],
+            )
+            .unwrap();
+
+        let result = db.load_workspace(ws.id);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DbError::Json(_)));
+    }
+
+    #[test]
+    fn corrupted_pair_analysis_overlaps_json_returns_error() {
+        let db = Database::open_in_memory().unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let analysis = WorkspacePairAnalysis {
+            workspace_a: a,
+            workspace_b: b,
+            score: OrthogonalityScore::Yellow,
+            overlaps: vec![],
+            merge_order_hint: MergeOrder::Either,
+            last_computed: Utc::now(),
+        };
+        db.save_pair_analysis(&analysis).unwrap();
+
+        db.conn
+            .execute(
+                "UPDATE pair_analyses SET overlaps_json = '[{\"invalid\":]' WHERE workspace_a = ?1 AND workspace_b = ?2",
+                rusqlite::params![a.to_string(), b.to_string()],
+            )
+            .unwrap();
+
+        let result = db.load_pair_analyses();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DbError::Json(_)));
+    }
+
+    #[test]
+    fn malformed_workspace_uuid_row_returns_uuid_error() {
+        let db = Database::open_in_memory().unwrap();
+        let now = Utc::now().to_rfc3339();
+        db.conn
+            .execute(
+                "INSERT INTO workspaces (id, name, branch, path, base_ref, created_at, last_activity, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    "not-a-uuid",
+                    "bad-row",
+                    "feat/bad-row",
+                    "/tmp/bad-row",
+                    "main",
+                    now,
+                    Utc::now().to_rfc3339(),
+                    "{\"description\":null,\"issue_url\":null,\"pr_url\":null}"
+                ],
+            )
+            .unwrap();
+
+        let err = db.load_workspaces().expect_err("expected UUID parse failure");
+        assert!(matches!(err, DbError::Uuid(_)));
+    }
+
+    #[test]
+    fn malformed_workspace_timestamp_row_returns_chrono_error() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO workspaces (id, name, branch, path, base_ref, created_at, last_activity, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    "bad-ts",
+                    "feat/bad-ts",
+                    "/tmp/bad-ts",
+                    "main",
+                    "not-a-timestamp",
+                    Utc::now().to_rfc3339(),
+                    "{\"description\":null,\"issue_url\":null,\"pr_url\":null}"
+                ],
+            )
+            .unwrap();
+
+        let err = db.load_workspaces().expect_err("expected date parse failure");
+        assert!(matches!(err, DbError::ChronoParse(_)));
+    }
+
+    #[test]
+    fn unknown_pair_analysis_enum_values_fallback_to_safe_defaults() {
+        let db = Database::open_in_memory().unwrap();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        db.conn
+            .execute(
+                "INSERT INTO pair_analyses (workspace_a, workspace_b, score, overlaps_json, merge_order_hint, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    a.to_string(),
+                    b.to_string(),
+                    "not-a-known-score",
+                    "[]",
+                    "not-a-known-order",
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        let analyses = db.load_pair_analyses().unwrap();
+        assert_eq!(analyses.len(), 1);
+        assert_eq!(analyses[0].score, OrthogonalityScore::Green);
+        assert_eq!(analyses[0].merge_order_hint, MergeOrder::Either);
+    }
+
+    #[test]
+    fn malformed_pair_analysis_timestamp_returns_chrono_error() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pair_analyses (workspace_a, workspace_b, score, overlaps_json, merge_order_hint, computed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    Uuid::new_v4().to_string(),
+                    "yellow",
+                    "[]",
+                    "either",
+                    "definitely-not-rfc3339"
+                ],
+            )
+            .unwrap();
+
+        let err = db
+            .load_pair_analyses()
+            .expect_err("expected computed_at parse failure");
+        assert!(matches!(err, DbError::ChronoParse(_)));
+    }
+
+    #[test]
+    fn malformed_base_graph_json_row_returns_error() {
+        let db = Database::open_in_memory().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO base_import_graph (file_path, imports_json, exports_json, ast_hash, base_commit, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    "src/bad.ts",
+                    "[{\"source\":]",
+                    "[]",
+                    "hash",
+                    "base",
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .unwrap();
+
+        let err = db.load_base_graph().expect_err("expected JSON parse failure");
+        assert!(matches!(err, DbError::Json(_)));
+    }
+
+    #[test]
+    fn malformed_workspace_delta_json_row_returns_error() {
+        let db = Database::open_in_memory().unwrap();
+        let ws_id = Uuid::new_v4();
+        db.conn
+            .execute(
+                "INSERT INTO workspace_graph_deltas (workspace_id, file_path, delta_type, imports_json, exports_json, ast_hash)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    ws_id.to_string(),
+                    "src/delta.ts",
+                    "modified",
+                    "[]",
+                    "{\"broken\":",
+                    "hash"
+                ],
+            )
+            .unwrap();
+
+        let err = db
+            .load_workspace_deltas(ws_id)
+            .expect_err("expected JSON parse failure");
+        assert!(matches!(err, DbError::Json(_)));
+    }
+
+    #[test]
+    fn malformed_workspace_file_symbols_json_row_returns_error() {
+        let db = Database::open_in_memory().unwrap();
+        let ws_id = Uuid::new_v4();
+        db.conn
+            .execute(
+                "INSERT INTO workspace_files (workspace_id, file_path, change_type, hunks_json, symbols_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    ws_id.to_string(),
+                    "src/main.rs",
+                    "modified",
+                    "[]",
+                    "[{\"name\":]"
+                ],
+            )
+            .unwrap();
+
+        let err = db
+            .load_workspace_files(ws_id)
+            .expect_err("expected JSON parse failure");
+        assert!(matches!(err, DbError::Json(_)));
+    }
 }

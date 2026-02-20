@@ -169,6 +169,44 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_response_ignores_unknown_fields() {
+        let json = r#"{"ok": true, "data": {"workspace_count": 3}, "extra": {"debug": true}}"#;
+        let response: DaemonResponse = serde_json::from_str(json).unwrap();
+        assert!(response.ok);
+        assert_eq!(response.data.unwrap()["workspace_count"], 3);
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn deserialize_response_rejects_missing_ok_field() {
+        let json = r#"{"data": {"workspace_count": 3}}"#;
+        let response: Result<DaemonResponse, _> = serde_json::from_str(json);
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn deserialize_response_rejects_non_boolean_ok() {
+        let json = r#"{"ok": "true", "data": {"workspace_count": 3}}"#;
+        let response: Result<DaemonResponse, _> = serde_json::from_str(json);
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn deserialize_response_rejects_truncated_json() {
+        let json = r#"{"ok": true, "data": {"workspace_count": 3}"#;
+        let response: Result<DaemonResponse, _> = serde_json::from_str(json);
+        assert!(response.is_err());
+    }
+
+    #[test]
+    fn deserialize_error_response_preserves_unicode() {
+        let json = r#"{"ok": false, "error": "parse failed at λ.rs: 你好 🚫"}"#;
+        let response: DaemonResponse = serde_json::from_str(json).unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.as_deref(), Some("parse failed at λ.rs: 你好 🚫"));
+    }
+
+    #[test]
     fn request_json_serializes_correctly() {
         let request = serde_json::json!({
             "method": "conflicts",

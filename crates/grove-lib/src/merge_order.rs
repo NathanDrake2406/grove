@@ -163,4 +163,240 @@ mod tests {
         assert!(a_pos < b_pos);
         assert!(b_pos < c_pos);
     }
+
+    #[test]
+    fn merge_order_contains_all_workspace_ids_exactly_once() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+
+        let analyses = vec![
+            make_analysis(a, b, OrthogonalityScore::Yellow, MergeOrder::AFirst),
+            make_analysis(b, c, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(c, d, OrthogonalityScore::Yellow, MergeOrder::AFirst),
+        ];
+
+        let result = compute_merge_order(&analyses, &[a, b, c, d]);
+        let mut seen = result.ordered.clone();
+        seen.extend(result.independent.clone());
+        seen.sort();
+        seen.dedup();
+        let mut expected = vec![a, b, c, d];
+        expected.sort();
+        assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn merge_order_is_valid_topological_ordering() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+
+        let analyses = vec![
+            make_analysis(a, b, OrthogonalityScore::Yellow, MergeOrder::AFirst),
+            make_analysis(a, c, OrthogonalityScore::Yellow, MergeOrder::AFirst),
+            make_analysis(c, d, OrthogonalityScore::Red, MergeOrder::AFirst),
+        ];
+
+        let result = compute_merge_order(&analyses, &[a, b, c, d]);
+        assert!(!result.has_cycle);
+
+        let pos = |id: WorkspaceId| {
+            result
+                .ordered
+                .iter()
+                .position(|x| *x == id)
+                .unwrap_or(usize::MAX)
+        };
+        assert!(pos(a) < pos(b));
+        assert!(pos(a) < pos(c));
+        assert!(pos(c) < pos(d));
+    }
+
+    #[test]
+    fn cycle_detection_with_five_workspaces() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+        let d = Uuid::new_v4();
+        let e = Uuid::new_v4();
+
+        let analyses = vec![
+            make_analysis(a, b, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(b, c, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(c, d, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(d, e, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(e, a, OrthogonalityScore::Red, MergeOrder::AFirst),
+        ];
+
+        let result = compute_merge_order(&analyses, &[a, b, c, d, e]);
+        assert!(result.has_cycle);
+        assert_eq!(result.ordered.len(), 5);
+        assert!(result.independent.is_empty());
+    }
+
+    #[test]
+    fn single_workspace_is_independent() {
+        let a = Uuid::new_v4();
+        let result = compute_merge_order(&[], &[a]);
+        assert!(!result.has_cycle);
+        assert!(result.ordered.is_empty());
+        assert_eq!(result.independent, vec![a]);
+    }
+
+    #[test]
+    fn green_score_ignores_directional_hint_constraints() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let analyses = vec![make_analysis(
+            a,
+            b,
+            OrthogonalityScore::Green,
+            MergeOrder::AFirst,
+        )];
+
+        let result = compute_merge_order(&analyses, &[a, b]);
+        assert!(!result.has_cycle);
+        assert!(result.ordered.is_empty());
+        assert_eq!(result.independent.len(), 2);
+        assert!(result.independent.contains(&a));
+        assert!(result.independent.contains(&b));
+    }
+
+    #[test]
+    fn needs_coordination_adds_deterministic_a_to_b_edge() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let analyses = vec![make_analysis(
+            a,
+            b,
+            OrthogonalityScore::Black,
+            MergeOrder::NeedsCoordination,
+        )];
+
+        let result = compute_merge_order(&analyses, &[a, b]);
+        assert!(!result.has_cycle);
+        assert_eq!(result.ordered, vec![a, b]);
+        assert!(result.independent.is_empty());
+    }
+
+    #[test]
+    fn duplicate_constraints_preserve_unique_workspace_membership() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        let mut analyses = Vec::new();
+        for _ in 0..25 {
+            analyses.push(make_analysis(
+                a,
+                b,
+                OrthogonalityScore::Red,
+                MergeOrder::AFirst,
+            ));
+        }
+        analyses.push(make_analysis(
+            b,
+            c,
+            OrthogonalityScore::Green,
+            MergeOrder::Either,
+        ));
+
+        let result = compute_merge_order(&analyses, &[a, b, c]);
+        assert!(!result.has_cycle);
+        assert!(result.independent.contains(&c));
+        let a_pos = result.ordered.iter().position(|id| *id == a).unwrap();
+        let b_pos = result.ordered.iter().position(|id| *id == b).unwrap();
+        assert!(a_pos < b_pos);
+
+        let mut all = result.ordered.clone();
+        all.extend(result.independent.clone());
+        all.sort();
+        all.dedup();
+        let mut expected = vec![a, b, c];
+        expected.sort();
+        assert_eq!(all, expected);
+    }
+
+    #[test]
+    fn cycle_fallback_preserves_workspace_input_order() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let c = Uuid::new_v4();
+
+        let analyses = vec![
+            make_analysis(a, b, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(b, c, OrthogonalityScore::Red, MergeOrder::AFirst),
+            make_analysis(c, a, OrthogonalityScore::Red, MergeOrder::AFirst),
+        ];
+
+        let workspace_ids = vec![c, a, b];
+        let result = compute_merge_order(&analyses, &workspace_ids);
+        assert!(result.has_cycle);
+        assert_eq!(result.ordered, workspace_ids);
+        assert!(result.independent.is_empty());
+    }
+
+    #[test]
+    fn large_chain_graph_respects_ordering_constraints() {
+        let workspace_ids: Vec<_> = (0..80).map(|_| Uuid::new_v4()).collect();
+        let analyses: Vec<_> = workspace_ids
+            .windows(2)
+            .map(|pair| {
+                make_analysis(
+                    pair[0],
+                    pair[1],
+                    OrthogonalityScore::Yellow,
+                    MergeOrder::AFirst,
+                )
+            })
+            .collect();
+
+        let result = compute_merge_order(&analyses, &workspace_ids);
+        assert!(!result.has_cycle);
+        assert!(result.independent.is_empty());
+
+        let mut pos = std::collections::HashMap::new();
+        for (i, id) in result.ordered.iter().enumerate() {
+            pos.insert(*id, i);
+        }
+        for pair in workspace_ids.windows(2) {
+            assert!(pos[&pair[0]] < pos[&pair[1]]);
+        }
+    }
+
+    #[test]
+    fn dense_acyclic_graph_is_returned_as_valid_topological_order() {
+        let workspace_ids: Vec<_> = (0..24).map(|_| Uuid::new_v4()).collect();
+        let mut analyses = Vec::new();
+
+        for i in 0..workspace_ids.len() {
+            for j in (i + 1)..workspace_ids.len() {
+                analyses.push(make_analysis(
+                    workspace_ids[i],
+                    workspace_ids[j],
+                    OrthogonalityScore::Red,
+                    MergeOrder::AFirst,
+                ));
+            }
+        }
+
+        let result = compute_merge_order(&analyses, &workspace_ids);
+        assert!(!result.has_cycle);
+        assert!(result.independent.is_empty());
+        assert_eq!(result.ordered.len(), workspace_ids.len());
+
+        let mut pos = std::collections::HashMap::new();
+        for (idx, id) in result.ordered.iter().enumerate() {
+            pos.insert(*id, idx);
+        }
+
+        for i in 0..workspace_ids.len() {
+            for j in (i + 1)..workspace_ids.len() {
+                assert!(pos[&workspace_ids[i]] < pos[&workspace_ids[j]]);
+            }
+        }
+    }
 }

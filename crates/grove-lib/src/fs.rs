@@ -91,6 +91,15 @@ impl FileSystem for MmapFileSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("grove-{prefix}-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn in_memory_fs_read_existing_file() {
@@ -129,5 +138,98 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.contains(&PathBuf::from("src/a.rs")));
         assert!(entries.contains(&PathBuf::from("src/b.rs")));
+    }
+
+    #[test]
+    fn in_memory_fs_read_missing_file_reports_exact_path() {
+        let fs = InMemoryFileSystem::new();
+        let missing = PathBuf::from("src/missing.bin");
+
+        let err = fs.read_file(&missing).unwrap_err();
+        match err {
+            FsError::NotFound(path) => assert_eq!(path, missing),
+            other => panic!("expected FsError::NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_memory_fs_preserves_malformed_bytes_and_is_idempotent() {
+        let mut fs = InMemoryFileSystem::new();
+        let raw = vec![0x00, 0xFF, 0xC3, 0x28, 0x80, b'\n'];
+        fs.add_file(PathBuf::from("blob.bin"), raw.clone());
+
+        let first = fs.read_file(Path::new("blob.bin")).unwrap();
+        let second = fs.read_file(Path::new("blob.bin")).unwrap();
+
+        assert_eq!(first.as_ref(), raw.as_slice());
+        assert_eq!(second.as_ref(), raw.as_slice());
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn in_memory_fs_list_dir_is_sorted_and_deterministic() {
+        let mut fs = InMemoryFileSystem::new();
+        fs.add_file(PathBuf::from("src/zeta.rs"), b"".to_vec());
+        fs.add_file(PathBuf::from("src/alpha.rs"), b"".to_vec());
+        fs.add_file(PathBuf::from("src/mid.rs"), b"".to_vec());
+
+        let first = fs.list_dir(Path::new("src")).unwrap();
+        let second = fs.list_dir(Path::new("src")).unwrap();
+
+        assert_eq!(
+            first,
+            vec![
+                PathBuf::from("src/alpha.rs"),
+                PathBuf::from("src/mid.rs"),
+                PathBuf::from("src/zeta.rs"),
+            ]
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn in_memory_fs_list_dir_for_missing_prefix_is_empty() {
+        let mut fs = InMemoryFileSystem::new();
+        fs.add_file(PathBuf::from("src/a.rs"), b"".to_vec());
+
+        let entries = fs.list_dir(Path::new("does-not-exist")).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn mmap_fs_read_file_preserves_malformed_bytes() {
+        let fs = MmapFileSystem;
+        let temp_dir = unique_temp_path("mmap-read");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("blob.bin");
+        let raw = vec![0xFF, 0xFE, 0x00, 0x80, b'x'];
+        std::fs::write(&file_path, &raw).unwrap();
+
+        let content = fs.read_file(&file_path).unwrap();
+        assert_eq!(content.as_ref(), raw.as_slice());
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
+    }
+
+    #[test]
+    fn mmap_fs_list_dir_is_sorted_and_repeatable() {
+        let fs = MmapFileSystem;
+        let temp_dir = unique_temp_path("mmap-list");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(temp_dir.join("z.txt"), b"").unwrap();
+        std::fs::write(temp_dir.join("a.txt"), b"").unwrap();
+        std::fs::write(temp_dir.join("m.txt"), b"").unwrap();
+
+        let first = fs.list_dir(&temp_dir).unwrap();
+        let second = fs.list_dir(&temp_dir).unwrap();
+
+        let names: Vec<_> = first
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["a.txt", "m.txt", "z.txt"]);
+        assert_eq!(first, second);
+
+        std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 }

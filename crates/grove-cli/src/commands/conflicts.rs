@@ -402,4 +402,132 @@ mod tests {
         assert!(output.contains("FILE  a.ts"));
         assert!(output.contains("SYMBOL  b.ts::doStuff"));
     }
+
+    #[test]
+    fn format_conflicts_handles_non_array_overlaps_as_empty() {
+        let data = serde_json::json!({
+            "score": "Green",
+            "overlaps": {"File": {"path": "src/main.rs"}},
+            "merge_order_hint": "Either",
+        });
+        let output = format_conflicts_output(&data);
+        assert!(output.contains("Overlaps: 0"));
+        assert!(output.contains("No conflicts detected."));
+    }
+
+    #[test]
+    fn format_conflicts_falls_back_for_unknown_overlap_shape() {
+        let data = serde_json::json!({
+            "score": "Yellow",
+            "overlaps": [
+                {
+                    "Custom": {
+                        "path": "src/weird.ts",
+                        "detail": "unexpected payload"
+                    }
+                }
+            ],
+            "merge_order_hint": "Either",
+        });
+        let output = format_conflicts_output(&data);
+        assert!(output.contains("Overlaps: 1"));
+        assert!(output.contains(r#""Custom""#));
+        assert!(output.contains(r#""path":"src/weird.ts""#));
+        assert!(output.contains(r#""detail":"unexpected payload""#));
+    }
+
+    #[test]
+    fn format_conflicts_overlap_variant_precedence_is_deterministic() {
+        let overlap = serde_json::json!({
+            "File": {
+                "path": "src/a.rs",
+                "a_change": "Modified",
+                "b_change": "Deleted",
+            },
+            "Hunk": {
+                "path": "src/a.rs",
+                "a_range": {"start": 1, "end": 2},
+                "b_range": {"start": 3, "end": 4},
+                "distance": 0,
+            }
+        });
+
+        let rendered = format_overlap(&overlap);
+        assert!(rendered.contains("HUNK  src/a.rs"));
+        assert!(!rendered.contains("FILE  src/a.rs"));
+    }
+
+    #[test]
+    fn format_conflicts_preserves_overlap_input_order() {
+        let data = serde_json::json!({
+            "score": "Red",
+            "merge_order_hint": "AFirst",
+            "overlaps": [
+                {
+                    "File": {
+                        "path": "z-last.ts",
+                        "a_change": "Modified",
+                        "b_change": "Modified"
+                    }
+                },
+                {
+                    "File": {
+                        "path": "a-first.ts",
+                        "a_change": "Modified",
+                        "b_change": "Deleted"
+                    }
+                }
+            ]
+        });
+
+        let output = format_conflicts_output(&data);
+        let z_idx = output.find("FILE  z-last.ts").unwrap();
+        let a_idx = output.find("FILE  a-first.ts").unwrap();
+        assert!(z_idx < a_idx);
+    }
+
+    #[test]
+    fn format_conflicts_with_missing_nested_fields_uses_placeholders() {
+        let data = serde_json::json!({
+            "score": "Red",
+            "overlaps": [
+                { "File": {} },
+                { "Hunk": { "path": "src/lib.rs" } },
+                { "Symbol": { "path": "src/lib.rs" } },
+                { "Dependency": {} },
+                { "Schema": {} }
+            ],
+            "merge_order_hint": "NeedsCoordination",
+        });
+
+        let output = format_conflicts_output(&data);
+        assert!(output.contains("FILE  ?  (A: ?, B: ?)"));
+        assert!(output.contains("HUNK  src/lib.rs  A:[0-0] B:[0-0] dist=0"));
+        assert!(output.contains("SYMBOL  src/lib.rs::?  (A: ?, B: ?)"));
+        assert!(output.contains("DEP  ? -> ?"));
+        assert!(output.contains("SCHEMA [?]  A: ?, B: ?"));
+    }
+
+    #[test]
+    fn format_conflicts_renders_unicode_fields() {
+        let data = serde_json::json!({
+            "score": "Yellow",
+            "overlaps": [
+                {
+                    "Symbol": {
+                        "path": "src/你好.ts",
+                        "symbol_name": "λ_transform",
+                        "a_modification": "changed 変数",
+                        "b_modification": "added 🚀",
+                    }
+                }
+            ],
+            "merge_order_hint": "Either",
+        });
+
+        let output = format_conflicts_output(&data);
+        assert!(output.contains("src/你好.ts::λ_transform"));
+        assert!(output.contains("A: changed 変数"));
+        assert!(output.contains("B: added 🚀"));
+    }
 }

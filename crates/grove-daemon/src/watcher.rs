@@ -558,4 +558,157 @@ mod tests {
         debouncer.unregister_worktree(&ws_id);
         assert_eq!(debouncer.pending_count(&ws_id), 0);
     }
+
+    #[test]
+    fn process_event_with_empty_paths_list_is_noop() {
+        let config = WatcherConfig::default();
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/test"));
+
+        let event = make_modify_event(vec![]);
+        let events = debouncer.process_event(&event);
+        assert!(events.is_empty());
+        assert_eq!(debouncer.pending_count(&ws_id), 0);
+    }
+
+    #[test]
+    fn process_event_for_unregistered_path_is_ignored() {
+        let config = WatcherConfig::default();
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/known"));
+
+        let event = make_modify_event(vec![PathBuf::from("/outside/root/src/main.rs")]);
+        let events = debouncer.process_event(&event);
+        assert!(events.is_empty());
+        assert_eq!(debouncer.pending_count(&ws_id), 0);
+    }
+
+    #[test]
+    fn find_worktree_prefers_most_specific_root() {
+        let mut worktrees = HashMap::new();
+        let parent = Uuid::new_v4();
+        let nested = Uuid::new_v4();
+        worktrees.insert(parent, PathBuf::from("/worktrees/mono"));
+        worktrees.insert(nested, PathBuf::from("/worktrees/mono/service-a"));
+
+        let result = find_worktree_for_path(
+            &PathBuf::from("/worktrees/mono/service-a/src/lib.rs"),
+            &worktrees,
+        )
+        .expect("path should resolve to a worktree");
+        assert_eq!(*result.0, nested);
+    }
+
+    #[test]
+    fn flush_respects_debounce_window() {
+        let config = WatcherConfig {
+            debounce_ms: 60,
+            ..Default::default()
+        };
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/test"));
+        debouncer.process_event(&make_modify_event(vec![PathBuf::from(
+            "/worktrees/test/src/main.rs",
+        )]));
+
+        assert!(debouncer.flush_debounced().is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(75));
+
+        let flushed = debouncer.flush_debounced();
+        assert_eq!(flushed.len(), 1);
+        match &flushed[0] {
+            WatchEvent::FilesChanged { workspace_id, paths } => {
+                assert_eq!(*workspace_id, ws_id);
+                assert_eq!(paths, &vec![PathBuf::from("/worktrees/test/src/main.rs")]);
+            }
+            other => panic!("expected FilesChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unregister_worktree_discards_pending_changes_before_flush() {
+        let config = WatcherConfig {
+            debounce_ms: 0,
+            ..Default::default()
+        };
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/test"));
+        debouncer.process_event(&make_modify_event(vec![PathBuf::from(
+            "/worktrees/test/src/main.rs",
+        )]));
+        assert_eq!(debouncer.pending_count(&ws_id), 1);
+
+        debouncer.unregister_worktree(&ws_id);
+        assert!(debouncer.flush_debounced().is_empty());
+    }
+
+    #[test]
+    fn circuit_breaker_with_many_paths_in_one_event_leaves_tail_pending() {
+        let config = WatcherConfig {
+            debounce_ms: 0,
+            circuit_breaker_threshold: 2,
+            ..Default::default()
+        };
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/test"));
+
+        let events = debouncer.process_event(&make_modify_event(vec![
+            PathBuf::from("/worktrees/test/src/a.rs"),
+            PathBuf::from("/worktrees/test/src/b.rs"),
+            PathBuf::from("/worktrees/test/src/c.rs"),
+        ]));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            WatchEvent::FullReindexNeeded { workspace_id } if *workspace_id == ws_id
+        ));
+        assert_eq!(debouncer.pending_count(&ws_id), 1);
+
+        let flush_events = debouncer.flush_debounced();
+        assert_eq!(flush_events.len(), 1);
+        match &flush_events[0] {
+            WatchEvent::FilesChanged { paths, .. } => {
+                assert_eq!(paths, &vec![PathBuf::from("/worktrees/test/src/c.rs")]);
+            }
+            other => panic!("expected FilesChanged, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_git_ref_and_file_paths_emit_base_event_and_keep_pending_file() {
+        let config = WatcherConfig::default();
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/test"));
+
+        let events = debouncer.process_event(&make_modify_event(vec![
+            PathBuf::from("/repo/.git/refs/remotes/origin/main"),
+            PathBuf::from("/worktrees/test/src/main.rs"),
+        ]));
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], WatchEvent::BaseRefChanged { .. }));
+        assert_eq!(debouncer.pending_count(&ws_id), 1);
+    }
+
+    #[test]
+    fn directory_create_event_is_ignored() {
+        let config = WatcherConfig::default();
+        let mut debouncer = Debouncer::new(config);
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/worktrees/test"));
+
+        let event = Event {
+            kind: EventKind::Create(CreateKind::Folder),
+            paths: vec![PathBuf::from("/worktrees/test/src/new-dir")],
+            attrs: Default::default(),
+        };
+        let events = debouncer.process_event(&event);
+        assert!(events.is_empty());
+        assert_eq!(debouncer.pending_count(&ws_id), 0);
+    }
 }

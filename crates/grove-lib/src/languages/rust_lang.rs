@@ -258,4 +258,165 @@ use std::collections::HashMap;
         assert!(imports[0].source.contains("crate::types::Workspace"));
         assert!(imports[1].source.contains("std::collections::HashMap"));
     }
+
+    #[test]
+    fn extracts_impl_for_generic_types() {
+        let source = br#"
+struct Repo<T> {
+    value: T,
+}
+
+impl<T> Repo<T> {
+    fn new(value: T) -> Self {
+        Self { value }
+    }
+}
+"#;
+
+        let analyzer = RustAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Struct && s.name == "Repo"));
+        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Impl));
+    }
+
+    #[test]
+    fn pub_crate_items_are_not_treated_as_public_exports() {
+        let source = br#"
+pub(crate) fn internal_api() {}
+pub fn public_api() {}
+"#;
+
+        let analyzer = RustAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert!(!exports.iter().any(|e| e.name == "internal_api"));
+        assert!(exports.iter().any(|e| e.name == "public_api"));
+    }
+
+    #[test]
+    fn nested_module_use_statements_are_not_collected() {
+        let source = br#"
+mod nested {
+    use crate::foo::Bar;
+}
+use std::fmt::Debug;
+"#;
+
+        let analyzer = RustAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 2);
+        assert!(imports[0].source.contains("std::fmt::Debug"));
+        assert!(imports.iter().any(|i| i.source.contains("crate::foo::Bar")));
+    }
+
+    #[test]
+    fn schema_file_detection_matches_build_rs_and_cargo_toml() {
+        let analyzer = RustAnalyzer::new();
+        assert!(analyzer.is_schema_file(Path::new("Cargo.toml")));
+        assert!(analyzer.is_schema_file(Path::new("build.rs")));
+        assert!(!analyzer.is_schema_file(Path::new("src/lib.rs")));
+    }
+
+    #[test]
+    fn malformed_rust_still_yields_parse_result_and_earlier_symbols() {
+        let source = br#"
+fn stable() {}
+
+impl Broken {
+    fn missing(&self)
+"#;
+        let analyzer = RustAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "stable"));
+    }
+
+    #[test]
+    fn top_level_use_is_collected_but_nested_use_is_not() {
+        let source = br#"
+mod nested {
+    use crate::deep::Thing;
+}
+
+use std::fmt::Debug;
+"#;
+        let analyzer = RustAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert!(imports[0].source.contains("std::fmt::Debug"));
+        assert!(!imports.iter().any(|i| i.source.contains("crate::deep::Thing")));
+    }
+
+    #[test]
+    fn complex_use_tree_and_alias_are_preserved_in_import_source() {
+        let source = br#"
+use crate::http::{self, Method as Verb, headers::*};
+"#;
+        let analyzer = RustAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        let raw = &imports[0].source;
+        assert!(raw.contains("crate::http"));
+        assert!(raw.contains("Method as Verb"));
+        assert!(raw.contains("headers::*"));
+    }
+
+    #[test]
+    fn restricted_pub_visibilities_are_currently_treated_as_exports() {
+        let source = br#"
+pub(crate) fn crate_visible() {}
+pub(super) struct SuperVisible;
+pub(in crate::internal) fn scoped_visible() {}
+pub fn public_visible() {}
+"#;
+        let analyzer = RustAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert!(exports.iter().any(|e| e.name == "crate_visible"));
+        assert!(exports.iter().any(|e| e.name == "SuperVisible"));
+        assert!(exports.iter().any(|e| e.name == "scoped_visible"));
+        assert!(exports.iter().any(|e| e.name == "public_visible"));
+    }
+
+    #[test]
+    fn trait_impl_symbol_tracks_target_type_name() {
+        let source = br#"
+struct Repo<T>(T);
+
+impl<T: std::fmt::Display> std::fmt::Display for Repo<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+"#;
+        let analyzer = RustAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        let impl_symbol = symbols.iter().find(|s| s.kind == SymbolKind::Impl).unwrap();
+        assert!(impl_symbol.name.contains("Repo"));
+    }
+
+    #[test]
+    fn extract_imports_reports_stable_line_numbers_for_sparse_files() {
+        let source = br#"use std::fmt::Debug;
+
+fn local() {}
+
+use crate::core::Engine;
+"#;
+        let analyzer = RustAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].line, 1);
+        assert_eq!(imports[1].line, 5);
+    }
+
+    #[test]
+    fn schema_file_detection_is_filename_based_and_case_sensitive() {
+        let analyzer = RustAnalyzer::new();
+        assert!(analyzer.is_schema_file(Path::new("nested/project/Cargo.toml")));
+        assert!(!analyzer.is_schema_file(Path::new("nested/project/cargo.toml")));
+        assert!(!analyzer.is_schema_file(Path::new("nested/project/build.RS")));
+    }
 }

@@ -303,4 +303,110 @@ mod tests {
 
         remove_pid_file(&pid_path).expect("remove should succeed for missing file");
     }
+
+    #[test]
+    fn read_pid_file_errors_on_negative_number() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "-42").expect("write should succeed");
+
+        let err = read_pid_file(&pid_path).expect_err("negative pid should fail");
+        assert!(matches!(err, LifecycleError::InvalidPidFile));
+    }
+
+    #[test]
+    fn read_pid_file_errors_on_float() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "12.5").expect("write should succeed");
+
+        let err = read_pid_file(&pid_path).expect_err("float pid should fail");
+        assert!(matches!(err, LifecycleError::InvalidPidFile));
+    }
+
+    #[test]
+    fn read_pid_file_errors_on_empty_string() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "").expect("write should succeed");
+
+        let err = read_pid_file(&pid_path).expect_err("empty pid should fail");
+        assert!(matches!(err, LifecycleError::InvalidPidFile));
+    }
+
+    #[test]
+    fn read_pid_file_errors_on_overflowing_number() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "9999999999999999999999999").expect("write should succeed");
+
+        let err = read_pid_file(&pid_path).expect_err("overflow pid should fail");
+        assert!(matches!(err, LifecycleError::InvalidPidFile));
+    }
+
+    #[test]
+    fn read_pid_file_trims_whitespace() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "  \n 12345 \t").expect("write should succeed");
+
+        let pid = read_pid_file(&pid_path)
+            .expect("read should succeed")
+            .expect("pid should exist");
+        assert_eq!(pid, 12345);
+    }
+
+    #[test]
+    fn write_pid_file_detects_running_pid_with_whitespace_contents() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        let current_pid = std::process::id();
+        fs::write(&pid_path, format!("  {current_pid}\n")).expect("write should succeed");
+
+        let err = write_pid_file(&pid_path).expect_err("should fail with AlreadyRunning");
+        assert!(matches!(err, LifecycleError::AlreadyRunning(pid) if pid == current_pid));
+    }
+
+    #[test]
+    fn read_pid_file_errors_when_path_is_directory() {
+        let dir = temp_dir();
+        let pid_dir = dir.path().join("pid-dir");
+        fs::create_dir(&pid_dir).expect("directory should be created");
+
+        let err = read_pid_file(&pid_dir).expect_err("directory read should fail");
+        assert!(matches!(err, LifecycleError::Io(_)));
+    }
+
+    #[test]
+    fn remove_pid_file_errors_when_path_is_directory() {
+        let dir = temp_dir();
+        let pid_dir = dir.path().join("pid-dir");
+        fs::create_dir(&pid_dir).expect("directory should be created");
+
+        let err = remove_pid_file(&pid_dir).expect_err("remove_file on directory should fail");
+        assert!(matches!(err, LifecycleError::Io(_)));
+    }
+
+    #[test]
+    fn is_daemon_running_false_for_invalid_pid_contents() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        fs::write(&pid_path, "definitely-not-a-pid").expect("write should succeed");
+
+        assert!(!is_daemon_running(&pid_path));
+    }
+
+    #[test]
+    fn cleanup_still_removes_pid_when_socket_path_is_directory() {
+        let dir = temp_dir();
+        let pid_path = dir.path().join("daemon.pid");
+        let socket_dir = dir.path().join("daemon.sock");
+        fs::write(&pid_path, "12345").expect("pid write should succeed");
+        fs::create_dir(&socket_dir).expect("socket dir should be created");
+
+        cleanup(&pid_path, &socket_dir).expect("cleanup should ignore non-removable socket path");
+
+        assert!(!pid_path.exists(), "PID file should still be removed");
+        assert!(socket_dir.exists(), "socket directory should remain in place");
+    }
 }
