@@ -44,6 +44,12 @@ pub enum Commands {
         #[command(subcommand)]
         action: DaemonAction,
     },
+
+    /// Generate shell integration (eval "$(grove init zsh)")
+    Init {
+        /// Shell type: zsh, bash, or fish
+        shell: String,
+    },
 }
 
 #[derive(clap::Subcommand, Debug, PartialEq, Eq)]
@@ -59,6 +65,19 @@ pub enum DaemonAction {
 // === Entrypoint ===
 
 pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Handle commands that don't require a grove workspace or daemon connection.
+    match &args.command {
+        Some(Commands::Init { shell }) => {
+            commands::init::execute(shell)?;
+            return Ok(());
+        }
+        Some(Commands::Daemon { action }) => {
+            handle_daemon_action(action)?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
     let grove_dir = find_grove_dir(std::env::current_dir()?)?;
     let socket_path = grove_dir.join("daemon.sock");
     let client = DaemonClient::new(&socket_path);
@@ -73,14 +92,15 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Conflicts { a, b }) => {
             commands::conflicts::execute(&client, &a, &b, args.json).await?;
         }
-        Some(Commands::Daemon { action }) => {
-            handle_daemon_action(action)?;
+        // Already handled above; included for exhaustive matching.
+        Some(Commands::Daemon { .. }) | Some(Commands::Init { .. }) => {
+            unreachable!("handled above");
         }
     }
     Ok(())
 }
 
-fn handle_daemon_action(action: DaemonAction) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_daemon_action(action: &DaemonAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         DaemonAction::Start => {
             println!("Starting daemon...");
@@ -182,6 +202,23 @@ mod tests {
             }
             other => panic!("expected Daemon Status, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_init_command() {
+        let args = CliArgs::try_parse_from(["grove", "init", "zsh"]).unwrap();
+        match args.command {
+            Some(Commands::Init { shell }) => {
+                assert_eq!(shell, "zsh");
+            }
+            other => panic!("expected Init, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_init_requires_shell_arg() {
+        let result = CliArgs::try_parse_from(["grove", "init"]);
+        assert!(result.is_err());
     }
 
     #[test]
