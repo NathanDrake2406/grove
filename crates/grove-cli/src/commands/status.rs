@@ -190,15 +190,20 @@ fn format_overlap_short(overlap: &serde_json::Value) -> String {
             .get("symbol_name")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        return format!("SYMBOL {path}::{name}");
+        return format!("same function  {name}() in {path}");
     }
     if let Some(data) = overlap.get("Hunk") {
         let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        return format!("HUNK   {path}");
+        let a_start = data.get("a_range").and_then(|v| v.get("start")).and_then(|v| v.as_u64());
+        let a_end = data.get("a_range").and_then(|v| v.get("end")).and_then(|v| v.as_u64());
+        return match (a_start, a_end) {
+            (Some(s), Some(e)) => format!("same lines     {path}:{s}-{e}"),
+            _ => format!("same lines     {path}"),
+        };
     }
     if let Some(data) = overlap.get("File") {
         let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        return format!("FILE   {path}");
+        return format!("same file      {path}");
     }
     if let Some(data) = overlap.get("Dependency") {
         let changed = data
@@ -209,16 +214,16 @@ fn format_overlap_short(overlap: &serde_json::Value) -> String {
             .get("affected_file")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        return format!("DEP    {changed} -> {affected}");
+        return format!("import chain   {changed} -> {affected}");
     }
     if let Some(data) = overlap.get("Schema") {
         let cat = data
             .get("category")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        return format!("SCHEMA [{cat}]");
+        return format!("config conflict [{cat}]");
     }
-    format!("{}", serde_json::to_string(overlap).unwrap_or_default())
+    serde_json::to_string(overlap).unwrap_or_default()
 }
 
 fn format_commit(commit: &str) -> &str {
@@ -360,7 +365,7 @@ mod tests {
         let output = format_smart_status(&data, &workspaces, &analyses);
         assert!(output.contains("1 conflict(s)"));
         assert!(output.contains("[Red] feature/auth <-> feature/payment"));
-        assert!(output.contains("SYMBOL src/auth.ts::updateUser"));
+        assert!(output.contains("same function  updateUser() in src/auth.ts"));
     }
 
     #[test]
@@ -386,23 +391,23 @@ mod tests {
     fn format_overlap_short_all_variants() {
         assert_eq!(
             format_overlap_short(&serde_json::json!({"File": {"path": "a.ts"}})),
-            "FILE   a.ts"
+            "same file      a.ts"
         );
         assert_eq!(
             format_overlap_short(&serde_json::json!({"Hunk": {"path": "b.ts"}})),
-            "HUNK   b.ts"
+            "same lines     b.ts"
         );
         assert_eq!(
             format_overlap_short(&serde_json::json!({"Symbol": {"path": "c.ts", "symbol_name": "foo"}})),
-            "SYMBOL c.ts::foo"
+            "same function  foo() in c.ts"
         );
         assert_eq!(
             format_overlap_short(&serde_json::json!({"Dependency": {"changed_file": "a.ts", "affected_file": "b.ts"}})),
-            "DEP    a.ts -> b.ts"
+            "import chain   a.ts -> b.ts"
         );
         assert_eq!(
             format_overlap_short(&serde_json::json!({"Schema": {"category": "Migration"}})),
-            "SCHEMA [Migration]"
+            "config conflict [Migration]"
         );
     }
 }

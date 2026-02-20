@@ -189,28 +189,28 @@ fn render_pair_detail(app: &App, analysis: &WorkspacePairAnalysis, frame: &mut F
         match overlap {
             Overlap::File { path, .. } => {
                 lines.push(Line::from(vec![
-                    Span::styled("FILE ", Style::default().fg(Color::Yellow)),
+                    Span::styled("same file      ", Style::default().fg(Color::Yellow)),
                     Span::raw(path.to_string_lossy().to_string()),
                 ]));
             }
-            Overlap::Hunk { path, distance, .. } => {
+            Overlap::Hunk { path, a_range, distance, .. } => {
                 let color = if *distance == 0 { Color::Red } else { Color::Yellow };
                 lines.push(Line::from(vec![
-                    Span::styled("HUNK ", Style::default().fg(color)),
-                    Span::raw(format!("{} (distance: {})", path.to_string_lossy(), distance)),
+                    Span::styled("same lines     ", Style::default().fg(color)),
+                    Span::raw(format!("{}:{}-{}", path.to_string_lossy(), a_range.start, a_range.end)),
                 ]));
             }
             Overlap::Symbol { path, symbol_name, .. } => {
                 lines.push(Line::from(vec![
-                    Span::styled("SYMBOL ", Style::default().fg(Color::Red)),
-                    Span::raw(format!("{}::{}", path.to_string_lossy(), symbol_name)),
+                    Span::styled("same function  ", Style::default().fg(Color::Red)),
+                    Span::raw(format!("{}() in {}", symbol_name, path.to_string_lossy())),
                 ]));
             }
             Overlap::Dependency { changed_file, affected_file, .. } => {
                 lines.push(Line::from(vec![
-                    Span::styled("DEPENDENCY ", Style::default().fg(Color::Magenta)),
+                    Span::styled("import chain   ", Style::default().fg(Color::Magenta)),
                     Span::raw(format!(
-                        "{} affects {}",
+                        "{} -> {}",
                         changed_file.to_string_lossy(),
                         affected_file.to_string_lossy()
                     )),
@@ -218,9 +218,10 @@ fn render_pair_detail(app: &App, analysis: &WorkspacePairAnalysis, frame: &mut F
             }
             Overlap::Schema { category, a_file, b_file, detail } => {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("SCHEMA [{:?}] ", category), Style::default().fg(Color::Yellow)),
+                    Span::styled("config conflict ", Style::default().fg(Color::Yellow)),
                     Span::raw(format!(
-                        "{} vs {} ({})",
+                        "[{:?}] {} vs {} ({})",
+                        category,
                         a_file.to_string_lossy(),
                         b_file.to_string_lossy(),
                         detail
