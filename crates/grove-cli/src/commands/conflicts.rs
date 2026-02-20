@@ -11,14 +11,19 @@ pub async fn execute(
     let response = client.conflicts(workspace_a, workspace_b).await?;
 
     if !response.ok {
-        let message = response.error.unwrap_or_else(|| "unknown error".to_string());
+        let message = response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string());
         return Err(CommandError::DaemonError(message));
     }
 
     let data = response.data.unwrap_or_default();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).unwrap_or_default()
+        );
         return Ok(());
     }
 
@@ -45,7 +50,10 @@ pub fn format_conflicts_output(data: &serde_json::Value) -> String {
         .unwrap_or("Unknown");
 
     out.push_str(&format!("Score: {}\n", format_score(score)));
-    out.push_str(&format!("Merge order: {}\n", format_merge_order(merge_order)));
+    out.push_str(&format!(
+        "Merge order: {}\n",
+        format_merge_order(merge_order)
+    ));
     out.push_str(&format!("Overlaps: {}\n", overlaps.len()));
     out.push_str(&"─".repeat(60));
     out.push('\n');
@@ -108,14 +116,8 @@ fn format_overlap(overlap: &serde_json::Value) -> String {
 
 fn format_file_overlap(data: &serde_json::Value) -> String {
     let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-    let a_change = data
-        .get("a_change")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    let b_change = data
-        .get("b_change")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
+    let a_change = data.get("a_change").and_then(|v| v.as_str()).unwrap_or("?");
+    let b_change = data.get("b_change").and_then(|v| v.as_str()).unwrap_or("?");
     format!("  FILE  {path}  (A: {a_change}, B: {b_change})")
 }
 
@@ -141,13 +143,8 @@ fn format_hunk_overlap(data: &serde_json::Value) -> String {
         .and_then(|v| v.get("end"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let distance = data
-        .get("distance")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    format!(
-        "  HUNK  {path}  A:[{a_start}-{a_end}] B:[{b_start}-{b_end}] dist={distance}"
-    )
+    let distance = data.get("distance").and_then(|v| v.as_u64()).unwrap_or(0);
+    format!("  HUNK  {path}  A:[{a_start}-{a_end}] B:[{b_start}-{b_end}] dist={distance}")
 }
 
 fn format_symbol_overlap(data: &serde_json::Value) -> String {
@@ -176,28 +173,14 @@ fn format_dependency_overlap(data: &serde_json::Value) -> String {
         .get("affected_file")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    format!(
-        "  DEP  {changed_file} -> {affected_file}  (export change breaks downstream)"
-    )
+    format!("  DEP  {changed_file} -> {affected_file}  (export change breaks downstream)")
 }
 
 fn format_schema_overlap(data: &serde_json::Value) -> String {
-    let category = data
-        .get("category")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    let a_file = data
-        .get("a_file")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    let b_file = data
-        .get("b_file")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    let detail = data
-        .get("detail")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let category = data.get("category").and_then(|v| v.as_str()).unwrap_or("?");
+    let a_file = data.get("a_file").and_then(|v| v.as_str()).unwrap_or("?");
+    let b_file = data.get("b_file").and_then(|v| v.as_str()).unwrap_or("?");
+    let detail = data.get("detail").and_then(|v| v.as_str()).unwrap_or("");
     format!("  SCHEMA [{category}]  A: {a_file}, B: {b_file}  {detail}")
 }
 
@@ -235,7 +218,10 @@ mod tests {
         assert_eq!(format_merge_order("AFirst"), "Merge A first");
         assert_eq!(format_merge_order("BFirst"), "Merge B first");
         assert_eq!(format_merge_order("Either"), "Either order");
-        assert_eq!(format_merge_order("NeedsCoordination"), "Needs coordination");
+        assert_eq!(
+            format_merge_order("NeedsCoordination"),
+            "Needs coordination"
+        );
         assert_eq!(format_merge_order("Other"), "Other");
     }
 

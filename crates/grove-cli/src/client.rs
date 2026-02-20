@@ -95,6 +95,14 @@ impl DaemonClient {
         self.request("status", serde_json::json!({})).await
     }
 
+    pub async fn shutdown(&self, token: Option<&str>) -> Result<DaemonResponse, ClientError> {
+        let params = match token {
+            Some(token) => serde_json::json!({ "token": token }),
+            None => serde_json::json!({}),
+        };
+        self.request("shutdown", params).await
+    }
+
     pub async fn list_workspaces(&self) -> Result<DaemonResponse, ClientError> {
         self.request("list_workspaces", serde_json::json!({})).await
     }
@@ -123,7 +131,8 @@ impl DaemonClient {
     }
 
     pub async fn get_all_analyses(&self) -> Result<DaemonResponse, ClientError> {
-        self.request("get_all_analyses", serde_json::json!({})).await
+        self.request("get_all_analyses", serde_json::json!({}))
+            .await
     }
 }
 
@@ -203,7 +212,10 @@ mod tests {
         let json = r#"{"ok": false, "error": "parse failed at λ.rs: 你好 🚫"}"#;
         let response: DaemonResponse = serde_json::from_str(json).unwrap();
         assert!(!response.ok);
-        assert_eq!(response.error.as_deref(), Some("parse failed at λ.rs: 你好 🚫"));
+        assert_eq!(
+            response.error.as_deref(),
+            Some("parse failed at λ.rs: 你好 🚫")
+        );
     }
 
     #[test]
@@ -222,6 +234,18 @@ mod tests {
         assert_eq!(parsed["params"]["workspace_b"], "id-b");
     }
 
+    #[test]
+    fn shutdown_request_json_serializes_correctly() {
+        let request = serde_json::json!({
+            "method": "shutdown",
+            "params": {},
+        });
+        let line = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["method"], "shutdown");
+        assert_eq!(parsed["params"], serde_json::json!({}));
+    }
+
     // === Connection Error Tests ===
 
     #[tokio::test]
@@ -231,7 +255,10 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             ClientError::DaemonNotRunning(path) => {
-                assert_eq!(path, PathBuf::from("/tmp/grove-test-nonexistent-socket.sock"));
+                assert_eq!(
+                    path,
+                    PathBuf::from("/tmp/grove-test-nonexistent-socket.sock")
+                );
             }
             other => panic!("expected DaemonNotRunning, got: {other}"),
         }

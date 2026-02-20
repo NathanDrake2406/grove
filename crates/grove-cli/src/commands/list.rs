@@ -6,14 +6,19 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
     let response = client.list_workspaces().await?;
 
     if !response.ok {
-        let message = response.error.unwrap_or_else(|| "unknown error".to_string());
+        let message = response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string());
         return Err(CommandError::DaemonError(message));
     }
 
     let data = response.data.unwrap_or_default();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).unwrap_or_default()
+        );
         return Ok(());
     }
 
@@ -41,10 +46,7 @@ pub fn format_workspace_table(workspaces: &[serde_json::Value]) -> String {
     out.push('\n');
 
     for ws in workspaces {
-        let id = ws
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(unknown)");
+        let id = ws.get("id").and_then(|v| v.as_str()).unwrap_or("(unknown)");
         let name = ws
             .get("name")
             .and_then(|v| v.as_str())
@@ -72,10 +74,18 @@ pub fn format_workspace_table(workspaces: &[serde_json::Value]) -> String {
 }
 
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         s.to_string()
+    } else if max_len == 0 {
+        String::new()
+    } else if max_len == 1 {
+        "…".to_string()
     } else {
-        format!("{}…", &s[..max_len - 1])
+        let mut out = String::new();
+        out.extend(s.chars().take(max_len - 1));
+        out.push('…');
+        out
     }
 }
 
@@ -193,9 +203,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    fn truncate_panics_when_cutting_unicode_mid_codepoint() {
-        let _ = truncate("ééééé", 4);
+    fn truncate_unicode_is_codepoint_safe() {
+        let result = truncate("ééééé", 4);
+        assert_eq!(result, "ééé…");
+        assert_eq!(result.chars().count(), 4);
+    }
+
+    #[test]
+    fn truncate_zero_len_returns_empty_string() {
+        assert_eq!(truncate("hello", 0), "");
     }
 
     #[test]

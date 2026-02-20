@@ -71,8 +71,10 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             commands::init::execute(shell)?;
             return Ok(());
         }
-        Some(Commands::Daemon { action }) => {
-            handle_daemon_action(action)?;
+        Some(Commands::Daemon {
+            action: DaemonAction::Start,
+        }) => {
+            handle_daemon_start();
             return Ok(());
         }
         _ => {}
@@ -92,27 +94,79 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Conflicts { a, b }) => {
             commands::conflicts::execute(&client, &a, &b, args.json).await?;
         }
+        Some(Commands::Daemon {
+            action: DaemonAction::Stop,
+        }) => {
+            handle_daemon_stop(&client, &grove_dir, args.json).await?;
+        }
+        Some(Commands::Daemon {
+            action: DaemonAction::Status,
+        }) => {
+            commands::status::execute(&client, args.json).await?;
+        }
         // Already handled above; included for exhaustive matching.
-        Some(Commands::Daemon { .. }) | Some(Commands::Init { .. }) => {
+        Some(Commands::Daemon {
+            action: DaemonAction::Start,
+        })
+        | Some(Commands::Init { .. }) => {
             unreachable!("handled above");
         }
     }
     Ok(())
 }
 
-fn handle_daemon_action(action: &DaemonAction) -> Result<(), Box<dyn std::error::Error>> {
-    match action {
-        DaemonAction::Start => {
-            println!("Starting daemon...");
-        }
-        DaemonAction::Stop => {
-            println!("Stopping daemon...");
-        }
-        DaemonAction::Status => {
-            println!("Checking daemon status...");
-        }
+fn handle_daemon_start() {
+    println!("Starting daemon...");
+}
+
+async fn handle_daemon_stop(
+    client: &DaemonClient,
+    grove_dir: &std::path::Path,
+    json: bool,
+) -> Result<(), commands::CommandError> {
+    let shutdown_token = read_shutdown_token_file(grove_dir)?;
+    let response = client.shutdown(shutdown_token.as_deref()).await?;
+
+    if !response.ok {
+        let message = response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string());
+        return Err(commands::CommandError::DaemonError(message));
     }
+
+    if json {
+        let data = response
+            .data
+            .unwrap_or_else(|| serde_json::json!({ "status": "shutdown_requested" }));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).unwrap_or_default()
+        );
+    } else {
+        println!("Daemon shutdown requested.");
+    }
+
     Ok(())
+}
+
+fn read_shutdown_token_file(
+    grove_dir: &std::path::Path,
+) -> Result<Option<String>, commands::CommandError> {
+    let token_path = grove_dir.join("daemon.shutdown.token");
+    match std::fs::read_to_string(&token_path) {
+        Ok(contents) => {
+            let token = contents.trim().to_string();
+            if token.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(token))
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(commands::CommandError::DaemonError(format!(
+            "failed to read shutdown token: {e}"
+        ))),
+    }
 }
 
 /// Walk up from the given directory looking for a `.grove/` directory.

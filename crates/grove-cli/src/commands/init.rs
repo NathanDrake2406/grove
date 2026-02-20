@@ -128,10 +128,7 @@ mod tests {
             output.contains("--print-path"),
             "should pass --print-path to the switch command"
         );
-        assert!(
-            output.contains("cd"),
-            "should cd to the target directory"
-        );
+        assert!(output.contains("cd"), "should cd to the target directory");
     }
 
     /// Helper: run execute() and capture what would be printed.

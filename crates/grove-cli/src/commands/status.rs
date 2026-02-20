@@ -7,14 +7,19 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
     let response = client.status().await?;
 
     if !response.ok {
-        let message = response.error.unwrap_or_else(|| "unknown error".to_string());
+        let message = response
+            .error
+            .unwrap_or_else(|| "unknown error".to_string());
         return Err(CommandError::DaemonError(message));
     }
 
     let data = response.data.unwrap_or_default();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&data).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&data).unwrap_or_default()
+        );
         return Ok(());
     }
 
@@ -35,10 +40,7 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
     println!("{}", "─".repeat(40));
     println!("  Workspaces:  {}", workspace_count);
     println!("  Analyses:    {}", analysis_count);
-    println!(
-        "  Base commit: {}",
-        format_commit(base_commit)
-    );
+    println!("  Base commit: {}", format_commit(base_commit));
 
     Ok(())
 }
@@ -64,10 +66,7 @@ pub fn format_status_output(data: &serde_json::Value) -> String {
     out.push('\n');
     out.push_str(&format!("  Workspaces:  {workspace_count}\n"));
     out.push_str(&format!("  Analyses:    {analysis_count}\n"));
-    out.push_str(&format!(
-        "  Base commit: {}\n",
-        format_commit(base_commit)
-    ));
+    out.push_str(&format!("  Base commit: {}\n", format_commit(base_commit)));
     out
 }
 
