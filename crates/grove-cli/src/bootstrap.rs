@@ -198,6 +198,41 @@ fn derive_name(path: &std::path::Path, branch: Option<&str>) -> String {
     }
 }
 
+/// Full bootstrap: resolve git context → ensure .grove/ → ensure daemon → discover worktrees → sync.
+/// Returns a connected `DaemonClient` ready for use.
+pub async fn bootstrap() -> Result<(DaemonClient, std::path::PathBuf), String> {
+    let ctx = resolve_git_context()?;
+    let grove_dir = ensure_grove_dir(&ctx)?;
+    let client = ensure_daemon(&grove_dir).await?;
+
+    let worktrees = discover_worktrees()?;
+
+    // Build the sync payload
+    let worktree_params: Vec<serde_json::Value> = worktrees
+        .iter()
+        .map(|wt| {
+            serde_json::json!({
+                "name": wt.name,
+                "path": wt.path.to_string_lossy(),
+                "branch": wt.branch.as_deref().unwrap_or(""),
+                "head": wt.head,
+            })
+        })
+        .collect();
+
+    let resp = client
+        .sync_worktrees(serde_json::Value::Array(worktree_params))
+        .await
+        .map_err(|e| format!("sync_worktrees failed: {e}"))?;
+
+    if !resp.ok {
+        let msg = resp.error.unwrap_or_else(|| "unknown error".to_string());
+        return Err(format!("sync_worktrees error: {msg}"));
+    }
+
+    Ok((client, grove_dir))
+}
+
 fn run_git(args: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(args)
