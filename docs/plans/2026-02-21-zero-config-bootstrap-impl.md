@@ -10,6 +10,36 @@
 
 ---
 
+## Parallel Execution Strategy
+
+**This plan has three independent tracks that MUST be executed in parallel using superpowers:dispatching-parallel-agents.** Do not run them sequentially — launch Track A and Track B+C as two parallel agents, then run the merge phase after both complete.
+
+```
+Track A (daemon-side)          Track B+C (CLI + rendering)
+─────────────────────          ────────────────────────────
+Task 1: UUID v5 dep            Task 5: Bootstrap module
+Task 2: Idempotent reg/remove  Task 6: Daemon liveness
+Task 3: SyncWorktrees state    Task 9: Smart status rendering
+Task 4: Socket protocol
+         ↘                        ↙
+     Merge Phase (sequential after both tracks complete)
+     ─────────────────────────────────────────────────
+     Task 7:  Bootstrap orchestrator
+     Task 8:  Wire into CLI entry point
+     Task 10: Integration smoke test
+     Task 11: Cleanup
+```
+
+**Track A** modifies `grove-daemon` (state actor + socket protocol) and `grove-cli/client.rs`. Zero overlap with Track B+C.
+
+**Track B+C** creates `grove-cli/bootstrap.rs` and modifies `grove-cli/commands/status.rs`. Zero overlap with Track A.
+
+**Merge Phase** depends on both tracks completing. Tasks 7-11 run sequentially in one agent.
+
+After each track completes, run `cargo build` and `cargo test` for the affected crate to catch issues before the merge phase.
+
+---
+
 ## Task 1: Add UUID v5 support to workspace dependencies
 
 **Files:**
