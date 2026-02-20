@@ -8,7 +8,11 @@ pub async fn execute(
     workspace_b: &str,
     json: bool,
 ) -> Result<(), CommandError> {
-    let response = client.conflicts(workspace_a, workspace_b).await?;
+    // Resolve human-friendly names to UUIDs.
+    let id_a = resolve_workspace_id(client, workspace_a).await?;
+    let id_b = resolve_workspace_id(client, workspace_b).await?;
+
+    let response = client.conflicts(&id_a, &id_b).await?;
 
     if !response.ok {
         let message = response
@@ -29,6 +33,78 @@ pub async fn execute(
 
     println!("{}", format_conflicts_output(&data));
     Ok(())
+}
+
+/// Resolve a workspace identifier to its UUID.
+///
+/// Accepts:
+/// - An exact workspace name (e.g. "feature/auth", "main")
+/// - An exact branch short name (e.g. "feature/auth" matches refs/heads/feature/auth)
+///
+/// Errors if no workspace matches or if multiple workspaces match.
+async fn resolve_workspace_id(
+    client: &DaemonClient,
+    query: &str,
+) -> Result<String, CommandError> {
+    let response = client.list_workspaces().await?;
+    if !response.ok {
+        return Err(CommandError::DaemonError(
+            "failed to list workspaces for name resolution".to_string(),
+        ));
+    }
+
+    let workspaces = response
+        .data
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    let matches: Vec<_> = workspaces
+        .iter()
+        .filter(|ws| workspace_matches_exact(ws, query))
+        .collect();
+
+    match matches.len() {
+        0 => Err(CommandError::DaemonError(format!(
+            "no workspace matching '{query}'"
+        ))),
+        1 => {
+            let id = matches[0]
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            Ok(id.to_string())
+        }
+        _ => {
+            let names: Vec<_> = matches
+                .iter()
+                .filter_map(|ws| ws.get("name").and_then(|v| v.as_str()))
+                .collect();
+            Err(CommandError::DaemonError(format!(
+                "'{query}' is ambiguous — matches: {}",
+                names.join(", ")
+            )))
+        }
+    }
+}
+
+/// Strict exact match against workspace name or branch short name.
+fn workspace_matches_exact(ws: &serde_json::Value, query: &str) -> bool {
+    // Exact match on workspace name.
+    if let Some(name) = ws.get("name").and_then(|v| v.as_str()) {
+        if name.eq_ignore_ascii_case(query) {
+            return true;
+        }
+    }
+
+    // Exact match on branch short name (strip refs/heads/).
+    if let Some(branch) = ws.get("branch").and_then(|v| v.as_str()) {
+        let short = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if short.eq_ignore_ascii_case(query) {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Format a pair analysis JSON value as plain-text output (extracted for testing).
@@ -515,5 +591,58 @@ mod tests {
         assert!(output.contains("src/你好.ts::λ_transform"));
         assert!(output.contains("A: changed 変数"));
         assert!(output.contains("B: added 🚀"));
+    }
+
+    // === Workspace Name Resolution Tests ===
+
+    fn make_workspace(id: &str, name: &str, branch: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "branch": format!("refs/heads/{branch}"),
+        })
+    }
+
+    #[test]
+    fn workspace_matches_exact_name() {
+        let ws = make_workspace("1", "feature/auth", "feature/auth");
+        assert!(workspace_matches_exact(&ws, "feature/auth"));
+    }
+
+    #[test]
+    fn workspace_matches_exact_name_main() {
+        let ws = make_workspace("1", "main", "main");
+        assert!(workspace_matches_exact(&ws, "main"));
+    }
+
+    #[test]
+    fn workspace_does_not_match_partial_name() {
+        let ws = make_workspace("1", "feature/auth", "feature/auth");
+        assert!(!workspace_matches_exact(&ws, "auth"));
+    }
+
+    #[test]
+    fn workspace_does_not_match_substring() {
+        let ws = make_workspace("1", "feature/auth-refactor", "feature/auth-refactor");
+        assert!(!workspace_matches_exact(&ws, "feature/auth"));
+    }
+
+    #[test]
+    fn workspace_matches_case_insensitive() {
+        let ws = make_workspace("1", "feature/Auth", "feature/Auth");
+        assert!(workspace_matches_exact(&ws, "feature/auth"));
+        assert!(workspace_matches_exact(&ws, "FEATURE/AUTH"));
+    }
+
+    #[test]
+    fn workspace_matches_branch_when_name_differs() {
+        let ws = make_workspace("1", "some-name", "hotfix/payments");
+        assert!(workspace_matches_exact(&ws, "hotfix/payments"));
+    }
+
+    #[test]
+    fn workspace_does_not_match_unrelated_query() {
+        let ws = make_workspace("1", "feature/auth", "feature/auth");
+        assert!(!workspace_matches_exact(&ws, "feature/payments"));
     }
 }
