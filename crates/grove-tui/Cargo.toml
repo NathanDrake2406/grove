@@ -1,0 +1,14 @@
+[package]
+name = "grove-tui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+grove-lib = { path = "../grove-lib" }
+grove-cli = { path = "../grove-cli" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }

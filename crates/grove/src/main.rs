@@ -51,10 +51,37 @@ fn main() {
 /// Build a tokio runtime and run the CLI entry point.
 fn run_cli(args: grove_cli::CliArgs) -> ! {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    if let Err(e) = rt.block_on(grove_cli::run(args)) {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    
+    // Check if we requested the TUI explicitly
+    let is_explicit_dashboard = matches!(args.command, Some(grove_cli::Commands::Dashboard));
+    
+    // Or if we should fallback to the TUI (no command + interactive TTY)
+    use crossterm::tty::IsTty;
+    let is_fallback_dashboard = args.command.is_none() && std::io::stdout().is_tty() && !args.json;
+    let fallback_to_status = args.command.is_none() && (!std::io::stdout().is_tty() || args.json);
+
+    // Get the client from the standard CLI run (which handles bootstrap)
+    let client = match rt.block_on(grove_cli::run(args)) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if is_explicit_dashboard || is_fallback_dashboard {
+        if let Err(e) = rt.block_on(grove_tui::run(client)) {
+            eprintln!("Interactive dashboard error: {e}");
+            std::process::exit(1);
+        }
+    } else if fallback_to_status {
+        // Fallback for non-interactive `grove`
+        if let Err(e) = rt.block_on(grove_cli::commands::status::execute(&client, false)) {
+            eprintln!("error executing status fallback: {e}");
+            std::process::exit(1);
+        }
     }
+    
     std::process::exit(0);
 }
 

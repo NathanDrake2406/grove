@@ -10,9 +10,11 @@ path = "src/main.rs"
 [dependencies]
 grove-cli = { path = "../grove-cli" }
 grove-daemon = { path = "../grove-daemon" }
+grove-tui = { path = "../grove-tui" }
 daemonize = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
+crossterm = { workspace = true }
 
 [dev-dependencies]
 grove-lib = { path = "../grove-lib" }

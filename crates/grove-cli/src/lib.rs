@@ -28,6 +28,9 @@ pub struct CliArgs {
 pub enum Commands {
     /// Show workspace status overview
     Status,
+    
+    /// Open the live interactive dashboard (TUI)
+    Dashboard,
 
     /// List all workspaces
     List,
@@ -65,18 +68,19 @@ pub enum DaemonAction {
 
 // === Entrypoint ===
 
-pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Error>> {
     // Handle commands that don't require a grove workspace or daemon connection.
     match &args.command {
         Some(Commands::Init { shell }) => {
             commands::init::execute(shell)?;
-            return Ok(());
+            // No client needed/created for init
+            std::process::exit(0);
         }
         Some(Commands::Daemon {
             action: DaemonAction::Start,
         }) => {
             handle_daemon_start();
-            return Ok(());
+            std::process::exit(0);
         }
         _ => {}
     }
@@ -90,7 +94,7 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             let socket_path = grove_dir.join("daemon.sock");
             let client = DaemonClient::new(&socket_path);
             handle_daemon_stop(&client, &grove_dir, args.json).await?;
-            return Ok(());
+            return Ok(client);
         }
         Some(Commands::Daemon {
             action: DaemonAction::Status,
@@ -99,7 +103,7 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             let socket_path = grove_dir.join("daemon.sock");
             let client = DaemonClient::new(&socket_path);
             commands::status::execute(&client, args.json).await?;
-            return Ok(());
+            return Ok(client);
         }
         _ => {}
     }
@@ -110,8 +114,13 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     match args.command {
-        Some(Commands::Status) | None => {
+        Some(Commands::Status) => {
             commands::status::execute(&client, args.json).await?;
+        }
+        Some(Commands::Dashboard) | None => {
+            // Handled by the main binary to avoid cyclic dependency.
+            // When `run` is called by the `grove` binary, it expects CLI commands to execute
+            // except for Dashboard/TTY fallbacks, which the binary handles itself.
         }
         Some(Commands::List) => {
             commands::list::execute(&client, args.json).await?;
@@ -124,7 +133,8 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
             unreachable!("handled above");
         }
     }
-    Ok(())
+    
+    Ok(client)
 }
 
 fn handle_daemon_start() {
