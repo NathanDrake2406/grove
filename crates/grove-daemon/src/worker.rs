@@ -7,7 +7,7 @@ use grove_lib::{
     ChangeType, ExportDelta, ExportedSymbol, FileChange, Hunk, LineRange, Signature, Symbol,
     Workspace, WorkspaceChangeset, WorkspacePairAnalysis,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -182,18 +182,20 @@ fn extract_changeset(
     config: &GroveConfig,
     workspace: &Workspace,
 ) -> Result<WorkspaceChangeset, WorkerError> {
+    use crate::git::{GitRepo, compute_hunks_from_content};
+
     let base_ref = if workspace.base_ref.is_empty() {
         config.base_branch.as_str()
     } else {
         workspace.base_ref.as_str()
     };
 
-    let merge_base = git_output_line(
-        &workspace.path,
-        ["merge-base", "HEAD", base_ref],
-        "merge-base",
-    )?;
+    let git = GitRepo::open(&workspace.path)?;
 
+    // Phase 2A: merge-base via gix (was subprocess)
+    let merge_base = git.merge_base("HEAD", base_ref)?;
+
+    // ahead/behind: kept as subprocess (runs once, ~2ms, not worth graph walk complexity)
     let ahead_behind = git_output_line(
         &workspace.path,
         [
@@ -208,54 +210,40 @@ fn extract_changeset(
     .and_then(|line| parse_left_right_counts(&line))
     .unwrap_or((0, 0));
 
-    let status_output = git_output(
-        &workspace.path,
-        [
-            "diff",
-            "--name-status",
-            "--find-renames",
-            "--no-color",
-            &format!("{merge_base}..HEAD"),
-        ],
-        "diff --name-status",
-    )?;
-    let statuses = parse_name_status_output(&status_output);
+    // Phase 2B: diff name-status via gix tree diff (was subprocess)
+    let base_tree = git.resolve_tree(&merge_base)?;
+    let head_tree = git.resolve_tree("HEAD")?;
+    let statuses = git.diff_name_status(&base_tree, &head_tree)?;
 
-    let patch_output = git_output(
-        &workspace.path,
-        [
-            "diff",
-            "--unified=0",
-            "--find-renames",
-            "--no-color",
-            &format!("{merge_base}..HEAD"),
-        ],
-        "diff --unified=0",
-    )?;
-    let hunks_by_path = parse_unified_diff_hunks(&patch_output);
+    // Phase 1: resolve trees once, reuse for all blob reads (was 2N subprocesses)
+    let mut base_tree_mut = git.resolve_tree(&merge_base)?;
+    let mut head_tree_mut = git.resolve_tree("HEAD")?;
 
     let mut files = Vec::new();
     let registry = LanguageRegistry::with_defaults();
     let max_file_size_bytes = config.max_file_size_kb * 1024;
 
     for status in statuses {
-        let hunks = hunks_by_path.get(&status.path).cloned().unwrap_or_default();
         let old_path = status.old_path.as_deref().unwrap_or(status.path.as_path());
         let new_path = status.path.as_path();
 
+        // Phase 1: read blobs in-process (was git show subprocess per file)
         let old_content = match status.change_type {
             ChangeType::Added => None,
             ChangeType::Modified | ChangeType::Deleted | ChangeType::Renamed => {
-                git_show_file(&workspace.path, &merge_base, old_path)
+                git.read_blob(&mut base_tree_mut, old_path)
             }
         };
 
         let new_content = match status.change_type {
             ChangeType::Deleted => None,
             ChangeType::Added | ChangeType::Modified | ChangeType::Renamed => {
-                git_show_file(&workspace.path, "HEAD", new_path)
+                git.read_blob(&mut head_tree_mut, new_path)
             }
         };
+
+        // Phase 2C: compute hunks in-process from content (was git diff --unified=0 subprocess)
+        let hunks = compute_hunks_from_content(old_content.as_deref(), new_content.as_deref());
 
         let symbols_modified = extract_modified_symbols(
             &registry,
@@ -306,132 +294,10 @@ fn parse_left_right_counts(value: &str) -> Option<(u32, u32)> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct DiffFileStatus {
-    path: PathBuf,
-    old_path: Option<PathBuf>,
-    change_type: ChangeType,
-}
-
-fn parse_name_status_output(output: &str) -> Vec<DiffFileStatus> {
-    let mut parsed = Vec::new();
-
-    for line in output.lines() {
-        let mut parts = line.split('\t');
-        let Some(status) = parts.next() else {
-            continue;
-        };
-
-        if status.starts_with('R') {
-            let Some(old_path) = parts.next() else {
-                continue;
-            };
-            let Some(new_path) = parts.next() else {
-                continue;
-            };
-            parsed.push(DiffFileStatus {
-                path: PathBuf::from(new_path),
-                old_path: Some(PathBuf::from(old_path)),
-                change_type: ChangeType::Renamed,
-            });
-            continue;
-        }
-
-        let Some(path) = parts.next() else {
-            continue;
-        };
-
-        let change_type = match status.chars().next() {
-            Some('A') => ChangeType::Added,
-            Some('D') => ChangeType::Deleted,
-            Some('M') => ChangeType::Modified,
-            _ => ChangeType::Modified,
-        };
-
-        parsed.push(DiffFileStatus {
-            path: PathBuf::from(path),
-            old_path: None,
-            change_type,
-        });
-    }
-
-    parsed
-}
-
-fn parse_unified_diff_hunks(output: &str) -> HashMap<PathBuf, Vec<Hunk>> {
-    let mut hunks_by_path: HashMap<PathBuf, Vec<Hunk>> = HashMap::new();
-    let mut current_path: Option<PathBuf> = None;
-
-    for line in output.lines() {
-        if let Some((old_path, new_path)) = parse_diff_header_paths(line) {
-            current_path = if new_path == Path::new("/dev/null") {
-                Some(old_path)
-            } else {
-                Some(new_path)
-            };
-            continue;
-        }
-
-        if let Some(hunk) = parse_hunk_header(line)
-            && let Some(path) = current_path.clone()
-        {
-            hunks_by_path.entry(path).or_default().push(hunk);
-        }
-    }
-
-    hunks_by_path
-}
-
-fn parse_diff_header_paths(line: &str) -> Option<(PathBuf, PathBuf)> {
-    if !line.starts_with("diff --git ") {
-        return None;
-    }
-
-    let mut tokens = line.split_whitespace();
-    let _ = tokens.next()?; // diff
-    let _ = tokens.next()?; // --git
-    let old = tokens.next()?;
-    let new = tokens.next()?;
-
-    Some((
-        PathBuf::from(strip_diff_prefix(old)),
-        PathBuf::from(strip_diff_prefix(new)),
-    ))
-}
-
-fn strip_diff_prefix(value: &str) -> &str {
-    value
-        .strip_prefix("a/")
-        .or_else(|| value.strip_prefix("b/"))
-        .unwrap_or(value)
-}
-
-fn parse_hunk_header(line: &str) -> Option<Hunk> {
-    if !line.starts_with("@@ -") {
-        return None;
-    }
-
-    let without_prefix = line.strip_prefix("@@ -")?;
-    let (ranges, _) = without_prefix.split_once(" @@")?;
-    let (old_range, new_range) = ranges.split_once(" +")?;
-    let (old_start, old_lines) = parse_diff_range(old_range)?;
-    let (new_start, new_lines) = parse_diff_range(new_range)?;
-
-    Some(Hunk {
-        old_start,
-        old_lines,
-        new_start,
-        new_lines,
-    })
-}
-
-fn parse_diff_range(range: &str) -> Option<(u32, u32)> {
-    let mut parts = range.split(',');
-    let start = parts.next()?.parse::<u32>().ok()?;
-    let lines = parts
-        .next()
-        .map(|v| v.parse::<u32>().ok())
-        .unwrap_or(Some(1))?;
-    Some((start, lines))
+pub(crate) struct DiffFileStatus {
+    pub(crate) path: PathBuf,
+    pub(crate) old_path: Option<PathBuf>,
+    pub(crate) change_type: ChangeType,
 }
 
 fn extract_modified_symbols(
@@ -575,21 +441,6 @@ fn exported_to_symbol(exported: &ExportedSymbol) -> Symbol {
     }
 }
 
-fn git_show_file(repo_path: &Path, revision: &str, path: &Path) -> Option<Vec<u8>> {
-    let spec = format!("{}:{}", revision, path.to_string_lossy());
-    let output = Command::new("git")
-        .current_dir(repo_path)
-        .args(["show", spec.as_str()])
-        .output()
-        .ok()?;
-
-    if output.status.success() {
-        Some(output.stdout)
-    } else {
-        None
-    }
-}
-
 fn git_output_line<const N: usize>(
     repo_path: &Path,
     args: [&str; N],
@@ -649,6 +500,12 @@ pub enum WorkerError {
         repo_path: PathBuf,
         source: std::string::FromUtf8Error,
     },
+    #[error("gix error during {context} in {repo_path}: {detail}")]
+    Gix {
+        context: &'static str,
+        repo_path: PathBuf,
+        detail: String,
+    },
 }
 
 pub(crate) fn canonical_pair(
@@ -698,42 +555,6 @@ mod tests {
             last_activity: Utc::now(),
             metadata: WorkspaceMetadata::default(),
         }
-    }
-
-    #[test]
-    fn parses_name_status_with_rename() {
-        let output = "M\tsrc/lib.rs\nA\tsrc/new.rs\nD\tsrc/old.rs\nR100\tsrc/from.rs\tsrc/to.rs\n";
-        let statuses = parse_name_status_output(output);
-
-        assert_eq!(statuses.len(), 4);
-        assert_eq!(statuses[0].change_type, ChangeType::Modified);
-        assert_eq!(statuses[1].change_type, ChangeType::Added);
-        assert_eq!(statuses[2].change_type, ChangeType::Deleted);
-        assert_eq!(statuses[3].change_type, ChangeType::Renamed);
-        assert_eq!(statuses[3].old_path, Some(PathBuf::from("src/from.rs")));
-        assert_eq!(statuses[3].path, PathBuf::from("src/to.rs"));
-    }
-
-    #[test]
-    fn parses_unified_diff_hunks() {
-        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1,2 +1,3 @@\n+line\ndiff --git a/src/old.rs b/src/old.rs\n@@ -10 +10,0 @@\n-line\n";
-
-        let hunks = parse_unified_diff_hunks(diff);
-        assert_eq!(hunks.len(), 2);
-
-        let first = hunks
-            .get(&PathBuf::from("src/lib.rs"))
-            .expect("first file hunks should exist");
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].old_start, 1);
-        assert_eq!(first[0].old_lines, 2);
-        assert_eq!(first[0].new_start, 1);
-        assert_eq!(first[0].new_lines, 3);
-
-        let second = hunks
-            .get(&PathBuf::from("src/old.rs"))
-            .expect("second file hunks should exist");
-        assert_eq!(second[0].new_lines, 0);
     }
 
     #[test]

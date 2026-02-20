@@ -1,4 +1,5 @@
 pub mod db;
+pub(crate) mod git;
 pub mod lifecycle;
 pub mod socket;
 pub mod state;
@@ -395,17 +396,15 @@ async fn resolve_base_branch_commit(
 ) -> Option<String> {
     let workspaces = list_workspaces(state_tx).await;
     let repo_path = workspaces.into_iter().next()?.path;
-    let output = std::process::Command::new("git")
-        .current_dir(&repo_path)
-        .args(["rev-parse", base_branch])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    let base_branch = base_branch.to_string();
 
-    let commit = String::from_utf8(output.stdout).ok()?;
-    Some(commit.trim().to_string())
+    tokio::task::spawn_blocking(move || {
+        let repo = gix::open(&repo_path).ok()?;
+        let id = repo.rev_parse_single(base_branch.as_bytes()).ok()?;
+        Some(id.to_hex().to_string())
+    })
+    .await
+    .ok()?
 }
 
 fn write_shutdown_token_file(path: &Path) -> Result<String, lifecycle::LifecycleError> {
