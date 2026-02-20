@@ -1,15 +1,18 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use grove_cli::client::DaemonClient;
-use grove_lib::{Workspace, WorkspacePairAnalysis};
+use grove_lib::{OrthogonalityScore, Workspace, WorkspacePairAnalysis};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusedPanel {
+    Worktrees,
+    Pairs,
+}
 
 #[derive(Debug)]
 pub enum ViewState {
     Loading,
     NoWorktrees,
     Dashboard,
-    PairDetail {
-        analysis: WorkspacePairAnalysis,
-    },
     Error(String),
 }
 
@@ -20,9 +23,6 @@ impl PartialEq for ViewState {
             (Self::Loading, Self::Loading) => true,
             (Self::NoWorktrees, Self::NoWorktrees) => true,
             (Self::Dashboard, Self::Dashboard) => true,
-            (Self::PairDetail { analysis: a }, Self::PairDetail { analysis: b }) => {
-                a.workspace_a == b.workspace_a && a.workspace_b == b.workspace_b
-            }
             (Self::Error(a), Self::Error(b)) => a == b,
             _ => false,
         }
@@ -39,10 +39,14 @@ pub struct App {
     // Data models
     pub workspaces: Vec<Workspace>,
     pub analyses: Vec<WorkspacePairAnalysis>,
+    pub base_commit: String,
 
     // Dashboard selection state
     pub selected_worktree_index: usize,
     pub selected_pair_index: usize,
+
+    // Dual-panel focus
+    pub focused_panel: FocusedPanel,
 }
 
 impl App {
@@ -53,13 +57,27 @@ impl App {
             view_state: ViewState::Loading,
             workspaces: Vec::new(),
             analyses: Vec::new(),
+            base_commit: String::new(),
             selected_worktree_index: 0,
             selected_pair_index: 0,
+            focused_panel: FocusedPanel::Worktrees,
         }
     }
 
     /// Fetches the latest data from the daemon.
     pub async fn refresh_data(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Fetch status for base_commit
+        let status_resp = self.client.status().await?;
+        if let Some(commit) = status_resp.ok
+            .then_some(status_resp.data.as_ref())
+            .flatten()
+            .and_then(|d| d.get("base_commit"))
+            .and_then(|v| v.as_str())
+        {
+            let short = if commit.len() > 8 { &commit[..8] } else { commit };
+            self.base_commit = short.to_string();
+        }
+
         // Fetch workspaces
         let ws_resp = self.client.list_workspaces().await?;
         if !ws_resp.ok {
@@ -68,7 +86,7 @@ impl App {
         }
 
         let new_workspaces: Vec<Workspace> = serde_json::from_value(ws_resp.data.unwrap_or_default())?;
-        
+
         // Fetch analyses
         let an_resp = self.client.get_all_analyses().await?;
         if !an_resp.ok {
@@ -78,12 +96,7 @@ impl App {
 
         let new_analyses: Vec<WorkspacePairAnalysis> = serde_json::from_value(an_resp.data.unwrap_or_default())?;
 
-        // Detect if anything changed
-        // For simplicity we use length + timestamp/content checks, or just compare JSON if derived traits are missing.
-        // In a real app we might diff or store last_computed to be more precise, but over-writing with new Vecs
-        // and setting is_dirty locally is fine.
-        
-        let changed = self.workspaces.len() != new_workspaces.len() 
+        let changed = self.workspaces.len() != new_workspaces.len()
             || self.analyses.len() != new_analyses.len()
             || !self.analyses_are_equal(&self.analyses, &new_analyses);
 
@@ -109,9 +122,6 @@ impl App {
         if old.len() != new.len() {
             return false;
         }
-        // Very basic structural check (time updated vs just same length).
-        // Since the prompt specifies deterministic overlap computation, we will assume if the length matches it's close enough,
-        // but to be precise we should compare `last_computed`.
         for (a, b) in old.iter().zip(new.iter()) {
             if a.last_computed != b.last_computed {
                 return false;
@@ -127,11 +137,37 @@ impl App {
         }
     }
 
+    /// Compute summary statistics for the header bar.
+    /// Returns (worktree_count, base_commit_short, conflict_count, clean_count).
+    pub fn summary_stats(&self) -> (usize, &str, usize, usize) {
+        let worktree_count = self.workspaces.len();
+        let base = if self.base_commit.is_empty() {
+            "(none)"
+        } else {
+            self.base_commit.as_str()
+        };
+
+        let conflict_count = self
+            .analyses
+            .iter()
+            .filter(|a| a.score != OrthogonalityScore::Green)
+            .count();
+
+        // Count worktrees that have at least one conflict pair
+        let conflict_ws_count = self
+            .workspaces
+            .iter()
+            .filter(|w| !self.get_pairs_for_worktree(&w.id).is_empty())
+            .count();
+        let clean_count = worktree_count.saturating_sub(conflict_ws_count);
+
+        (worktree_count, base, conflict_count, clean_count)
+    }
+
     pub fn handle_input(&mut self, key: KeyEvent) -> bool {
         // Return true if we should exit
         match self.view_state {
             ViewState::Dashboard => self.handle_dashboard_input(key),
-            ViewState::PairDetail { .. } => self.handle_detail_input(key),
             ViewState::Loading | ViewState::NoWorktrees | ViewState::Error(_) => {
                 matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
             }
@@ -141,46 +177,60 @@ impl App {
     fn handle_dashboard_input(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.workspaces.is_empty() {
-                    self.selected_worktree_index = (self.selected_worktree_index + 1).min(self.workspaces.len() - 1);
-                    self.selected_pair_index = 0;
-                    self.is_dirty = true;
-                }
+
+            KeyCode::Tab => {
+                self.focused_panel = match self.focused_panel {
+                    FocusedPanel::Worktrees => FocusedPanel::Pairs,
+                    FocusedPanel::Pairs => FocusedPanel::Worktrees,
+                };
+                self.is_dirty = true;
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if self.selected_worktree_index > 0 {
-                    self.selected_worktree_index -= 1;
-                    self.selected_pair_index = 0;
-                    self.is_dirty = true;
-                }
+
+            KeyCode::Char('r') => {
+                // Force refresh — mark dirty to re-draw; the tick will re-fetch data
+                self.is_dirty = true;
             }
-            KeyCode::Enter => {
-                // If they have selected a worktree, we find its conflicts
-                if let Some(ws) = self.workspaces.get(self.selected_worktree_index) {
-                    let pairs = self.get_pairs_for_worktree(&ws.id);
-                    if let Some(selected_pair) = pairs.get(self.selected_pair_index) {
-                        self.view_state = ViewState::PairDetail {
-                            analysis: (*selected_pair).clone(),
-                        };
+
+            KeyCode::Char('j') | KeyCode::Down => match self.focused_panel {
+                FocusedPanel::Worktrees => {
+                    if !self.workspaces.is_empty() {
+                        self.selected_worktree_index =
+                            (self.selected_worktree_index + 1).min(self.workspaces.len() - 1);
+                        self.selected_pair_index = 0;
                         self.is_dirty = true;
                     }
                 }
-            }
+                FocusedPanel::Pairs => {
+                    if let Some(ws) = self.workspaces.get(self.selected_worktree_index) {
+                        let pair_count = self.get_pairs_for_worktree(&ws.id).len();
+                        if pair_count > 0 {
+                            self.selected_pair_index =
+                                (self.selected_pair_index + 1).min(pair_count - 1);
+                            self.is_dirty = true;
+                        }
+                    }
+                }
+            },
+
+            KeyCode::Char('k') | KeyCode::Up => match self.focused_panel {
+                FocusedPanel::Worktrees => {
+                    if self.selected_worktree_index > 0 {
+                        self.selected_worktree_index -= 1;
+                        self.selected_pair_index = 0;
+                        self.is_dirty = true;
+                    }
+                }
+                FocusedPanel::Pairs => {
+                    if self.selected_pair_index > 0 {
+                        self.selected_pair_index -= 1;
+                        self.is_dirty = true;
+                    }
+                }
+            },
+
             _ => {}
         }
         false
-    }
-
-    fn handle_detail_input(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
-                self.view_state = ViewState::Dashboard;
-                self.is_dirty = true;
-                false
-            }
-            _ => false, // Could add pagination or scrolling within detail view later
-        }
     }
 
     /// Gets all analyses where the given workspace ID is either workspace_a or workspace_b.
@@ -190,7 +240,7 @@ impl App {
             .iter()
             .filter(|a| {
                 (a.workspace_a == *id || a.workspace_b == *id)
-                    && a.score != grove_lib::OrthogonalityScore::Green
+                    && a.score != OrthogonalityScore::Green
             })
             .collect()
     }
