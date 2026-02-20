@@ -1650,6 +1650,7 @@ dependencies = [
  "colored",
  "crossterm",
  "futures",
+ "gix",
  "grove-lib",
  "serde",
  "serde_json",
@@ -1665,6 +1666,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures",
+ "gix",
  "grove-lib",
  "ignore",
  "libc",
@@ -1672,6 +1674,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "thiserror",
  "tokio",

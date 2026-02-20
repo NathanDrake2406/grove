@@ -14,6 +14,7 @@ crossterm = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+gix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
