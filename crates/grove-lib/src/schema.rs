@@ -60,18 +60,18 @@ pub fn compute_schema_overlaps(a: &WorkspaceChangeset, b: &WorkspaceChangeset) -
     for a_file in &a.changed_files {
         if let Some(a_cat) = classify_schema_file(&a_file.path) {
             for b_file in &b.changed_files {
-                if let Some(b_cat) = classify_schema_file(&b_file.path) {
-                    if a_cat == b_cat {
-                        overlaps.push(Overlap::Schema {
-                            category: a_cat,
-                            a_file: a_file.path.clone(),
-                            b_file: b_file.path.clone(),
-                            detail: format!(
-                                "Both workspaces modify {:?} files",
-                                a_cat
-                            ),
-                        });
-                    }
+                if let Some(b_cat) = classify_schema_file(&b_file.path)
+                    && a_cat == b_cat
+                {
+                    overlaps.push(Overlap::Schema {
+                        category: a_cat,
+                        a_file: a_file.path.clone(),
+                        b_file: b_file.path.clone(),
+                        detail: format!(
+                            "Both workspaces modify {:?} files",
+                            a_cat
+                        ),
+                    });
                 }
             }
         }

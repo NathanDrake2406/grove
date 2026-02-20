@@ -7,6 +7,12 @@ pub struct RustAnalyzer {
     parser: std::sync::Mutex<Parser>,
 }
 
+impl Default for RustAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RustAnalyzer {
     pub fn new() -> Self {
         let mut parser = Parser::new();

@@ -311,12 +311,12 @@ impl Database {
         let imports_json = delta
             .imports
             .as_ref()
-            .map(|i| serde_json::to_string(i))
+            .map(serde_json::to_string)
             .transpose()?;
         let exports_json = delta
             .exports
             .as_ref()
-            .map(|e| serde_json::to_string(e))
+            .map(serde_json::to_string)
             .transpose()?;
 
         self.conn.execute(

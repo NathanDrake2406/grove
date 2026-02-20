@@ -8,6 +8,12 @@ pub struct TypeScriptAnalyzer {
     parser_tsx: std::sync::Mutex<Parser>,
 }
 
+impl Default for TypeScriptAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TypeScriptAnalyzer {
     pub fn new() -> Self {
         let mut parser_ts = Parser::new();
@@ -131,20 +137,20 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
                     // const/let/var declarations
                     let mut decl_cursor = child.walk();
                     for decl_child in child.children(&mut decl_cursor) {
-                        if decl_child.kind() == "variable_declarator" {
-                            if let Some(name_node) = decl_child.child_by_field_name("name") {
-                                let name =
-                                    name_node.utf8_text(source).unwrap_or("").to_string();
-                                symbols.push(Symbol {
-                                    name,
-                                    kind: SymbolKind::Variable,
-                                    range: LineRange {
-                                        start: child.start_position().row as u32 + 1,
-                                        end: child.end_position().row as u32 + 1,
-                                    },
-                                    signature: None,
-                                });
-                            }
+                        if decl_child.kind() == "variable_declarator"
+                            && let Some(name_node) = decl_child.child_by_field_name("name")
+                        {
+                            let name =
+                                name_node.utf8_text(source).unwrap_or("").to_string();
+                            symbols.push(Symbol {
+                                name,
+                                kind: SymbolKind::Variable,
+                                range: LineRange {
+                                    start: child.start_position().row as u32 + 1,
+                                    end: child.end_position().row as u32 + 1,
+                                },
+                                signature: None,
+                            });
                         }
                     }
                 }

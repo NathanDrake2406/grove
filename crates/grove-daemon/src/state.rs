@@ -1,7 +1,7 @@
 use grove_lib::graph::{GraphOverlay, ImportGraph};
 use grove_lib::{CommitHash, Workspace, WorkspaceId, WorkspacePairAnalysis};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -222,7 +222,7 @@ impl DaemonState {
 
     // === Message Handlers ===
 
-    fn handle_file_changed(&mut self, workspace_id: WorkspaceId, path: &PathBuf) {
+    fn handle_file_changed(&mut self, workspace_id: WorkspaceId, path: &Path) {
         if !self.workspaces.contains_key(&workspace_id) {
             warn!(workspace_id = %workspace_id, "file change for unknown workspace");
             return;
@@ -248,10 +248,10 @@ impl DaemonState {
             "analysis complete"
         );
 
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.save_pair_analysis(&result) {
-                error!(error = %e, "failed to persist pair analysis");
-            }
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_pair_analysis(&result)
+        {
+            error!(error = %e, "failed to persist pair analysis");
         }
 
         self.pair_analyses.insert(pair, result);
@@ -330,11 +330,11 @@ impl DaemonState {
         let id = workspace.id;
         info!(workspace_id = %id, name = %workspace.name, "registering workspace");
 
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.save_workspace(&workspace) {
-                error!(error = %e, "failed to persist workspace");
-                return Err(format!("persistence error: {e}"));
-            }
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_workspace(&workspace)
+        {
+            error!(error = %e, "failed to persist workspace");
+            return Err(format!("persistence error: {e}"));
         }
 
         self.workspaces.insert(id, workspace);
@@ -355,10 +355,10 @@ impl DaemonState {
         self.pair_analyses
             .retain(|(a, b), _| *a != workspace_id && *b != workspace_id);
 
-        if let Some(ref db) = self.db {
-            if let Err(e) = db.delete_workspace(workspace_id) {
-                error!(error = %e, "failed to delete workspace from db");
-            }
+        if let Some(ref db) = self.db
+            && let Err(e) = db.delete_workspace(workspace_id)
+        {
+            error!(error = %e, "failed to delete workspace from db");
         }
 
         Ok(())

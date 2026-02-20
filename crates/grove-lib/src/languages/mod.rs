@@ -28,6 +28,12 @@ pub struct LanguageRegistry {
     analyzers: Vec<Box<dyn LanguageAnalyzer>>,
 }
 
+impl Default for LanguageRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LanguageRegistry {
     pub fn new() -> Self {
         Self { analyzers: vec![] }
