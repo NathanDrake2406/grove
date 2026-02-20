@@ -5,9 +5,11 @@ pub mod state;
 pub mod watcher;
 
 use std::path::Path;
+use std::time::Duration;
 
 use thiserror::Error;
 use tracing::info;
+use uuid::Uuid;
 
 use crate::db::Database;
 use crate::lifecycle::DaemonPaths;
@@ -55,25 +57,32 @@ pub async fn run(config: GroveConfig, grove_dir: &Path) -> Result<(), DaemonErro
     let paths = DaemonPaths::from_grove_dir(grove_dir);
 
     // Ensure the grove directory exists
-    std::fs::create_dir_all(grove_dir)
-        .map_err(lifecycle::LifecycleError::Io)?;
+    std::fs::create_dir_all(grove_dir).map_err(lifecycle::LifecycleError::Io)?;
 
     // Write PID file — fails if another daemon is already running
     lifecycle::write_pid_file(&paths.pid_file)?;
+    let shutdown_token = write_shutdown_token_file(&paths.shutdown_token_file)?;
 
     // From this point on, always clean up PID + socket files on exit
-    let cleanup_result = run_inner(&config, &paths).await;
+    let cleanup_result = run_inner(&config, &paths, &shutdown_token).await;
 
     // Always clean up, regardless of success or failure
     if let Err(e) = lifecycle::cleanup(&paths.pid_file, &paths.socket_file) {
         tracing::warn!(error = %e, "cleanup error during shutdown");
+    }
+    if let Err(e) = remove_shutdown_token_file(&paths.shutdown_token_file) {
+        tracing::warn!(error = %e, "failed to remove shutdown token file");
     }
 
     cleanup_result
 }
 
 /// Inner run loop, separated so that `run()` can guarantee cleanup.
-async fn run_inner(config: &GroveConfig, paths: &DaemonPaths) -> Result<(), DaemonError> {
+async fn run_inner(
+    config: &GroveConfig,
+    paths: &DaemonPaths,
+    shutdown_token: &str,
+) -> Result<(), DaemonError> {
     // Initialize tracing (stderr + eventually file)
     init_tracing(&paths.log_file);
 
@@ -107,12 +116,22 @@ async fn run_inner(config: &GroveConfig, paths: &DaemonPaths) -> Result<(), Daem
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
 
     // Create and run socket server
-    let server = SocketServer::new(&paths.socket_file, state_tx.clone());
+    let server = SocketServer::new(&paths.socket_file, state_tx.clone())
+        .with_timeouts(
+            Duration::from_millis(config.socket_idle_timeout_ms),
+            Duration::from_millis(config.socket_state_reply_timeout_ms),
+        )
+        .with_shutdown_trigger(shutdown_tx.clone());
+    let server = server.with_shutdown_token(shutdown_token.to_string());
     info!(socket = %paths.socket_file.display(), "socket server created");
 
-    // Run socket server and shutdown signal concurrently
+    // Run socket server and shutdown signal concurrently. When a signal arrives,
+    // ask the server to stop and wait until it exits before shutting down state.
+    let server_run = server.run(shutdown_rx);
+    tokio::pin!(server_run);
+
     tokio::select! {
-        result = server.run(shutdown_rx) => {
+        result = &mut server_run => {
             if let Err(e) = result {
                 tracing::error!(error = %e, "socket server error");
                 return Err(DaemonError::Socket(e));
@@ -121,7 +140,15 @@ async fn run_inner(config: &GroveConfig, paths: &DaemonPaths) -> Result<(), Daem
         () = lifecycle::shutdown_signal() => {
             info!("shutdown signal received, initiating graceful shutdown");
             // Signal socket server to stop accepting connections
-            drop(shutdown_tx);
+            let _ = shutdown_tx.send(());
+
+            match server_run.await {
+                Ok(()) => {}
+                Err(e) => {
+                    tracing::error!(error = %e, "socket server error");
+                    return Err(DaemonError::Socket(e));
+                }
+            }
         }
     }
 
@@ -138,6 +165,26 @@ async fn run_inner(config: &GroveConfig, paths: &DaemonPaths) -> Result<(), Daem
 
     info!("grove daemon stopped");
     Ok(())
+}
+
+fn write_shutdown_token_file(path: &Path) -> Result<String, lifecycle::LifecycleError> {
+    let token = Uuid::new_v4().to_string();
+    std::fs::write(path, &token).map_err(lifecycle::LifecycleError::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(lifecycle::LifecycleError::Io)?;
+    }
+    Ok(token)
+}
+
+fn remove_shutdown_token_file(path: &Path) -> Result<(), lifecycle::LifecycleError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(lifecycle::LifecycleError::Io(e)),
+    }
 }
 
 #[cfg(test)]
@@ -187,9 +234,7 @@ mod tests {
         assert!(paths.pid_file.exists());
 
         // Verify it contains our PID
-        let pid = lifecycle::read_pid_file(&paths.pid_file)
-            .unwrap()
-            .unwrap();
+        let pid = lifecycle::read_pid_file(&paths.pid_file).unwrap().unwrap();
         assert_eq!(pid, std::process::id());
 
         // Cleanup removes it
@@ -228,7 +273,10 @@ mod tests {
 
         assert_eq!(watcher_config.debounce_ms, 250);
         assert_eq!(watcher_config.circuit_breaker_threshold, 50);
-        assert_eq!(watcher_config.ignore_patterns, vec!["custom_dir".to_string()]);
+        assert_eq!(
+            watcher_config.ignore_patterns,
+            vec!["custom_dir".to_string()]
+        );
         assert!(!watcher_config.respect_gitignore);
     }
 
@@ -242,8 +290,7 @@ mod tests {
 
     #[test]
     fn daemon_error_display() {
-        let lifecycle_err: DaemonError =
-            lifecycle::LifecycleError::InvalidPidFile.into();
+        let lifecycle_err: DaemonError = lifecycle::LifecycleError::InvalidPidFile.into();
         assert_eq!(
             lifecycle_err.to_string(),
             "lifecycle error: invalid PID file contents"

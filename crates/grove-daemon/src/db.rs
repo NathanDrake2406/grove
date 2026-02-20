@@ -3,7 +3,7 @@ use grove_lib::{
     ChangeType, CommitHash, ExportedSymbol, Hunk, Import, MergeOrder, OrthogonalityScore, Symbol,
     Workspace, WorkspaceId, WorkspaceMetadata, WorkspacePairAnalysis,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -293,8 +293,7 @@ impl Database {
                 exports: serde_json::from_str(&row.exports_json)?,
                 ast_hash: row.ast_hash,
                 base_commit: row.base_commit,
-                updated_at: DateTime::parse_from_rfc3339(&row.updated_at)?
-                    .with_timezone(&Utc),
+                updated_at: DateTime::parse_from_rfc3339(&row.updated_at)?.with_timezone(&Utc),
             });
         }
         Ok(entries)
@@ -667,7 +666,10 @@ mod tests {
         assert_eq!(loaded[0].id, ws.id);
         assert_eq!(loaded[0].name, "auth-refactor");
         assert_eq!(loaded[0].branch, "feat/auth-refactor");
-        assert_eq!(loaded[0].metadata.description, Some("test workspace".to_string()));
+        assert_eq!(
+            loaded[0].metadata.description,
+            Some("test workspace".to_string())
+        );
     }
 
     #[test]
@@ -928,7 +930,9 @@ mod tests {
             )
             .unwrap();
 
-        let err = db.load_workspaces().expect_err("expected UUID parse failure");
+        let err = db
+            .load_workspaces()
+            .expect_err("expected UUID parse failure");
         assert!(matches!(err, DbError::Uuid(_)));
     }
 
@@ -952,7 +956,9 @@ mod tests {
             )
             .unwrap();
 
-        let err = db.load_workspaces().expect_err("expected date parse failure");
+        let err = db
+            .load_workspaces()
+            .expect_err("expected date parse failure");
         assert!(matches!(err, DbError::ChronoParse(_)));
     }
 
@@ -1024,7 +1030,9 @@ mod tests {
             )
             .unwrap();
 
-        let err = db.load_base_graph().expect_err("expected JSON parse failure");
+        let err = db
+            .load_base_graph()
+            .expect_err("expected JSON parse failure");
         assert!(matches!(err, DbError::Json(_)));
     }
 

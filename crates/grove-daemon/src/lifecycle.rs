@@ -17,6 +17,7 @@ pub enum LifecycleError {
 pub struct DaemonPaths {
     pub pid_file: PathBuf,
     pub socket_file: PathBuf,
+    pub shutdown_token_file: PathBuf,
     pub db_file: PathBuf,
     pub log_file: PathBuf,
 }
@@ -27,6 +28,7 @@ impl DaemonPaths {
         Self {
             pid_file: grove_dir.join("daemon.pid"),
             socket_file: grove_dir.join("daemon.sock"),
+            shutdown_token_file: grove_dir.join("daemon.shutdown.token"),
             db_file: grove_dir.join("grove.db"),
             log_file: grove_dir.join("daemon.log"),
         }
@@ -112,10 +114,8 @@ fn is_process_alive(pid: u32) -> bool {
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let mut sigterm =
-        signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
-    let mut sigint =
-        signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
 
     tokio::select! {
         _ = sigterm.recv() => {
@@ -243,6 +243,10 @@ mod tests {
 
         assert_eq!(paths.pid_file, grove_dir.join("daemon.pid"));
         assert_eq!(paths.socket_file, grove_dir.join("daemon.sock"));
+        assert_eq!(
+            paths.shutdown_token_file,
+            grove_dir.join("daemon.shutdown.token")
+        );
         assert_eq!(paths.db_file, grove_dir.join("grove.db"));
         assert_eq!(paths.log_file, grove_dir.join("daemon.log"));
     }
@@ -407,6 +411,9 @@ mod tests {
         cleanup(&pid_path, &socket_dir).expect("cleanup should ignore non-removable socket path");
 
         assert!(!pid_path.exists(), "PID file should still be removed");
-        assert!(socket_dir.exists(), "socket directory should remain in place");
+        assert!(
+            socket_dir.exists(),
+            "socket directory should remain in place"
+        );
     }
 }

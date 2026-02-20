@@ -168,13 +168,20 @@ async fn list_workspaces_returns_all_registered() {
     assert_eq!(workspaces.len(), 3);
 
     // Verify structure — each workspace has expected fields
-    let names: Vec<&str> = workspaces.iter().map(|w| w["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = workspaces
+        .iter()
+        .map(|w| w["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"ws-alpha"));
     assert!(names.contains(&"ws-beta"));
     assert!(names.contains(&"ws-gamma"));
 
     // Also verify get_workspace for a specific ID
-    let resp = daemon.client.get_workspace(&id_a.to_string()).await.unwrap();
+    let resp = daemon
+        .client
+        .get_workspace(&id_a.to_string())
+        .await
+        .unwrap();
     assert!(resp.ok);
     let ws_data = resp.data.unwrap();
     assert_eq!(ws_data["name"], "ws-alpha");
@@ -188,7 +195,11 @@ async fn get_workspace_nonexistent_returns_error() {
     let daemon = TestDaemon::start().await;
 
     let fake_id = Uuid::new_v4();
-    let resp = daemon.client.get_workspace(&fake_id.to_string()).await.unwrap();
+    let resp = daemon
+        .client
+        .get_workspace(&fake_id.to_string())
+        .await
+        .unwrap();
     assert!(!resp.ok);
     assert!(resp.error.unwrap().contains("not found"));
 
@@ -257,7 +268,8 @@ async fn conflicts_between_overlapping_workspaces() {
         .iter()
         .filter_map(|o| {
             // Serde tags externally-tagged enums as { "VariantName": { fields } }
-            o.as_object().and_then(|m| m.keys().next().map(|s| s.as_str()))
+            o.as_object()
+                .and_then(|m| m.keys().next().map(|s| s.as_str()))
         })
         .collect();
     assert!(overlap_types.contains(&"File"));
@@ -663,10 +675,18 @@ async fn full_workflow_register_analyze_query_remove() {
     assert_eq!(data["workspace_count"], 1);
     assert_eq!(data["analysis_count"], 0);
 
-    let resp = daemon.client.get_workspace(&id_a.to_string()).await.unwrap();
+    let resp = daemon
+        .client
+        .get_workspace(&id_a.to_string())
+        .await
+        .unwrap();
     assert!(!resp.ok); // removed
 
-    let resp = daemon.client.get_workspace(&id_b.to_string()).await.unwrap();
+    let resp = daemon
+        .client
+        .get_workspace(&id_b.to_string())
+        .await
+        .unwrap();
     assert!(resp.ok); // still exists
 
     daemon.shutdown().await;
@@ -703,7 +723,10 @@ async fn startup_readiness_retry_loop_eventually_reaches_daemon() {
             Err(other) => panic!("unexpected startup error during retry loop: {other}"),
         }
     }
-    assert!(reached_daemon, "daemon never became reachable before deadline");
+    assert!(
+        reached_daemon,
+        "daemon never became reachable before deadline"
+    );
 
     drop(shutdown_tx);
     state_tx.send(StateMessage::Shutdown).await.unwrap();
@@ -771,7 +794,19 @@ async fn in_flight_status_requests_during_shutdown_do_not_hang() {
 
     for task in tasks {
         match task.await.unwrap() {
-            Ok(Ok(response)) => assert!(response.ok),
+            Ok(Ok(response)) => {
+                if response.ok {
+                    continue;
+                }
+                let error = response
+                    .error
+                    .as_deref()
+                    .expect("structured error response should include `error`");
+                assert!(
+                    !error.trim().is_empty(),
+                    "structured error response should include non-empty `error`"
+                );
+            }
             Ok(Err(
                 ClientError::DaemonNotRunning(_)
                 | ClientError::Connection(_)

@@ -16,6 +16,8 @@ pub struct GroveConfig {
     pub max_warm_asts: usize,
     pub max_worktrees: usize,
     pub analysis_timeout_ms: u64,
+    pub socket_idle_timeout_ms: u64,
+    pub socket_state_reply_timeout_ms: u64,
     pub max_file_size_kb: u64,
     pub circuit_breaker_threshold: usize,
     pub ignore_patterns: Vec<String>,
@@ -30,6 +32,8 @@ impl Default for GroveConfig {
             max_warm_asts: 5000,
             max_worktrees: 20,
             analysis_timeout_ms: 30_000,
+            socket_idle_timeout_ms: 300_000,
+            socket_state_reply_timeout_ms: 5_000,
             max_file_size_kb: 1024,
             circuit_breaker_threshold: 100,
             ignore_patterns: vec![
@@ -152,10 +156,12 @@ impl DaemonState {
             match db.load_pair_analyses() {
                 Ok(analyses) => {
                     for a in analyses {
-                        self.pair_analyses
-                            .insert((a.workspace_a, a.workspace_b), a);
+                        self.pair_analyses.insert((a.workspace_a, a.workspace_b), a);
                     }
-                    info!(count = self.pair_analyses.len(), "loaded pair analyses from db");
+                    info!(
+                        count = self.pair_analyses.len(),
+                        "loaded pair analyses from db"
+                    );
                 }
                 Err(e) => {
                     warn!(error = %e, "failed to load pair analyses from db");
@@ -165,41 +171,48 @@ impl DaemonState {
         self
     }
 
-    /// Run the actor loop, processing messages until Shutdown is received.
+    /// Run the actor loop until Shutdown is received.
+    ///
+    /// Once shutdown starts, the receiver is closed to reject new sends, then
+    /// queued messages are drained. Queued queries are still answered so
+    /// in-flight request/response paths do not hang while the daemon exits.
     pub async fn run(mut self, mut rx: mpsc::Receiver<StateMessage>) {
         info!("state actor started");
 
         while let Some(msg) = rx.recv().await {
-            match msg {
-                StateMessage::FileChanged {
-                    workspace_id,
-                    path,
-                } => {
+            let shutdown_requested = match msg {
+                StateMessage::FileChanged { workspace_id, path } => {
                     self.handle_file_changed(workspace_id, &path);
+                    false
                 }
                 StateMessage::AnalysisComplete { pair, result } => {
                     self.handle_analysis_complete(pair, result);
+                    false
                 }
                 StateMessage::Query { request, reply } => {
                     let response = self.handle_query(request);
                     if reply.send(response).is_err() {
                         debug!("query reply channel dropped");
                     }
+                    false
                 }
                 StateMessage::BaseRefChanged { new_commit } => {
                     self.handle_base_ref_changed(new_commit);
+                    false
                 }
                 StateMessage::WorktreeReindexComplete {
                     workspace_id,
                     overlay,
                 } => {
                     self.handle_worktree_reindex_complete(workspace_id, overlay);
+                    false
                 }
                 StateMessage::RegisterWorkspace { workspace, reply } => {
                     let result = self.handle_register_workspace(workspace);
                     if reply.send(result).is_err() {
                         debug!("register reply channel dropped");
                     }
+                    false
                 }
                 StateMessage::RemoveWorkspace {
                     workspace_id,
@@ -209,15 +222,60 @@ impl DaemonState {
                     if reply.send(result).is_err() {
                         debug!("remove reply channel dropped");
                     }
+                    false
                 }
                 StateMessage::Shutdown => {
                     info!("state actor shutting down");
-                    break;
+                    true
                 }
+            };
+
+            if shutdown_requested {
+                rx.close();
+                self.drain_queued_messages(&mut rx).await;
+                break;
             }
         }
 
         info!("state actor stopped");
+    }
+
+    async fn drain_queued_messages(&mut self, rx: &mut mpsc::Receiver<StateMessage>) {
+        while let Some(msg) = rx.recv().await {
+            match msg {
+                StateMessage::Query { request, reply } => {
+                    let response = self.handle_query(request);
+                    if reply.send(response).is_err() {
+                        debug!("query reply channel dropped during shutdown drain");
+                    }
+                }
+                StateMessage::RegisterWorkspace { reply, .. } => {
+                    if reply
+                        .send(Err("daemon is shutting down".to_string()))
+                        .is_err()
+                    {
+                        debug!("register reply channel dropped during shutdown drain");
+                    }
+                }
+                StateMessage::RemoveWorkspace { reply, .. } => {
+                    if reply
+                        .send(Err("daemon is shutting down".to_string()))
+                        .is_err()
+                    {
+                        debug!("remove reply channel dropped during shutdown drain");
+                    }
+                }
+                StateMessage::FileChanged { .. }
+                | StateMessage::AnalysisComplete { .. }
+                | StateMessage::BaseRefChanged { .. }
+                | StateMessage::WorktreeReindexComplete { .. } => {
+                    debug!("dropping state mutation queued after shutdown");
+                }
+                StateMessage::Shutdown => {
+                    debug!("dropping duplicate shutdown message");
+                }
+            }
+        }
     }
 
     // === Message Handlers ===
@@ -1093,5 +1151,36 @@ mod tests {
 
         tx.send(StateMessage::Shutdown).await.unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn queued_query_after_shutdown_is_drained_and_replied() {
+        let (tx, rx) = mpsc::channel(8);
+        let state = DaemonState::new(GroveConfig::default(), None);
+
+        let (query_reply_tx, query_reply_rx) = oneshot::channel();
+
+        tx.try_send(StateMessage::Shutdown).unwrap();
+        tx.try_send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: query_reply_tx,
+        })
+        .unwrap();
+        drop(tx);
+
+        state.run(rx).await;
+
+        match query_reply_rx.await.unwrap() {
+            QueryResponse::Status {
+                workspace_count,
+                analysis_count,
+                base_commit,
+            } => {
+                assert_eq!(workspace_count, 0);
+                assert_eq!(analysis_count, 0);
+                assert_eq!(base_commit, "");
+            }
+            other => panic!("expected status response, got: {other:?}"),
+        }
     }
 }

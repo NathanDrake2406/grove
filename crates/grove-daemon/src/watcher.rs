@@ -1,8 +1,8 @@
 use grove_lib::WorkspaceId;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{
-    event::{CreateKind, ModifyKind, RemoveKind},
     Event, EventKind,
+    event::{CreateKind, ModifyKind, RemoveKind},
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -68,13 +68,9 @@ pub enum WatchEvent {
         paths: Vec<PathBuf>,
     },
     /// Circuit breaker tripped — too many files changed at once.
-    FullReindexNeeded {
-        workspace_id: WorkspaceId,
-    },
+    FullReindexNeeded { workspace_id: WorkspaceId },
     /// Base branch ref changed.
-    BaseRefChanged {
-        ref_path: PathBuf,
-    },
+    BaseRefChanged { ref_path: PathBuf },
 }
 
 /// Builds a gitignore matcher for a worktree path.
@@ -175,11 +171,7 @@ impl Debouncer {
     }
 
     /// Register a worktree to watch.
-    pub fn register_worktree(
-        &mut self,
-        workspace_id: WorkspaceId,
-        root: PathBuf,
-    ) {
+    pub fn register_worktree(&mut self, workspace_id: WorkspaceId, root: PathBuf) {
         let gitignore = if self.config.respect_gitignore {
             build_gitignore(&root)
         } else {
@@ -373,9 +365,7 @@ mod tests {
         assert!(is_git_ref_change(&PathBuf::from(
             "/project/.git/FETCH_HEAD"
         )));
-        assert!(!is_git_ref_change(&PathBuf::from(
-            "/project/src/main.rs"
-        )));
+        assert!(!is_git_ref_change(&PathBuf::from("/project/src/main.rs")));
     }
 
     #[test]
@@ -386,17 +376,12 @@ mod tests {
         worktrees.insert(id_a, PathBuf::from("/worktrees/alpha"));
         worktrees.insert(id_b, PathBuf::from("/worktrees/beta"));
 
-        let result = find_worktree_for_path(
-            &PathBuf::from("/worktrees/alpha/src/main.rs"),
-            &worktrees,
-        );
+        let result =
+            find_worktree_for_path(&PathBuf::from("/worktrees/alpha/src/main.rs"), &worktrees);
         assert!(result.is_some());
         assert_eq!(*result.unwrap().0, id_a);
 
-        let result = find_worktree_for_path(
-            &PathBuf::from("/somewhere/else/main.rs"),
-            &worktrees,
-        );
+        let result = find_worktree_for_path(&PathBuf::from("/somewhere/else/main.rs"), &worktrees);
         assert!(result.is_none());
     }
 
@@ -525,12 +510,7 @@ mod tests {
         let gi = build_gitignore(&dir).unwrap();
 
         // .log files should be ignored
-        assert!(should_ignore(
-            &dir.join("debug.log"),
-            &dir,
-            Some(&gi),
-            &[],
-        ));
+        assert!(should_ignore(&dir.join("debug.log"), &dir, Some(&gi), &[],));
 
         // .rs files should not be ignored
         assert!(!should_ignore(
@@ -620,7 +600,10 @@ mod tests {
         let flushed = debouncer.flush_debounced();
         assert_eq!(flushed.len(), 1);
         match &flushed[0] {
-            WatchEvent::FilesChanged { workspace_id, paths } => {
+            WatchEvent::FilesChanged {
+                workspace_id,
+                paths,
+            } => {
                 assert_eq!(*workspace_id, ws_id);
                 assert_eq!(paths, &vec![PathBuf::from("/worktrees/test/src/main.rs")]);
             }
