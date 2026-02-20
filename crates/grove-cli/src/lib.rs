@@ -81,9 +81,29 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         _ => {}
     }
 
-    let grove_dir = find_grove_dir(std::env::current_dir()?)?;
-    let socket_path = grove_dir.join("daemon.sock");
-    let client = DaemonClient::new(&socket_path);
+    // Commands that manage the daemon directly — use existing find_grove_dir (no auto-spawn).
+    match &args.command {
+        Some(Commands::Daemon { action: DaemonAction::Stop }) => {
+            let grove_dir = find_grove_dir(std::env::current_dir()?)?;
+            let socket_path = grove_dir.join("daemon.sock");
+            let client = DaemonClient::new(&socket_path);
+            handle_daemon_stop(&client, &grove_dir, args.json).await?;
+            return Ok(());
+        }
+        Some(Commands::Daemon { action: DaemonAction::Status }) => {
+            let grove_dir = find_grove_dir(std::env::current_dir()?)?;
+            let socket_path = grove_dir.join("daemon.sock");
+            let client = DaemonClient::new(&socket_path);
+            commands::status::execute(&client, args.json).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // All other commands: bootstrap (auto-create .grove/, auto-spawn daemon, sync worktrees).
+    let (client, _grove_dir) = bootstrap::bootstrap()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     match args.command {
         Some(Commands::Status) | None => {
@@ -95,21 +115,8 @@ pub async fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Conflicts { a, b }) => {
             commands::conflicts::execute(&client, &a, &b, args.json).await?;
         }
-        Some(Commands::Daemon {
-            action: DaemonAction::Stop,
-        }) => {
-            handle_daemon_stop(&client, &grove_dir, args.json).await?;
-        }
-        Some(Commands::Daemon {
-            action: DaemonAction::Status,
-        }) => {
-            commands::status::execute(&client, args.json).await?;
-        }
         // Already handled above; included for exhaustive matching.
-        Some(Commands::Daemon {
-            action: DaemonAction::Start,
-        })
-        | Some(Commands::Init { .. }) => {
+        Some(Commands::Daemon { .. }) | Some(Commands::Init { .. }) => {
             unreachable!("handled above");
         }
     }
