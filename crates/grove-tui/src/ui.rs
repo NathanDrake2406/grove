@@ -9,6 +9,22 @@ use ratatui::{
 use crate::app::{App, FocusedPanel, ViewState};
 use grove_lib::{OrthogonalityScore, Overlap, WorkspacePairAnalysis};
 
+/// Truncate a string to fit within `max_width` columns, appending "…" if truncated.
+fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if s.len() <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let mut truncated = s[..max_width - 1].to_string();
+    truncated.push('…');
+    truncated
+}
+
 pub fn render(app: &App, frame: &mut Frame) {
     let area = frame.area();
 
@@ -54,33 +70,29 @@ fn render_error(err: &str, frame: &mut Frame, area: Rect) {
 }
 
 fn render_dashboard(app: &App, frame: &mut Frame, area: Rect) {
-    // Outer vertical split: header | middle | detail
+    // Full-width vertical stack: header | worktrees | conflicts | detail | footer
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // summary bar
-            Constraint::Min(6),    // worktrees + conflicts panels
-            Constraint::Length(10), // detail panel
+            Constraint::Fill(1),  // worktrees panel
+            Constraint::Fill(1),  // conflicts panel
+            Constraint::Fill(1),  // detail panel
+            Constraint::Length(1), // footer
         ])
         .split(area);
 
     let header_area = rows[0];
-    let middle_area = rows[1];
-    let detail_area = rows[2];
-
-    // Middle horizontal split: worktrees (30%) | conflicts (70%)
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(middle_area);
-
-    let worktrees_area = columns[0];
-    let pairs_area = columns[1];
+    let worktrees_area = rows[1];
+    let pairs_area = rows[2];
+    let detail_area = rows[3];
+    let footer_area = rows[4];
 
     render_summary_bar(app, frame, header_area);
     render_worktrees_panel(app, frame, worktrees_area);
     render_pairs_panel(app, frame, pairs_area);
     render_detail_panel(app, frame, detail_area);
+    render_footer(app, frame, footer_area);
 }
 
 fn render_summary_bar(app: &App, frame: &mut Frame, area: Rect) {
@@ -104,16 +116,28 @@ fn render_summary_bar(app: &App, frame: &mut Frame, area: Rect) {
             format!("{} clean", clean_count),
             Style::default().fg(Color::Green),
         ),
-        Span::styled(
-            "   [\u{2190}\u{2192}] switch panel  [\u{2191}\u{2193}] navigate  [r] refresh  [q] quit",
-            Style::default().fg(Color::DarkGray),
-        ),
     ]);
 
     let block = Block::default()
         .title(" Grove Status ")
         .borders(Borders::ALL);
     let p = Paragraph::new(line).block(block);
+    frame.render_widget(p, area);
+}
+
+fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
+    let _ = app; // available for future context-sensitive hints
+    let line = Line::from(vec![
+        Span::styled(" \u{2190}\u{2192}", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(" panel  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("r", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(" refresh  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("q", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(" quit", Style::default().fg(Color::DarkGray)),
+    ]);
+    let p = Paragraph::new(line);
     frame.render_widget(p, area);
 }
 
@@ -125,6 +149,9 @@ fn render_worktrees_panel(app: &App, frame: &mut Frame, area: Rect) {
         Style::default().fg(Color::DarkGray)
     };
 
+    // Available width: total minus borders (2) minus prefix "  "/" > " (2) minus suffix " ✔"/" !" (2)
+    let available_name_width = (area.width as usize).saturating_sub(2 + 2 + 2);
+
     let items: Vec<ListItem> = app
         .workspaces
         .iter()
@@ -134,13 +161,15 @@ fn render_worktrees_panel(app: &App, frame: &mut Frame, area: Rect) {
             let pairs = app.get_pairs_for_worktree(&w.id);
             let has_conflicts = !pairs.is_empty();
 
-            let name_style = if selected {
+            let name_style = if selected && focused {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
 
-            let indicator = if selected { "> " } else { "  " };
+            let indicator = if selected && focused { "> " } else { "  " };
+
+            let truncated_name = truncate_with_ellipsis(&w.name, available_name_width);
 
             let conflict_indicator = if has_conflicts {
                 Span::styled(" !", Style::default().fg(Color::Red))
@@ -150,7 +179,7 @@ fn render_worktrees_panel(app: &App, frame: &mut Frame, area: Rect) {
 
             ListItem::new(Line::from(vec![
                 Span::raw(indicator),
-                Span::styled(w.name.clone(), name_style),
+                Span::styled(truncated_name, name_style),
                 conflict_indicator,
             ]))
         })
@@ -201,6 +230,18 @@ fn render_pairs_panel(app: &App, frame: &mut Frame, area: Rect) {
         return;
     }
 
+    // Layout: borders consume 2 cols. Score badge is fixed 11 chars " ■ SCORE  ".
+    // Overlap count suffix like " (N) " is at most 6 chars. Name gets the rest.
+    let total_width = area.width as usize;
+    let inner_width = total_width.saturating_sub(2); // minus borders
+    // Score badge: " ■ SCORE  " = 1 space + "■" + 1 space + 6-char score + 2 spaces = 11 chars
+    let score_badge_width: usize = 11;
+    // Overlap count: " (N) " — reserve 6 chars to accommodate up to 3-digit counts
+    let count_suffix_width: usize = 6;
+    let name_width = inner_width
+        .saturating_sub(score_badge_width)
+        .saturating_sub(count_suffix_width);
+
     let pair_items: Vec<ListItem> = pairs
         .iter()
         .enumerate()
@@ -225,28 +266,41 @@ fn render_pairs_panel(app: &App, frame: &mut Frame, area: Rect) {
                 OrthogonalityScore::Black => Color::Magenta,
             };
 
-            let score_str = match p.score {
-                OrthogonalityScore::Green => "\u{25a0} GREEN ",
-                OrthogonalityScore::Yellow => "\u{25a0} YELLOW",
-                OrthogonalityScore::Red => "\u{25a0} RED   ",
-                OrthogonalityScore::Black => "\u{25a0} BLACK ",
+            // Score label padded to 6 chars for alignment
+            let score_label = match p.score {
+                OrthogonalityScore::Green => "GREEN ",
+                OrthogonalityScore::Yellow => "YELLOW",
+                OrthogonalityScore::Red => "RED   ",
+                OrthogonalityScore::Black => "BLACK ",
             };
 
-            let sel_style = if i == app.selected_pair_index {
+            let selected = i == app.selected_pair_index && focused;
+            let row_style = if selected {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else {
                 Style::default()
             };
 
+            let truncated_name = truncate_with_ellipsis(target_name, name_width);
+            let count_str = format!(" ({}) ", p.overlaps.len());
+
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!(" {} ", score_str),
-                    Style::default().fg(score_color),
+                    format!(" \u{25a0} {}  ", score_label),
+                    if selected {
+                        row_style.fg(score_color)
+                    } else {
+                        Style::default().fg(score_color)
+                    },
                 ),
-                Span::styled(format!("{} ", target_name), sel_style),
+                Span::styled(truncated_name, row_style),
                 Span::styled(
-                    format!("({} overlaps)", p.overlaps.len()),
-                    Style::default().fg(Color::DarkGray),
+                    count_str,
+                    if selected {
+                        row_style.fg(Color::DarkGray)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
                 ),
             ]))
         })
@@ -271,27 +325,79 @@ fn render_detail_panel(app: &App, frame: &mut Frame, area: Rect) {
         }
     };
 
-    let pairs = app.get_pairs_for_worktree(&selected_ws.id);
+    match app.focused_panel {
+        FocusedPanel::Worktrees => {
+            // Show worktree details — full untruncated fields
+            let pairs = app.get_pairs_for_worktree(&selected_ws.id);
+            let conflict_summary = if pairs.is_empty() {
+                "none".to_string()
+            } else {
+                format!("{} pair(s) with overlaps", pairs.len())
+            };
 
-    if pairs.is_empty() {
-        let p = Paragraph::new("\n  No conflicts \u{2014} this worktree is clean.")
-            .block(block)
-            .style(Style::default().fg(Color::Green));
-        frame.render_widget(p, area);
-        return;
-    }
+            let label_style = Style::default().fg(Color::DarkGray);
+            let value_style = Style::default();
 
-    match pairs.get(app.selected_pair_index) {
-        Some(analysis) => {
-            let lines = build_overlap_lines(analysis, app);
+            let lines: Vec<Line<'static>> = vec![
+                Line::from(vec![
+                    Span::styled("  name        ".to_string(), label_style),
+                    Span::styled(selected_ws.name.clone(), value_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("  branch      ".to_string(), label_style),
+                    Span::styled(selected_ws.branch.clone(), value_style),
+                ]),
+                Line::from(vec![
+                    Span::styled("  path        ".to_string(), label_style),
+                    Span::styled(
+                        selected_ws.path.to_string_lossy().into_owned(),
+                        value_style,
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("  conflicts   ".to_string(), label_style),
+                    Span::styled(
+                        conflict_summary,
+                        if pairs.is_empty() {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Red)
+                        },
+                    ),
+                ]),
+            ];
+
             let p = Paragraph::new(lines)
                 .block(block)
                 .wrap(Wrap { trim: false });
             frame.render_widget(p, area);
         }
-        None => {
-            let p = Paragraph::new("Select a conflict pair to view details.").block(block);
-            frame.render_widget(p, area);
+        FocusedPanel::Pairs => {
+            // Show overlap details for the selected pair
+            let pairs = app.get_pairs_for_worktree(&selected_ws.id);
+
+            if pairs.is_empty() {
+                let p = Paragraph::new("\n  No conflicts \u{2014} this worktree is clean.")
+                    .block(block)
+                    .style(Style::default().fg(Color::Green));
+                frame.render_widget(p, area);
+                return;
+            }
+
+            match pairs.get(app.selected_pair_index) {
+                Some(analysis) => {
+                    let lines = build_overlap_lines(analysis, app);
+                    let p = Paragraph::new(lines)
+                        .block(block)
+                        .wrap(Wrap { trim: false });
+                    frame.render_widget(p, area);
+                }
+                None => {
+                    let p =
+                        Paragraph::new("Select a conflict pair to view details.").block(block);
+                    frame.render_widget(p, area);
+                }
+            }
         }
     }
 }

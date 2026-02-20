@@ -101,8 +101,22 @@ impl App {
             || !self.analyses_are_equal(&self.analyses, &new_analyses);
 
         if changed || self.view_state == ViewState::Loading {
-            self.workspaces = new_workspaces;
             self.analyses = new_analyses;
+
+            // Sort worktrees: conflicting first, clean last
+            let mut sorted = new_workspaces;
+            sorted.sort_by_key(|w| {
+                let has_conflicts = self.analyses.iter().any(|a| {
+                    (a.workspace_a == w.id || a.workspace_b == w.id)
+                        && a.score != OrthogonalityScore::Green
+                });
+                // false (has conflicts) sorts before true (clean)
+                !has_conflicts
+            });
+            self.workspaces = sorted;
+
+            self.selected_worktree_index = 0;
+            self.selected_pair_index = 0;
             self.is_dirty = true;
 
             // Automatically transition state
