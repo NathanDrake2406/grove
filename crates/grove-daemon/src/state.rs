@@ -1,11 +1,12 @@
 use grove_lib::graph::{GraphOverlay, ImportGraph};
 use grove_lib::{CommitHash, Workspace, WorkspaceId, WorkspacePairAnalysis};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
+use crate::worker::{WorkerMessage, canonical_pair};
 
 // === Configuration ===
 
@@ -85,6 +86,9 @@ pub enum StateMessage {
         desired: Vec<Workspace>,
         reply: oneshot::Sender<Result<SyncResult, String>>,
     },
+    AttachWorker {
+        worker_tx: mpsc::Sender<WorkerMessage>,
+    },
     Shutdown,
 }
 
@@ -134,6 +138,8 @@ pub struct DaemonState {
     workspace_overlays: HashMap<WorkspaceId, GraphOverlay>,
     pair_analyses: HashMap<(WorkspaceId, WorkspaceId), WorkspacePairAnalysis>,
     dirty_workspaces: Vec<WorkspaceId>,
+    in_flight_pairs: HashSet<(WorkspaceId, WorkspaceId)>,
+    worker_tx: Option<mpsc::Sender<WorkerMessage>>,
     db: Option<Database>,
 }
 
@@ -147,6 +153,8 @@ impl DaemonState {
             workspace_overlays: HashMap::new(),
             pair_analyses: HashMap::new(),
             dirty_workspaces: Vec::new(),
+            in_flight_pairs: HashSet::new(),
+            worker_tx: None,
             db,
         }
     }
@@ -194,7 +202,7 @@ impl DaemonState {
         while let Some(msg) = rx.recv().await {
             let shutdown_requested = match msg {
                 StateMessage::FileChanged { workspace_id, path } => {
-                    self.handle_file_changed(workspace_id, &path);
+                    self.handle_file_changed(workspace_id, &path).await;
                     false
                 }
                 StateMessage::AnalysisComplete { pair, result } => {
@@ -241,6 +249,11 @@ impl DaemonState {
                     if reply.send(result).is_err() {
                         debug!("sync reply channel dropped");
                     }
+                    false
+                }
+                StateMessage::AttachWorker { worker_tx } => {
+                    self.handle_attach_worker(worker_tx);
+                    self.dispatch_dirty_workspaces().await;
                     false
                 }
                 StateMessage::Shutdown => {
@@ -292,6 +305,9 @@ impl DaemonState {
                         debug!("sync reply channel dropped during shutdown drain");
                     }
                 }
+                StateMessage::AttachWorker { .. } => {
+                    debug!("dropping worker attachment queued after shutdown");
+                }
                 StateMessage::FileChanged { .. }
                 | StateMessage::AnalysisComplete { .. }
                 | StateMessage::BaseRefChanged { .. }
@@ -307,7 +323,7 @@ impl DaemonState {
 
     // === Message Handlers ===
 
-    fn handle_file_changed(&mut self, workspace_id: WorkspaceId, path: &Path) {
+    async fn handle_file_changed(&mut self, workspace_id: WorkspaceId, path: &Path) {
         if !self.workspaces.contains_key(&workspace_id) {
             warn!(workspace_id = %workspace_id, "file change for unknown workspace");
             return;
@@ -318,6 +334,8 @@ impl DaemonState {
         if !self.dirty_workspaces.contains(&workspace_id) {
             self.dirty_workspaces.push(workspace_id);
         }
+
+        self.dispatch_dirty_workspaces().await;
     }
 
     fn handle_analysis_complete(
@@ -325,6 +343,8 @@ impl DaemonState {
         pair: (WorkspaceId, WorkspaceId),
         result: WorkspacePairAnalysis,
     ) {
+        self.in_flight_pairs.remove(&canonical_pair(pair.0, pair.1));
+
         info!(
             workspace_a = %pair.0,
             workspace_b = %pair.1,
@@ -340,6 +360,11 @@ impl DaemonState {
         }
 
         self.pair_analyses.insert(pair, result);
+    }
+
+    fn handle_attach_worker(&mut self, worker_tx: mpsc::Sender<WorkerMessage>) {
+        self.worker_tx = Some(worker_tx);
+        info!("worker channel attached to state actor");
     }
 
     fn handle_query(&self, request: QueryRequest) -> QueryResponse {
@@ -455,6 +480,8 @@ impl DaemonState {
         // Remove all pair analyses involving this workspace
         self.pair_analyses
             .retain(|(a, b), _| *a != workspace_id && *b != workspace_id);
+        self.in_flight_pairs
+            .retain(|(a, b)| *a != workspace_id && *b != workspace_id);
 
         if let Some(ref db) = self.db
             && let Err(e) = db.delete_workspace(workspace_id)
@@ -503,6 +530,79 @@ impl DaemonState {
         })
     }
 
+    async fn dispatch_dirty_workspaces(&mut self) {
+        if self.worker_tx.is_none() {
+            debug!("worker not attached yet, retaining dirty workspaces");
+            return;
+        }
+
+        let dirty = self.dirty_workspaces.clone();
+        let mut still_dirty = Vec::new();
+
+        for workspace_id in dirty {
+            if self.dispatch_pairs_for_workspace(workspace_id).await.is_err() {
+                still_dirty.push(workspace_id);
+            }
+        }
+
+        self.dirty_workspaces = still_dirty;
+    }
+
+    async fn dispatch_pairs_for_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), ()> {
+        let Some(worker_tx) = self.worker_tx.clone() else {
+            return Err(());
+        };
+
+        let pair_targets: Vec<WorkspaceId> = self
+            .workspaces
+            .keys()
+            .copied()
+            .filter(|id| *id != workspace_id)
+            .collect();
+
+        for other_id in pair_targets {
+            let pair = canonical_pair(workspace_id, other_id);
+            if self.in_flight_pairs.contains(&pair) {
+                continue;
+            }
+
+            let Some(workspace_a) = self.workspaces.get(&pair.0).cloned() else {
+                continue;
+            };
+            let Some(workspace_b) = self.workspaces.get(&pair.1).cloned() else {
+                continue;
+            };
+
+            self.in_flight_pairs.insert(pair);
+            let send_result = worker_tx
+                .send(WorkerMessage::AnalyzePair {
+                    workspace_a,
+                    workspace_b,
+                    base_graph: self.base_graph.clone(),
+                })
+                .await;
+
+            if let Err(e) = send_result {
+                self.in_flight_pairs.remove(&pair);
+                warn!(
+                    workspace_a = %pair.0,
+                    workspace_b = %pair.1,
+                    error = %e,
+                    "failed to dispatch analysis pair"
+                );
+                return Err(());
+            }
+
+            debug!(
+                workspace_a = %pair.0,
+                workspace_b = %pair.1,
+                "dispatched analysis pair to workers"
+            );
+        }
+
+        Ok(())
+    }
+
     // === Accessors (for testing) ===
 
     pub fn workspace_count(&self) -> usize {
@@ -536,8 +636,10 @@ pub fn spawn_state_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::WorkerMessage;
     use chrono::Utc;
     use grove_lib::{MergeOrder, OrthogonalityScore, WorkspaceMetadata};
+    use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
     fn make_workspace(name: &str) -> Workspace {
@@ -1075,25 +1177,78 @@ mod tests {
         handle.await.unwrap();
     }
 
-    #[test]
-    fn duplicate_file_changed_messages_do_not_duplicate_dirty_workspace() {
+    #[tokio::test]
+    async fn file_changed_dispatches_analysis_for_related_pairs() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws_a = make_workspace("dispatch-a");
+        let ws_b = make_workspace("dispatch-b");
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+
+        for ws in [ws_a, ws_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(StateMessage::RegisterWorkspace {
+                workspace: ws,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        tx.send(StateMessage::AttachWorker { worker_tx })
+            .await
+            .unwrap();
+
+        tx.send(StateMessage::FileChanged {
+            workspace_id: id_a,
+            path: PathBuf::from("src/lib.rs"),
+        })
+        .await
+        .unwrap();
+
+        let dispatched = timeout(Duration::from_secs(1), worker_rx.recv())
+            .await
+            .expect("dispatch should happen before timeout")
+            .expect("worker queue should receive a message");
+
+        match dispatched {
+            WorkerMessage::AnalyzePair {
+                workspace_a,
+                workspace_b,
+                ..
+            } => {
+                let expected = canonical_pair(id_a, id_b);
+                assert_eq!((workspace_a.id, workspace_b.id), expected);
+            }
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_file_changed_messages_do_not_duplicate_dirty_workspace() {
         let mut state = DaemonState::new(GroveConfig::default(), None);
         let ws = make_workspace("dup-dirty");
         let ws_id = ws.id;
         state.handle_register_workspace(ws).unwrap();
 
-        state.handle_file_changed(ws_id, Path::new("src/a.rs"));
-        state.handle_file_changed(ws_id, Path::new("src/b.rs"));
-        state.handle_file_changed(ws_id, Path::new("src/c.rs"));
+        state.handle_file_changed(ws_id, Path::new("src/a.rs")).await;
+        state.handle_file_changed(ws_id, Path::new("src/b.rs")).await;
+        state.handle_file_changed(ws_id, Path::new("src/c.rs")).await;
 
         assert_eq!(state.dirty_workspaces().len(), 1);
         assert_eq!(state.dirty_workspaces()[0], ws_id);
     }
 
-    #[test]
-    fn file_changed_for_unknown_workspace_is_ignored() {
+    #[tokio::test]
+    async fn file_changed_for_unknown_workspace_is_ignored() {
         let mut state = DaemonState::new(GroveConfig::default(), None);
-        state.handle_file_changed(Uuid::new_v4(), Path::new("src/ghost.rs"));
+        state
+            .handle_file_changed(Uuid::new_v4(), Path::new("src/ghost.rs"))
+            .await;
         assert!(state.dirty_workspaces().is_empty());
     }
 
