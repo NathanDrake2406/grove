@@ -1,0 +1,15 @@
+[package]
+name = "grove"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "grove"
+path = "src/main.rs"
+
+[dependencies]
+grove-cli = { path = "../grove-cli" }
+grove-daemon = { path = "../grove-daemon" }
+daemonize = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "grove-daemon"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grove-lib = { path = "../grove-lib" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+notify = { workspace = true }
+ignore = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

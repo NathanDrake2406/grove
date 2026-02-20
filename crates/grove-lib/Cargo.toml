@@ -1,0 +1,19 @@
+[package]
+name = "grove-lib"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gix = { workspace = true }
+tree-sitter = { workspace = true }
+tree-sitter-typescript = { workspace = true }
+tree-sitter-rust = { workspace = true }
+oxc_resolver = { workspace = true }
+similar = { workspace = true }
+petgraph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+bytes = { workspace = true }

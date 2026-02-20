@@ -1,0 +1,62 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/grove-lib",
+    "crates/grove-daemon",
+    "crates/grove-cli",
+    "crates/grove",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/TODO/grove"
+
+[workspace.dependencies]
+# Analysis
+gix = "0.76"
+tree-sitter = "0.26"
+tree-sitter-typescript = "0.23"
+tree-sitter-rust = "0.24"
+oxc_resolver = "11"
+similar = "2"
+petgraph = "0.8"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Filesystem
+notify = "8"
+ignore = "0.4"
+
+# Database
+rusqlite = { version = "0.38", features = ["bundled"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+colored = "3"
+
+# Daemon
+daemonize = "0.5"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# IDs
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Bytes
+bytes = "1"

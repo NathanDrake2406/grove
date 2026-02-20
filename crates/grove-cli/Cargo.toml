@@ -1,0 +1,13 @@
+[package]
+name = "grove-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+grove-lib = { path = "../grove-lib" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+colored = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
