@@ -57,106 +57,116 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
         let tree = self.parse(source, false)?;
         let root = tree.root_node();
         let mut symbols = Vec::new();
-        let mut cursor = root.walk();
-
-        for child in root.children(&mut cursor) {
-            match child.kind() {
-                "function_declaration" => {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Function,
-                            range: LineRange {
-                                start: child.start_position().row as u32 + 1,
-                                end: child.end_position().row as u32 + 1,
-                            },
-                            signature: Some(
-                                get_first_line(source, child.start_byte(), child.end_byte()),
-                            ),
-                        });
-                    }
+        visit_descendants(root, &mut |node| match node.kind() {
+            "function_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Function,
+                        range: LineRange {
+                            start: node.start_position().row as u32 + 1,
+                            end: node.end_position().row as u32 + 1,
+                        },
+                        signature: Some(get_first_line(source, node.start_byte(), node.end_byte())),
+                    });
                 }
-                "class_declaration" => {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Class,
-                            range: LineRange {
-                                start: child.start_position().row as u32 + 1,
-                                end: child.end_position().row as u32 + 1,
-                            },
-                            signature: None,
-                        });
-                    }
-                }
-                "interface_declaration" => {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Interface,
-                            range: LineRange {
-                                start: child.start_position().row as u32 + 1,
-                                end: child.end_position().row as u32 + 1,
-                            },
-                            signature: None,
-                        });
-                    }
-                }
-                "type_alias_declaration" => {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::TypeAlias,
-                            range: LineRange {
-                                start: child.start_position().row as u32 + 1,
-                                end: child.end_position().row as u32 + 1,
-                            },
-                            signature: None,
-                        });
-                    }
-                }
-                "enum_declaration" => {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let name = name_node.utf8_text(source).unwrap_or("").to_string();
-                        symbols.push(Symbol {
-                            name,
-                            kind: SymbolKind::Enum,
-                            range: LineRange {
-                                start: child.start_position().row as u32 + 1,
-                                end: child.end_position().row as u32 + 1,
-                            },
-                            signature: None,
-                        });
-                    }
-                }
-                "lexical_declaration" | "variable_declaration" => {
-                    // const/let/var declarations
-                    let mut decl_cursor = child.walk();
-                    for decl_child in child.children(&mut decl_cursor) {
-                        if decl_child.kind() == "variable_declarator"
-                            && let Some(name_node) = decl_child.child_by_field_name("name")
-                        {
-                            let name =
-                                name_node.utf8_text(source).unwrap_or("").to_string();
-                            symbols.push(Symbol {
-                                name,
-                                kind: SymbolKind::Variable,
-                                range: LineRange {
-                                    start: child.start_position().row as u32 + 1,
-                                    end: child.end_position().row as u32 + 1,
-                                },
-                                signature: None,
-                            });
-                        }
-                    }
-                }
-                _ => {}
             }
-        }
+            "method_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        symbols.push(Symbol {
+                            name,
+                            kind: SymbolKind::Method,
+                            range: LineRange {
+                                start: node.start_position().row as u32 + 1,
+                                end: node.end_position().row as u32 + 1,
+                            },
+                            signature: Some(get_first_line(
+                                source,
+                                node.start_byte(),
+                                node.end_byte(),
+                            )),
+                        });
+                    }
+                }
+            }
+            "class_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Class,
+                        range: LineRange {
+                            start: node.start_position().row as u32 + 1,
+                            end: node.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+            }
+            "interface_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Interface,
+                        range: LineRange {
+                            start: node.start_position().row as u32 + 1,
+                            end: node.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+            }
+            "type_alias_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::TypeAlias,
+                        range: LineRange {
+                            start: node.start_position().row as u32 + 1,
+                            end: node.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+            }
+            "enum_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_node.utf8_text(source).unwrap_or("").to_string();
+                    symbols.push(Symbol {
+                        name,
+                        kind: SymbolKind::Enum,
+                        range: LineRange {
+                            start: node.start_position().row as u32 + 1,
+                            end: node.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+            }
+            "variable_declarator" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let mut names = Vec::new();
+                    collect_binding_identifiers(name_node, source, &mut names);
+                    for name in names {
+                        symbols.push(Symbol {
+                            name,
+                            kind: SymbolKind::Variable,
+                            range: LineRange {
+                                start: node.start_position().row as u32 + 1,
+                                end: node.end_position().row as u32 + 1,
+                            },
+                            signature: None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        });
 
         Ok(symbols)
     }
@@ -165,78 +175,19 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
         let tree = self.parse(source, false)?;
         let root = tree.root_node();
         let mut imports = Vec::new();
-        let mut cursor = root.walk();
-
-        for child in root.children(&mut cursor) {
-            if child.kind() == "import_statement" {
-                let line = child.start_position().row as u32 + 1;
-                let mut source_path = String::new();
-                let mut symbols = Vec::new();
-
-                let mut import_cursor = child.walk();
-                for import_child in child.children(&mut import_cursor) {
-                    match import_child.kind() {
-                        "string" | "template_string" => {
-                            let raw = import_child.utf8_text(source).unwrap_or("");
-                            // Strip quotes
-                            source_path = raw.trim_matches(|c| c == '\'' || c == '"').to_string();
-                        }
-                        "import_clause" => {
-                            let mut clause_cursor = import_child.walk();
-                            for clause_child in import_child.children(&mut clause_cursor) {
-                                if clause_child.kind() == "named_imports" {
-                                    let mut named_cursor = clause_child.walk();
-                                    for named_child in clause_child.children(&mut named_cursor) {
-                                        if named_child.kind() == "import_specifier" {
-                                            let name = named_child
-                                                .child_by_field_name("name")
-                                                .map(|n| {
-                                                    n.utf8_text(source)
-                                                        .unwrap_or("")
-                                                        .to_string()
-                                                })
-                                                .unwrap_or_default();
-                                            let alias = named_child
-                                                .child_by_field_name("alias")
-                                                .map(|n| {
-                                                    n.utf8_text(source)
-                                                        .unwrap_or("")
-                                                        .to_string()
-                                                });
-                                            if !name.is_empty() {
-                                                symbols.push(ImportedSymbol { name, alias });
-                                            }
-                                        }
-                                    }
-                                }
-                                if clause_child.kind() == "identifier" {
-                                    // Default import
-                                    let name = clause_child
-                                        .utf8_text(source)
-                                        .unwrap_or("")
-                                        .to_string();
-                                    if !name.is_empty() {
-                                        symbols.push(ImportedSymbol {
-                                            name: "default".to_string(),
-                                            alias: Some(name),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-
-                if !source_path.is_empty() {
-                    imports.push(Import {
-                        source: source_path,
-                        symbols,
-                        line,
-                    });
+        visit_descendants(root, &mut |node| match node.kind() {
+            "import_statement" => {
+                if let Some(import) = extract_static_import(node, source) {
+                    imports.push(import);
                 }
             }
-        }
+            "call_expression" => {
+                if let Some(import) = extract_dynamic_import(node, source) {
+                    imports.push(import);
+                }
+            }
+            _ => {}
+        });
 
         Ok(imports)
     }
@@ -292,6 +243,27 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
                                 });
                             }
                         }
+                        "export_clause" => {
+                            let mut clause_cursor = export_child.walk();
+                            for clause_child in export_child.children(&mut clause_cursor) {
+                                if clause_child.kind() == "export_specifier" {
+                                    let alias = clause_child.child_by_field_name("alias");
+                                    let name = clause_child.child_by_field_name("name");
+                                    let exported_name = alias.or(name).and_then(|n| {
+                                        let text = n.utf8_text(source).unwrap_or("").to_string();
+                                        if text.is_empty() { None } else { Some(text) }
+                                    });
+
+                                    if let Some(name) = exported_name {
+                                        exports.push(ExportedSymbol {
+                                            name,
+                                            kind: SymbolKind::Variable,
+                                            signature: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -309,8 +281,12 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
 
         matches!(
             filename.as_str(),
-            "package.json" | "tsconfig.json" | "next.config.js" | "next.config.ts"
-                | "vite.config.ts" | "webpack.config.js"
+            "package.json"
+                | "tsconfig.json"
+                | "next.config.js"
+                | "next.config.ts"
+                | "vite.config.ts"
+                | "webpack.config.js"
         )
     }
 }
@@ -319,6 +295,155 @@ fn get_first_line(source: &[u8], start: usize, end: usize) -> String {
     let slice = &source[start..end.min(source.len())];
     let text = String::from_utf8_lossy(slice);
     text.lines().next().unwrap_or("").to_string()
+}
+
+fn visit_descendants<'tree, F>(node: tree_sitter::Node<'tree>, f: &mut F)
+where
+    F: FnMut(tree_sitter::Node<'tree>),
+{
+    f(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_descendants(child, f);
+    }
+}
+
+fn collect_binding_identifiers(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    names: &mut Vec<String>,
+) {
+    match node.kind() {
+        "identifier" | "shorthand_property_identifier_pattern" => {
+            let name = node.utf8_text(source).unwrap_or("").to_string();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        _ => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                collect_binding_identifiers(child, source, names);
+            }
+        }
+    }
+}
+
+fn extract_static_import(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Import> {
+    let line = node.start_position().row as u32 + 1;
+    let mut source_path = node
+        .child_by_field_name("source")
+        .and_then(|n| extract_string_value(n, source))
+        .unwrap_or_default();
+    let mut symbols = Vec::new();
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string" | "template_string" if source_path.is_empty() => {
+                source_path = extract_string_value(child, source).unwrap_or_default();
+            }
+            "import_clause" => {
+                let mut clause_cursor = child.walk();
+                for clause_child in child.children(&mut clause_cursor) {
+                    match clause_child.kind() {
+                        "identifier" => {
+                            let name = clause_child.utf8_text(source).unwrap_or("").to_string();
+                            if !name.is_empty() {
+                                symbols.push(ImportedSymbol {
+                                    name: "default".to_string(),
+                                    alias: Some(name),
+                                });
+                            }
+                        }
+                        "named_imports" => {
+                            let mut named_cursor = clause_child.walk();
+                            for named_child in clause_child.children(&mut named_cursor) {
+                                if named_child.kind() == "import_specifier" {
+                                    let name = named_child
+                                        .child_by_field_name("name")
+                                        .map(|n| n.utf8_text(source).unwrap_or("").to_string())
+                                        .unwrap_or_default();
+                                    let alias = named_child
+                                        .child_by_field_name("alias")
+                                        .map(|n| n.utf8_text(source).unwrap_or("").to_string());
+
+                                    if !name.is_empty() {
+                                        symbols.push(ImportedSymbol { name, alias });
+                                    }
+                                }
+                            }
+                        }
+                        "namespace_import" => {
+                            let alias = clause_child
+                                .child_by_field_name("name")
+                                .or_else(|| {
+                                    let mut ns_cursor = clause_child.walk();
+                                    clause_child
+                                        .children(&mut ns_cursor)
+                                        .find(|n| n.kind() == "identifier")
+                                })
+                                .map(|n| n.utf8_text(source).unwrap_or("").to_string())
+                                .filter(|s| !s.is_empty());
+
+                            if let Some(alias) = alias {
+                                symbols.push(ImportedSymbol {
+                                    name: "*".to_string(),
+                                    alias: Some(alias),
+                                });
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if source_path.is_empty() {
+        None
+    } else {
+        Some(Import {
+            source: source_path,
+            symbols,
+            line,
+        })
+    }
+}
+
+fn extract_dynamic_import(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Import> {
+    let function = node.child_by_field_name("function")?;
+    if function.kind() != "import" {
+        return None;
+    }
+
+    let arguments = node.child_by_field_name("arguments")?;
+    let mut arg_cursor = arguments.walk();
+    for argument in arguments.children(&mut arg_cursor) {
+        if matches!(argument.kind(), "string" | "template_string")
+            && let Some(source_path) = extract_string_value(argument, source)
+        {
+            return Some(Import {
+                source: source_path,
+                symbols: vec![],
+                line: node.start_position().row as u32 + 1,
+            });
+        }
+    }
+
+    None
+}
+
+fn extract_string_value(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let raw = node.utf8_text(source).ok()?;
+    let trimmed = raw.trim();
+    let value = trimmed.trim_matches(|c| c == '\'' || c == '"' || c == '`');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -357,11 +482,21 @@ interface PaymentConfig {
 "#;
         let analyzer = TypeScriptAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert_eq!(symbols.len(), 2);
-        assert_eq!(symbols[0].name, "PaymentService");
-        assert_eq!(symbols[0].kind, SymbolKind::Class);
-        assert_eq!(symbols[1].name, "PaymentConfig");
-        assert_eq!(symbols[1].kind, SymbolKind::Interface);
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "PaymentService" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "PaymentConfig" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "process" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -428,7 +563,7 @@ export { renamed as reRenamed } from "./other";
     }
 
     #[test]
-    fn extract_imports_supports_default_named_and_skips_dynamic_imports() {
+    fn extract_imports_supports_default_named_namespace_and_dynamic_imports() {
         let source = br#"
 import React, { useMemo as memo } from "react";
 import * as fs from "node:fs";
@@ -452,7 +587,7 @@ const mod = await import("./dynamic");
     }
 
     #[test]
-    fn extract_exports_handles_default_and_reexport_current_behavior() {
+    fn extract_exports_handles_default_and_reexport_aliases() {
         let source = br#"
 export default class DefaultThing {}
 export { foo as bar } from "./foo";
@@ -470,12 +605,8 @@ export function named() {}
     #[test]
     fn schema_file_detection_handles_nested_paths_and_spaces() {
         let analyzer = TypeScriptAnalyzer::new();
-        assert!(analyzer.is_schema_file(Path::new(
-            "a/b/c with spaces/next.config.ts"
-        )));
-        assert!(analyzer.is_schema_file(Path::new(
-            "deep/nested/project/tsconfig.json"
-        )));
+        assert!(analyzer.is_schema_file(Path::new("a/b/c with spaces/next.config.ts")));
+        assert!(analyzer.is_schema_file(Path::new("deep/nested/project/tsconfig.json")));
     }
 
     #[test]
@@ -512,7 +643,7 @@ import { foo as value, bar as value, value as foo } from "./dep";
     }
 
     #[test]
-    fn nested_namespace_and_class_methods_are_not_emitted_as_top_level_symbols() {
+    fn nested_namespace_and_class_methods_are_emitted_by_recursive_walk() {
         let source = br#"
 namespace Internal {
     export function hidden() {}
@@ -529,12 +660,16 @@ function topLevel() {}
 
         assert!(symbols.iter().any(|s| s.name == "Api"));
         assert!(symbols.iter().any(|s| s.name == "topLevel"));
-        assert!(!symbols.iter().any(|s| s.name == "hidden"));
-        assert!(!symbols.iter().any(|s| s.name == "method"));
+        assert!(symbols.iter().any(|s| s.name == "hidden"));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "method" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
-    fn extract_exports_collects_declarations_but_not_reexport_aliases() {
+    fn extract_exports_collects_declarations_and_reexport_aliases() {
         let source = br#"
 export { foo as bar } from "./foo";
 export * from "./other";
@@ -547,7 +682,7 @@ export interface DeclaredShape {}
 
         assert!(exports.iter().any(|e| e.name == "declared"));
         assert!(exports.iter().any(|e| e.name == "DeclaredShape"));
-        assert!(!exports.iter().any(|e| e.name == "bar"));
+        assert!(exports.iter().any(|e| e.name == "bar"));
     }
 
     #[test]
@@ -585,6 +720,9 @@ import Client, { connect as openConnection } from "./client";
         assert_eq!(imports[1].symbols[0].name, "default");
         assert_eq!(imports[1].symbols[0].alias.as_deref(), Some("Client"));
         assert_eq!(imports[1].symbols[1].name, "connect");
-        assert_eq!(imports[1].symbols[1].alias.as_deref(), Some("openConnection"));
+        assert_eq!(
+            imports[1].symbols[1].alias.as_deref(),
+            Some("openConnection")
+        );
     }
 }

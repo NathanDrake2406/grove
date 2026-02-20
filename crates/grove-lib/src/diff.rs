@@ -119,11 +119,21 @@ mod tests {
     fn hunk_overlap_detects_overlapping_ranges() {
         let a = make_changeset(vec![make_file(
             "src/payment.ts",
-            vec![Hunk { old_start: 10, old_lines: 10, new_start: 10, new_lines: 20 }],
+            vec![Hunk {
+                old_start: 10,
+                old_lines: 10,
+                new_start: 10,
+                new_lines: 20,
+            }],
         )]);
         let b = make_changeset(vec![make_file(
             "src/payment.ts",
-            vec![Hunk { old_start: 20, old_lines: 10, new_start: 20, new_lines: 25 }],
+            vec![Hunk {
+                old_start: 20,
+                old_lines: 10,
+                new_start: 20,
+                new_lines: 25,
+            }],
         )]);
 
         let overlaps = compute_hunk_overlaps(&a, &b, 5);
@@ -138,11 +148,21 @@ mod tests {
     fn hunk_overlap_detects_nearby_ranges() {
         let a = make_changeset(vec![make_file(
             "src/payment.ts",
-            vec![Hunk { old_start: 10, old_lines: 5, new_start: 10, new_lines: 5 }],
+            vec![Hunk {
+                old_start: 10,
+                old_lines: 5,
+                new_start: 10,
+                new_lines: 5,
+            }],
         )]);
         let b = make_changeset(vec![make_file(
             "src/payment.ts",
-            vec![Hunk { old_start: 18, old_lines: 5, new_start: 18, new_lines: 5 }],
+            vec![Hunk {
+                old_start: 18,
+                old_lines: 5,
+                new_start: 18,
+                new_lines: 5,
+            }],
         )]);
 
         // a_range: 10-14, b_range: 18-22, distance = 4 (within threshold of 5)
@@ -158,11 +178,21 @@ mod tests {
     fn hunk_overlap_ignores_distant_ranges() {
         let a = make_changeset(vec![make_file(
             "src/payment.ts",
-            vec![Hunk { old_start: 10, old_lines: 5, new_start: 10, new_lines: 5 }],
+            vec![Hunk {
+                old_start: 10,
+                old_lines: 5,
+                new_start: 10,
+                new_lines: 5,
+            }],
         )]);
         let b = make_changeset(vec![make_file(
             "src/payment.ts",
-            vec![Hunk { old_start: 200, old_lines: 5, new_start: 200, new_lines: 5 }],
+            vec![Hunk {
+                old_start: 200,
+                old_lines: 5,
+                new_start: 200,
+                new_lines: 5,
+            }],
         )]);
 
         let overlaps = compute_hunk_overlaps(&a, &b, 5);
@@ -186,15 +216,35 @@ mod tests {
         let a = make_changeset(vec![make_file(
             "src/shared.ts",
             vec![
-                Hunk { old_start: 0, old_lines: 0, new_start: 0, new_lines: 0 },
-                Hunk { old_start: 10, old_lines: 3, new_start: 10, new_lines: 3 },
+                Hunk {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 0,
+                    new_lines: 0,
+                },
+                Hunk {
+                    old_start: 10,
+                    old_lines: 3,
+                    new_start: 10,
+                    new_lines: 3,
+                },
             ],
         )]);
         let b = make_changeset(vec![make_file(
             "src/shared.ts",
             vec![
-                Hunk { old_start: 0, old_lines: 0, new_start: 0, new_lines: 0 },
-                Hunk { old_start: 11, old_lines: 2, new_start: 11, new_lines: 2 },
+                Hunk {
+                    old_start: 0,
+                    old_lines: 0,
+                    new_start: 0,
+                    new_lines: 0,
+                },
+                Hunk {
+                    old_start: 11,
+                    old_lines: 2,
+                    new_start: 11,
+                    new_lines: 2,
+                },
             ],
         )]);
 
@@ -235,11 +285,21 @@ mod tests {
     fn zero_length_hunks_are_supported() {
         let a = make_changeset(vec![make_file(
             "src/zero.ts",
-            vec![Hunk { old_start: 0, old_lines: 0, new_start: 0, new_lines: 0 }],
+            vec![Hunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 0,
+                new_lines: 0,
+            }],
         )]);
         let b = make_changeset(vec![make_file(
             "src/zero.ts",
-            vec![Hunk { old_start: 0, old_lines: 0, new_start: 0, new_lines: 0 }],
+            vec![Hunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 0,
+                new_lines: 0,
+            }],
         )]);
 
         let overlaps = compute_hunk_overlaps(&a, &b, 0);
@@ -406,7 +466,9 @@ mod tests {
         let overlaps = compute_hunk_overlaps(&a, &b, 0);
         assert_eq!(overlaps.len(), 1);
         match &overlaps[0] {
-            Overlap::Hunk { path: p, distance, .. } => {
+            Overlap::Hunk {
+                path: p, distance, ..
+            } => {
                 assert_eq!(p, &PathBuf::from(path));
                 assert_eq!(*distance, 0);
             }

@@ -67,10 +67,7 @@ pub fn compute_schema_overlaps(a: &WorkspaceChangeset, b: &WorkspaceChangeset) -
                         category: a_cat,
                         a_file: a_file.path.clone(),
                         b_file: b_file.path.clone(),
-                        detail: format!(
-                            "Both workspaces modify {:?} files",
-                            a_cat
-                        ),
+                        detail: format!("Both workspaces modify {:?} files", a_cat),
                     });
                 }
             }
@@ -226,7 +223,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("/");
         let path = format!("{deep}/.github/workflows/发布.yml");
-        assert_eq!(classify_schema_file(Path::new(&path)), Some(SchemaCategory::CI));
+        assert_eq!(
+            classify_schema_file(Path::new(&path)),
+            Some(SchemaCategory::CI)
+        );
     }
 
     #[test]

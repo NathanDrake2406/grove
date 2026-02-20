@@ -1,7 +1,7 @@
 use crate::diff::{compute_file_overlaps, compute_hunk_overlaps};
 use crate::schema::compute_schema_overlaps;
 use crate::types::*;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 const HUNK_PROXIMITY_THRESHOLD: u32 = 5;
 
@@ -43,6 +43,7 @@ pub fn score_pair(
     a: &WorkspaceChangeset,
     b: &WorkspaceChangeset,
     dependency_overlaps: Vec<Overlap>,
+    last_computed: DateTime<Utc>,
 ) -> WorkspacePairAnalysis {
     let mut all_overlaps = Vec::new();
 
@@ -83,15 +84,28 @@ pub fn score_pair(
         score,
         overlaps: all_overlaps,
         merge_order_hint,
-        last_computed: Utc::now(),
+        last_computed,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    fn deterministic_timestamp() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).expect("valid fixed timestamp")
+    }
+
+    fn score_pair(
+        a: &WorkspaceChangeset,
+        b: &WorkspaceChangeset,
+        dependency_overlaps: Vec<Overlap>,
+    ) -> WorkspacePairAnalysis {
+        super::score_pair(a, b, dependency_overlaps, deterministic_timestamp())
+    }
 
     fn make_changeset_with_id(id: Uuid, files: Vec<FileChange>) -> WorkspaceChangeset {
         WorkspaceChangeset {
@@ -110,7 +124,12 @@ mod tests {
             vec![FileChange {
                 path: PathBuf::from("src/auth.ts"),
                 change_type: ChangeType::Modified,
-                hunks: vec![Hunk { old_start: 1, old_lines: 5, new_start: 1, new_lines: 5 }],
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 5,
+                    new_start: 1,
+                    new_lines: 5,
+                }],
                 symbols_modified: vec![],
                 exports_changed: vec![],
             }],
@@ -120,7 +139,12 @@ mod tests {
             vec![FileChange {
                 path: PathBuf::from("src/payment.ts"),
                 change_type: ChangeType::Modified,
-                hunks: vec![Hunk { old_start: 1, old_lines: 5, new_start: 1, new_lines: 5 }],
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 5,
+                    new_start: 1,
+                    new_lines: 5,
+                }],
                 symbols_modified: vec![],
                 exports_changed: vec![],
             }],
@@ -138,7 +162,12 @@ mod tests {
             vec![FileChange {
                 path: PathBuf::from("src/shared.ts"),
                 change_type: ChangeType::Modified,
-                hunks: vec![Hunk { old_start: 1, old_lines: 5, new_start: 1, new_lines: 5 }],
+                hunks: vec![Hunk {
+                    old_start: 1,
+                    old_lines: 5,
+                    new_start: 1,
+                    new_lines: 5,
+                }],
                 symbols_modified: vec![],
                 exports_changed: vec![],
             }],
@@ -148,9 +177,12 @@ mod tests {
             vec![FileChange {
                 path: PathBuf::from("src/shared.ts"),
                 change_type: ChangeType::Modified,
-                hunks: vec![
-                    Hunk { old_start: 100, old_lines: 5, new_start: 100, new_lines: 5 },
-                ],
+                hunks: vec![Hunk {
+                    old_start: 100,
+                    old_lines: 5,
+                    new_start: 100,
+                    new_lines: 5,
+                }],
                 symbols_modified: vec![],
                 exports_changed: vec![],
             }],
@@ -174,7 +206,12 @@ mod tests {
             vec![FileChange {
                 path: PathBuf::from("src/payment.ts"),
                 change_type: ChangeType::Modified,
-                hunks: vec![Hunk { old_start: 10, old_lines: 20, new_start: 10, new_lines: 25 }],
+                hunks: vec![Hunk {
+                    old_start: 10,
+                    old_lines: 20,
+                    new_start: 10,
+                    new_lines: 25,
+                }],
                 symbols_modified: vec![shared_symbol.clone()],
                 exports_changed: vec![],
             }],
@@ -184,7 +221,12 @@ mod tests {
             vec![FileChange {
                 path: PathBuf::from("src/payment.ts"),
                 change_type: ChangeType::Modified,
-                hunks: vec![Hunk { old_start: 15, old_lines: 10, new_start: 15, new_lines: 12 }],
+                hunks: vec![Hunk {
+                    old_start: 15,
+                    old_lines: 10,
+                    new_start: 15,
+                    new_lines: 12,
+                }],
                 symbols_modified: vec![Symbol {
                     name: "processPayment".into(),
                     kind: SymbolKind::Function,
@@ -209,8 +251,12 @@ mod tests {
             changed_file: PathBuf::from("src/auth.ts"),
             changed_export: ExportDelta::SignatureChanged {
                 symbol_name: "authenticate".into(),
-                old: Signature { text: "fn authenticate() -> bool".into() },
-                new: Signature { text: "fn authenticate(token: &str) -> Result<bool>".into() },
+                old: Signature {
+                    text: "fn authenticate() -> bool".into(),
+                },
+                new: Signature {
+                    text: "fn authenticate(token: &str) -> Result<bool>".into(),
+                },
             },
             affected_file: PathBuf::from("src/router.ts"),
             affected_usage: vec![Location {

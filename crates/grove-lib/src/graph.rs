@@ -1,6 +1,6 @@
 use crate::types::*;
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 /// The canonical import graph for the base branch.
 #[derive(Debug, Clone, Default)]
@@ -96,66 +96,112 @@ impl GraphOverlay {
     }
 }
 
-/// Compute dependency-level overlaps between two workspace overlays.
+/// Compute dependency-level overlaps between two workspace changesets.
 /// This is the most expensive layer: it traces export signature changes
 /// through the import graph to find affected files in the other workspace.
 pub fn compute_dependency_overlaps(
     a_changeset: &WorkspaceChangeset,
     b_changeset: &WorkspaceChangeset,
-    _a_overlay: &GraphOverlay,
-    _b_overlay: &GraphOverlay,
     base_graph: &ImportGraph,
 ) -> Vec<Overlap> {
     let mut overlaps = Vec::new();
+    let mut emitted_overlap_keys: HashSet<(WorkspaceId, PathBuf, usize, PathBuf)> = HashSet::new();
 
-    let b_changed_files: HashSet<&PathBuf> =
-        b_changeset.changed_files.iter().map(|f| &f.path).collect();
+    let b_changed_files: HashSet<&Path> = b_changeset
+        .changed_files
+        .iter()
+        .map(|f| f.path.as_path())
+        .collect();
+    collect_directional_dependency_overlaps(
+        a_changeset,
+        &b_changed_files,
+        base_graph,
+        &mut emitted_overlap_keys,
+        &mut overlaps,
+    );
 
-    // For each file in A's changeset that has export changes...
-    for a_file in &a_changeset.changed_files {
-        for export_delta in &a_file.exports_changed {
-            // Find all dependents of this file in the base graph
-            let dependents = base_graph.get_dependents(&a_file.path);
-
-            for dep_file in dependents {
-                // If the dependent file is also changed in B's workspace,
-                // that's a dependency-level conflict
-                if b_changed_files.contains(dep_file) {
-                    overlaps.push(Overlap::Dependency {
-                        changed_in: a_changeset.workspace_id,
-                        changed_file: a_file.path.clone(),
-                        changed_export: export_delta.clone(),
-                        affected_file: dep_file.clone(),
-                        affected_usage: vec![], // Filled in by symbol-level analysis
-                    });
-                }
-            }
-        }
-    }
-
-    // Also check B's exports affecting A's files
-    let a_changed_files: HashSet<&PathBuf> =
-        a_changeset.changed_files.iter().map(|f| &f.path).collect();
-
-    for b_file in &b_changeset.changed_files {
-        for export_delta in &b_file.exports_changed {
-            let dependents = base_graph.get_dependents(&b_file.path);
-
-            for dep_file in dependents {
-                if a_changed_files.contains(dep_file) {
-                    overlaps.push(Overlap::Dependency {
-                        changed_in: b_changeset.workspace_id,
-                        changed_file: b_file.path.clone(),
-                        changed_export: export_delta.clone(),
-                        affected_file: dep_file.clone(),
-                        affected_usage: vec![],
-                    });
-                }
-            }
-        }
-    }
+    let a_changed_files: HashSet<&Path> = a_changeset
+        .changed_files
+        .iter()
+        .map(|f| f.path.as_path())
+        .collect();
+    collect_directional_dependency_overlaps(
+        b_changeset,
+        &a_changed_files,
+        base_graph,
+        &mut emitted_overlap_keys,
+        &mut overlaps,
+    );
 
     overlaps
+}
+
+fn collect_directional_dependency_overlaps(
+    source_changeset: &WorkspaceChangeset,
+    target_changed_files: &HashSet<&Path>,
+    base_graph: &ImportGraph,
+    emitted_overlap_keys: &mut HashSet<(WorkspaceId, PathBuf, usize, PathBuf)>,
+    overlaps: &mut Vec<Overlap>,
+) {
+    for changed_file in &source_changeset.changed_files {
+        if changed_file.exports_changed.is_empty() {
+            continue;
+        }
+
+        let transitive_dependents =
+            collect_transitive_dependents(changed_file.path.as_path(), base_graph);
+
+        for (export_delta_idx, export_delta) in changed_file.exports_changed.iter().enumerate() {
+            for dependent_file in &transitive_dependents {
+                if !target_changed_files.contains(dependent_file.as_path()) {
+                    continue;
+                }
+
+                let overlap_key = (
+                    source_changeset.workspace_id,
+                    changed_file.path.clone(),
+                    export_delta_idx,
+                    dependent_file.clone(),
+                );
+
+                if !emitted_overlap_keys.insert(overlap_key) {
+                    continue;
+                }
+
+                overlaps.push(Overlap::Dependency {
+                    changed_in: source_changeset.workspace_id,
+                    changed_file: changed_file.path.clone(),
+                    changed_export: export_delta.clone(),
+                    affected_file: dependent_file.clone(),
+                    affected_usage: vec![],
+                });
+            }
+        }
+    }
+}
+
+fn collect_transitive_dependents(file: &Path, base_graph: &ImportGraph) -> Vec<PathBuf> {
+    let mut queue = VecDeque::new();
+    let mut visited = HashSet::new();
+    let mut discovered = Vec::new();
+
+    visited.insert(file.to_path_buf());
+    queue.push_back(file.to_path_buf());
+
+    while let Some(current) = queue.pop_front() {
+        if let Some(direct_dependents) = base_graph.dependents.get(&current) {
+            for (dependent_file, _) in direct_dependents {
+                if !visited.insert(dependent_file.clone()) {
+                    continue;
+                }
+
+                discovered.push(dependent_file.clone());
+                queue.push_back(dependent_file.clone());
+            }
+        }
+    }
+
+    discovered
 }
 
 #[cfg(test)]
@@ -169,7 +215,10 @@ mod tests {
         graph.add_import(
             PathBuf::from("src/router.ts"),
             PathBuf::from("src/auth.ts"),
-            vec![ImportedSymbol { name: "authenticate".into(), alias: None }],
+            vec![ImportedSymbol {
+                name: "authenticate".into(),
+                alias: None,
+            }],
         );
 
         assert_eq!(
@@ -189,7 +238,10 @@ mod tests {
         base_graph.add_import(
             PathBuf::from("src/router.ts"),
             PathBuf::from("src/auth.ts"),
-            vec![ImportedSymbol { name: "authenticate".into(), alias: None }],
+            vec![ImportedSymbol {
+                name: "authenticate".into(),
+                alias: None,
+            }],
         );
 
         let a_id = Uuid::new_v4();
@@ -206,7 +258,9 @@ mod tests {
                 symbols_modified: vec![],
                 exports_changed: vec![ExportDelta::SignatureChanged {
                     symbol_name: "authenticate".into(),
-                    old: Signature { text: "fn authenticate() -> bool".into() },
+                    old: Signature {
+                        text: "fn authenticate() -> bool".into(),
+                    },
                     new: Signature {
                         text: "fn authenticate(token: &str) -> Result<bool>".into(),
                     },
@@ -231,11 +285,7 @@ mod tests {
             commits_behind: 0,
         };
 
-        let a_overlay = GraphOverlay::new();
-        let b_overlay = GraphOverlay::new();
-
-        let overlaps =
-            compute_dependency_overlaps(&a, &b, &a_overlay, &b_overlay, &base_graph);
+        let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
 
         assert_eq!(overlaps.len(), 1);
         match &overlaps[0] {
@@ -259,7 +309,10 @@ mod tests {
         base_graph.add_import(
             PathBuf::from("src/router.ts"),
             PathBuf::from("src/auth.ts"),
-            vec![ImportedSymbol { name: "authenticate".into(), alias: None }],
+            vec![ImportedSymbol {
+                name: "authenticate".into(),
+                alias: None,
+            }],
         );
 
         let a = WorkspaceChangeset {
@@ -290,13 +343,7 @@ mod tests {
             commits_behind: 0,
         };
 
-        let overlaps = compute_dependency_overlaps(
-            &a,
-            &b,
-            &GraphOverlay::new(),
-            &GraphOverlay::new(),
-            &base_graph,
-        );
+        let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
 
         assert!(overlaps.is_empty());
     }
@@ -409,13 +456,7 @@ mod tests {
             commits_behind: 0,
         };
 
-        let overlaps = compute_dependency_overlaps(
-            &a_changeset,
-            &b_changeset,
-            &GraphOverlay::new(),
-            &GraphOverlay::new(),
-            &base_graph,
-        );
+        let overlaps = compute_dependency_overlaps(&a_changeset, &b_changeset, &base_graph);
 
         assert_eq!(overlaps.len(), 1);
         match &overlaps[0] {
@@ -592,8 +633,7 @@ mod tests {
             commits_behind: 0,
         };
 
-        let overlaps =
-            compute_dependency_overlaps(&a, &b, &GraphOverlay::new(), &GraphOverlay::new(), &base_graph);
+        let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
 
         assert_eq!(overlaps.len(), 4);
         let mut affected = std::collections::HashSet::new();
@@ -696,8 +736,7 @@ mod tests {
             commits_behind: 0,
         };
 
-        let overlaps =
-            compute_dependency_overlaps(&a, &b, &GraphOverlay::new(), &GraphOverlay::new(), &base_graph);
+        let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
         assert_eq!(overlaps.len(), 2);
 
         let changed_in: std::collections::HashSet<_> = overlaps
@@ -712,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn dependency_overlap_does_not_propagate_transitively_or_to_unrelated_large_change_sets() {
+    fn dependency_overlap_propagates_transitively_but_not_to_unrelated_large_change_sets() {
         let mut base_graph = ImportGraph::new();
         // mid depends on api, leaf depends on mid (transitive-only w.r.t. api)
         base_graph.add_import(
@@ -777,8 +816,111 @@ mod tests {
             commits_behind: 0,
         };
 
-        let overlaps =
-            compute_dependency_overlaps(&a, &b, &GraphOverlay::new(), &GraphOverlay::new(), &base_graph);
-        assert!(overlaps.is_empty());
+        let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
+        assert_eq!(overlaps.len(), 1);
+        match &overlaps[0] {
+            Overlap::Dependency {
+                changed_file,
+                affected_file,
+                ..
+            } => {
+                assert_eq!(changed_file, &PathBuf::from("src/api.ts"));
+                assert_eq!(affected_file, &PathBuf::from("src/leaf.ts"));
+            }
+            _ => panic!("expected dependency overlap"),
+        }
+    }
+
+    #[test]
+    fn dependency_overlap_transitive_traversal_is_cycle_safe_and_deduplicated() {
+        let mut base_graph = ImportGraph::new();
+        base_graph.add_import(
+            PathBuf::from("B.ts"),
+            PathBuf::from("A.ts"),
+            vec![ImportedSymbol {
+                name: "x".into(),
+                alias: None,
+            }],
+        );
+        base_graph.add_import(
+            PathBuf::from("C.ts"),
+            PathBuf::from("B.ts"),
+            vec![ImportedSymbol {
+                name: "x".into(),
+                alias: None,
+            }],
+        );
+        base_graph.add_import(
+            PathBuf::from("A.ts"),
+            PathBuf::from("C.ts"),
+            vec![ImportedSymbol {
+                name: "x".into(),
+                alias: None,
+            }],
+        );
+        // Duplicate edge to confirm we don't emit duplicate overlaps.
+        base_graph.add_import(
+            PathBuf::from("B.ts"),
+            PathBuf::from("A.ts"),
+            vec![ImportedSymbol {
+                name: "x".into(),
+                alias: None,
+            }],
+        );
+
+        let a = WorkspaceChangeset {
+            workspace_id: Uuid::new_v4(),
+            merge_base: "abc".into(),
+            changed_files: vec![FileChange {
+                path: PathBuf::from("A.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                symbols_modified: vec![],
+                exports_changed: vec![ExportDelta::Added(Symbol {
+                    name: "x".into(),
+                    kind: SymbolKind::Function,
+                    range: LineRange { start: 1, end: 1 },
+                    signature: None,
+                })],
+            }],
+            commits_ahead: 1,
+            commits_behind: 0,
+        };
+
+        let b = WorkspaceChangeset {
+            workspace_id: Uuid::new_v4(),
+            merge_base: "abc".into(),
+            changed_files: vec![
+                FileChange {
+                    path: PathBuf::from("B.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: vec![],
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                },
+                FileChange {
+                    path: PathBuf::from("C.ts"),
+                    change_type: ChangeType::Modified,
+                    hunks: vec![],
+                    symbols_modified: vec![],
+                    exports_changed: vec![],
+                },
+            ],
+            commits_ahead: 1,
+            commits_behind: 0,
+        };
+
+        let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
+
+        assert_eq!(overlaps.len(), 2);
+        let affected_files: HashSet<_> = overlaps
+            .into_iter()
+            .map(|overlap| match overlap {
+                Overlap::Dependency { affected_file, .. } => affected_file,
+                _ => panic!("expected dependency overlap"),
+            })
+            .collect();
+        assert!(affected_files.contains(&PathBuf::from("B.ts")));
+        assert!(affected_files.contains(&PathBuf::from("C.ts")));
     }
 }

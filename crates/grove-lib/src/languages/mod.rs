@@ -126,7 +126,11 @@ mod tests {
         let mut registry = LanguageRegistry::new();
         registry.register(Box::new(MockAnalyzer::new("rust", vec!["rs"])));
 
-        assert!(registry.analyzer_for_file(Path::new("src/lib.RS")).is_none());
+        assert!(
+            registry
+                .analyzer_for_file(Path::new("src/lib.RS"))
+                .is_none()
+        );
         assert_eq!(
             registry
                 .analyzer_for_file(Path::new("src/lib.rs"))

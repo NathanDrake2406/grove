@@ -124,24 +124,24 @@ impl LanguageAnalyzer for RustAnalyzer {
             .ok_or_else(|| AnalysisError::ParseError("rust parse failed".into()))?;
         let root = tree.root_node();
         let mut imports = Vec::new();
-        let mut cursor = root.walk();
-
-        for child in root.children(&mut cursor) {
-            if child.kind() == "use_declaration" {
-                let text = child.utf8_text(source).unwrap_or("").to_string();
-                let line = child.start_position().row as u32 + 1;
-                // Extract the module path from "use crate::module::symbol;"
+        visit_descendants(root, &mut |node| {
+            if node.kind() == "use_declaration" {
+                let text = node.utf8_text(source).unwrap_or("").to_string();
+                let line = node.start_position().row as u32 + 1;
                 let path = text
+                    .trim()
                     .trim_start_matches("use ")
                     .trim_end_matches(';')
+                    .trim()
                     .to_string();
+
                 imports.push(Import {
                     source: path,
                     symbols: vec![], // TODO: parse use tree for individual symbols
                     line,
                 });
             }
-        }
+        });
 
         Ok(imports)
     }
@@ -157,12 +157,7 @@ impl LanguageAnalyzer for RustAnalyzer {
         let mut cursor = root.walk();
 
         for child in root.children(&mut cursor) {
-            // Check if the item has a visibility_modifier child with "pub"
-            let is_pub = child
-                .children(&mut child.walk())
-                .any(|c| c.kind() == "visibility_modifier");
-
-            if is_pub {
+            if is_bare_pub_visibility(child, source) {
                 match child.kind() {
                     "function_item" => {
                         if let Some(name_node) = child.child_by_field_name("name") {
@@ -203,6 +198,27 @@ fn get_signature_line(source: &[u8], start: usize) -> String {
     let slice = &source[start..];
     let text = String::from_utf8_lossy(slice);
     text.lines().next().unwrap_or("").to_string()
+}
+
+fn visit_descendants<'tree, F>(node: tree_sitter::Node<'tree>, f: &mut F)
+where
+    F: FnMut(tree_sitter::Node<'tree>),
+{
+    f(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        visit_descendants(child, f);
+    }
+}
+
+fn is_bare_pub_visibility(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "visibility_modifier" {
+            return child.utf8_text(source).unwrap_or("").trim() == "pub";
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -275,7 +291,11 @@ impl<T> Repo<T> {
 
         let analyzer = RustAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.kind == SymbolKind::Struct && s.name == "Repo"));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.kind == SymbolKind::Struct && s.name == "Repo")
+        );
         assert!(symbols.iter().any(|s| s.kind == SymbolKind::Impl));
     }
 
@@ -294,7 +314,7 @@ pub fn public_api() {}
     }
 
     #[test]
-    fn nested_module_use_statements_are_not_collected() {
+    fn nested_module_use_statements_are_collected_recursively() {
         let source = br#"
 mod nested {
     use crate::foo::Bar;
@@ -305,7 +325,7 @@ use std::fmt::Debug;
         let analyzer = RustAnalyzer::new();
         let imports = analyzer.extract_imports(source).unwrap();
         assert_eq!(imports.len(), 2);
-        assert!(imports[0].source.contains("std::fmt::Debug"));
+        assert!(imports.iter().any(|i| i.source.contains("std::fmt::Debug")));
         assert!(imports.iter().any(|i| i.source.contains("crate::foo::Bar")));
     }
 
@@ -331,7 +351,7 @@ impl Broken {
     }
 
     #[test]
-    fn top_level_use_is_collected_but_nested_use_is_not() {
+    fn top_level_and_nested_use_are_collected() {
         let source = br#"
 mod nested {
     use crate::deep::Thing;
@@ -342,9 +362,13 @@ use std::fmt::Debug;
         let analyzer = RustAnalyzer::new();
         let imports = analyzer.extract_imports(source).unwrap();
 
-        assert_eq!(imports.len(), 1);
-        assert!(imports[0].source.contains("std::fmt::Debug"));
-        assert!(!imports.iter().any(|i| i.source.contains("crate::deep::Thing")));
+        assert_eq!(imports.len(), 2);
+        assert!(imports.iter().any(|i| i.source.contains("std::fmt::Debug")));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.source.contains("crate::deep::Thing"))
+        );
     }
 
     #[test]
@@ -363,7 +387,7 @@ use crate::http::{self, Method as Verb, headers::*};
     }
 
     #[test]
-    fn restricted_pub_visibilities_are_currently_treated_as_exports() {
+    fn restricted_pub_visibilities_are_not_treated_as_exports() {
         let source = br#"
 pub(crate) fn crate_visible() {}
 pub(super) struct SuperVisible;
@@ -373,9 +397,9 @@ pub fn public_visible() {}
         let analyzer = RustAnalyzer::new();
         let exports = analyzer.extract_exports(source).unwrap();
 
-        assert!(exports.iter().any(|e| e.name == "crate_visible"));
-        assert!(exports.iter().any(|e| e.name == "SuperVisible"));
-        assert!(exports.iter().any(|e| e.name == "scoped_visible"));
+        assert!(!exports.iter().any(|e| e.name == "crate_visible"));
+        assert!(!exports.iter().any(|e| e.name == "SuperVisible"));
+        assert!(!exports.iter().any(|e| e.name == "scoped_visible"));
         assert!(exports.iter().any(|e| e.name == "public_visible"));
     }
 

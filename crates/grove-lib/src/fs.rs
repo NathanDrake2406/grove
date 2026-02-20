@@ -65,41 +65,9 @@ impl FileSystem for InMemoryFileSystem {
     }
 }
 
-/// Memory-mapped filesystem for production use.
-pub struct MmapFileSystem;
-
-impl FileSystem for MmapFileSystem {
-    fn read_file(&self, path: &Path) -> Result<Bytes, FsError> {
-        let data = std::fs::read(path)?;
-        Ok(Bytes::from(data))
-    }
-
-    fn exists(&self, path: &Path) -> bool {
-        path.exists()
-    }
-
-    fn list_dir(&self, path: &Path) -> Result<Vec<PathBuf>, FsError> {
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(path)? {
-            entries.push(entry?.path());
-        }
-        entries.sort();
-        Ok(entries)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn unique_temp_path(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("grove-{prefix}-{}-{nanos}", std::process::id()))
-    }
 
     #[test]
     fn in_memory_fs_read_existing_file() {
@@ -194,42 +162,5 @@ mod tests {
 
         let entries = fs.list_dir(Path::new("does-not-exist")).unwrap();
         assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn mmap_fs_read_file_preserves_malformed_bytes() {
-        let fs = MmapFileSystem;
-        let temp_dir = unique_temp_path("mmap-read");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        let file_path = temp_dir.join("blob.bin");
-        let raw = vec![0xFF, 0xFE, 0x00, 0x80, b'x'];
-        std::fs::write(&file_path, &raw).unwrap();
-
-        let content = fs.read_file(&file_path).unwrap();
-        assert_eq!(content.as_ref(), raw.as_slice());
-
-        std::fs::remove_dir_all(&temp_dir).unwrap();
-    }
-
-    #[test]
-    fn mmap_fs_list_dir_is_sorted_and_repeatable() {
-        let fs = MmapFileSystem;
-        let temp_dir = unique_temp_path("mmap-list");
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(temp_dir.join("z.txt"), b"").unwrap();
-        std::fs::write(temp_dir.join("a.txt"), b"").unwrap();
-        std::fs::write(temp_dir.join("m.txt"), b"").unwrap();
-
-        let first = fs.list_dir(&temp_dir).unwrap();
-        let second = fs.list_dir(&temp_dir).unwrap();
-
-        let names: Vec<_> = first
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
-            .collect();
-        assert_eq!(names, vec!["a.txt", "m.txt", "z.txt"]);
-        assert_eq!(first, second);
-
-        std::fs::remove_dir_all(&temp_dir).unwrap();
     }
 }
