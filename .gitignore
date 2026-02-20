@@ -4,3 +4,5 @@
 *.swo
 .DS_Store
 .worktrees/
+CLAUDE.md
+docs/PRD.md
