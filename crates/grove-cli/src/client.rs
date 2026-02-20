@@ -134,6 +134,14 @@ impl DaemonClient {
         self.request("get_all_analyses", serde_json::json!({}))
             .await
     }
+
+    pub async fn sync_worktrees(
+        &self,
+        worktrees: serde_json::Value,
+    ) -> Result<DaemonResponse, ClientError> {
+        self.request("sync_worktrees", serde_json::json!({ "worktrees": worktrees }))
+            .await
+    }
 }
 
 #[cfg(test)]

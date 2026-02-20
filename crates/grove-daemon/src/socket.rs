@@ -86,10 +86,16 @@ impl SocketResponse {
 
 // === Request Parsing ===
 
-fn parse_request(request: &SocketRequest) -> Result<QueryRequest, String> {
+#[derive(Debug)]
+enum ParsedRequest {
+    Query(QueryRequest),
+    SyncWorktrees { desired: Vec<grove_lib::Workspace> },
+}
+
+fn parse_request(request: &SocketRequest) -> Result<ParsedRequest, String> {
     match request.method.as_str() {
-        "status" => Ok(QueryRequest::GetStatus),
-        "list_workspaces" => Ok(QueryRequest::ListWorkspaces),
+        "status" => Ok(ParsedRequest::Query(QueryRequest::GetStatus)),
+        "list_workspaces" => Ok(ParsedRequest::Query(QueryRequest::ListWorkspaces)),
         "get_workspace" => {
             let workspace_id = request
                 .params
@@ -99,7 +105,9 @@ fn parse_request(request: &SocketRequest) -> Result<QueryRequest, String> {
             let workspace_id: WorkspaceId = workspace_id
                 .parse()
                 .map_err(|e| format!("invalid workspace_id: {e}"))?;
-            Ok(QueryRequest::GetWorkspace { workspace_id })
+            Ok(ParsedRequest::Query(QueryRequest::GetWorkspace {
+                workspace_id,
+            }))
         }
         "conflicts" => {
             let workspace_a = request
@@ -118,12 +126,53 @@ fn parse_request(request: &SocketRequest) -> Result<QueryRequest, String> {
             let workspace_b: WorkspaceId = workspace_b
                 .parse()
                 .map_err(|e| format!("invalid workspace_b: {e}"))?;
-            Ok(QueryRequest::GetPairAnalysis {
+            Ok(ParsedRequest::Query(QueryRequest::GetPairAnalysis {
                 workspace_a,
                 workspace_b,
-            })
+            }))
         }
-        "get_all_analyses" => Ok(QueryRequest::GetAllAnalyses),
+        "get_all_analyses" => Ok(ParsedRequest::Query(QueryRequest::GetAllAnalyses)),
+        "sync_worktrees" => {
+            let worktrees = request
+                .params
+                .get("worktrees")
+                .ok_or_else(|| "missing required param: worktrees".to_string())?;
+
+            #[derive(serde::Deserialize)]
+            struct WorktreeParam {
+                name: String,
+                path: String,
+                branch: String,
+                #[allow(dead_code)]
+                head: String,
+            }
+
+            let params: Vec<WorktreeParam> = serde_json::from_value(worktrees.clone())
+                .map_err(|e| format!("invalid worktrees param: {e}"))?;
+
+            let desired: Vec<grove_lib::Workspace> = params
+                .into_iter()
+                .map(|p| {
+                    let path = std::path::PathBuf::from(&p.path);
+                    let id = uuid::Uuid::new_v5(
+                        &uuid::Uuid::NAMESPACE_URL,
+                        path.to_string_lossy().as_bytes(),
+                    );
+                    grove_lib::Workspace {
+                        id,
+                        name: p.name,
+                        branch: p.branch,
+                        path,
+                        base_ref: String::new(),
+                        created_at: chrono::Utc::now(),
+                        last_activity: chrono::Utc::now(),
+                        metadata: grove_lib::WorkspaceMetadata::default(),
+                    }
+                })
+                .collect();
+
+            Ok(ParsedRequest::SyncWorktrees { desired })
+        }
         other => Err(format!("unknown method: {other}")),
     }
 }
@@ -511,9 +560,8 @@ async fn handle_request_with_options(
         };
     }
 
-    // Parse into a QueryRequest
-    let query = match parse_request(&request) {
-        Ok(q) => q,
+    let parsed = match parse_request(&request) {
+        Ok(p) => p,
         Err(e) => {
             return RequestOutcome {
                 response: SocketResponse::error(e),
@@ -522,24 +570,75 @@ async fn handle_request_with_options(
         }
     };
 
-    // Send to state actor and await response
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let message = StateMessage::Query {
-        request: query,
-        reply: reply_tx,
-    };
+    let response = match parsed {
+        ParsedRequest::Query(query) => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let message = StateMessage::Query {
+                request: query,
+                reply: reply_tx,
+            };
 
-    if state_tx.send(message).await.is_err() {
-        return RequestOutcome {
-            response: SocketResponse::error("daemon state unavailable"),
-            close_connection: false,
-        };
-    }
+            if state_tx.send(message).await.is_err() {
+                return RequestOutcome {
+                    response: SocketResponse::error("daemon state unavailable"),
+                    close_connection: false,
+                };
+            }
 
-    let response = match timeout(state_reply_timeout, reply_rx).await {
-        Ok(Ok(response)) => query_response_to_socket(response),
-        Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
-        Err(_) => SocketResponse::error("state actor response timed out"),
+            match timeout(state_reply_timeout, reply_rx).await {
+                Ok(Ok(response)) => query_response_to_socket(response),
+                Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
+                Err(_) => SocketResponse::error("state actor response timed out"),
+            }
+        }
+        ParsedRequest::SyncWorktrees { desired } => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let message = StateMessage::SyncWorktrees {
+                desired,
+                reply: reply_tx,
+            };
+
+            if state_tx.send(message).await.is_err() {
+                return RequestOutcome {
+                    response: SocketResponse::error("daemon state unavailable"),
+                    close_connection: false,
+                };
+            }
+
+            match timeout(state_reply_timeout, reply_rx).await {
+                Ok(Ok(Ok(sync_result))) => {
+                    let added: Vec<String> =
+                        sync_result.added.iter().map(|id| id.to_string()).collect();
+                    let removed: Vec<String> =
+                        sync_result.removed.iter().map(|id| id.to_string()).collect();
+                    let unchanged: Vec<String> = sync_result
+                        .unchanged
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect();
+                    let workspaces = match serde_json::to_value(&sync_result.workspaces) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return RequestOutcome {
+                                response: SocketResponse::error(format!(
+                                    "serialization error: {e}"
+                                )),
+                                close_connection: false,
+                            };
+                        }
+                    };
+                    SocketResponse::success(serde_json::json!({
+                        "added": added,
+                        "removed": removed,
+                        "unchanged": unchanged,
+                        "workspaces": workspaces,
+                    }))
+                }
+                Ok(Ok(Err(e))) => SocketResponse::error(e),
+                Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
+                Err(_) => SocketResponse::error("state actor response timed out"),
+            }
+        }
     };
 
     RequestOutcome {
@@ -688,7 +787,10 @@ mod tests {
             params: serde_json::json!({}),
         };
         let result = parse_request(&req);
-        assert!(matches!(result, Ok(QueryRequest::GetStatus)));
+        assert!(matches!(
+            result,
+            Ok(ParsedRequest::Query(QueryRequest::GetStatus))
+        ));
     }
 
     #[test]
@@ -698,7 +800,10 @@ mod tests {
             params: serde_json::json!({}),
         };
         let result = parse_request(&req);
-        assert!(matches!(result, Ok(QueryRequest::ListWorkspaces)));
+        assert!(matches!(
+            result,
+            Ok(ParsedRequest::Query(QueryRequest::ListWorkspaces))
+        ));
     }
 
     #[test]
@@ -708,9 +813,8 @@ mod tests {
             method: "get_workspace".to_string(),
             params: serde_json::json!({"workspace_id": id.to_string()}),
         };
-        let result = parse_request(&req).unwrap();
-        match result {
-            QueryRequest::GetWorkspace { workspace_id } => {
+        match parse_request(&req).unwrap() {
+            ParsedRequest::Query(QueryRequest::GetWorkspace { workspace_id }) => {
                 assert_eq!(workspace_id, id);
             }
             other => panic!("expected GetWorkspace, got: {other:?}"),
@@ -728,12 +832,11 @@ mod tests {
                 "workspace_b": id_b.to_string(),
             }),
         };
-        let result = parse_request(&req).unwrap();
-        match result {
-            QueryRequest::GetPairAnalysis {
+        match parse_request(&req).unwrap() {
+            ParsedRequest::Query(QueryRequest::GetPairAnalysis {
                 workspace_a,
                 workspace_b,
-            } => {
+            }) => {
                 assert_eq!(workspace_a, id_a);
                 assert_eq!(workspace_b, id_b);
             }
@@ -748,7 +851,24 @@ mod tests {
             params: serde_json::json!({}),
         };
         let result = parse_request(&req);
-        assert!(matches!(result, Ok(QueryRequest::GetAllAnalyses)));
+        assert!(matches!(
+            result,
+            Ok(ParsedRequest::Query(QueryRequest::GetAllAnalyses))
+        ));
+    }
+
+    #[test]
+    fn parse_sync_worktrees_request() {
+        let req = SocketRequest {
+            method: "sync_worktrees".to_string(),
+            params: serde_json::json!({
+                "worktrees": [
+                    {"name": "main", "path": "/repo", "branch": "refs/heads/main", "head": "abc123"}
+                ]
+            }),
+        };
+        let result = parse_request(&req);
+        assert!(matches!(result, Ok(ParsedRequest::SyncWorktrees { .. })));
     }
 
     #[test]
