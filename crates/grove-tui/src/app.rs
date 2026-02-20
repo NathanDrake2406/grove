@@ -178,11 +178,13 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
 
-            KeyCode::Tab => {
-                self.focused_panel = match self.focused_panel {
-                    FocusedPanel::Worktrees => FocusedPanel::Pairs,
-                    FocusedPanel::Pairs => FocusedPanel::Worktrees,
-                };
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.focused_panel = FocusedPanel::Worktrees;
+                self.is_dirty = true;
+            }
+
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                self.focused_panel = FocusedPanel::Pairs;
                 self.is_dirty = true;
             }
 

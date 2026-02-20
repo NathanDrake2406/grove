@@ -105,7 +105,7 @@ fn render_summary_bar(app: &App, frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::Green),
         ),
         Span::styled(
-            "   [Tab] switch panel  [j/k] navigate  [r] refresh  [q] quit",
+            "   [\u{2190}\u{2192}] switch panel  [\u{2191}\u{2193}] navigate  [r] refresh  [q] quit",
             Style::default().fg(Color::DarkGray),
         ),
     ]);
