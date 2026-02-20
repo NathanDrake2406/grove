@@ -378,6 +378,21 @@ impl DaemonState {
     }
 
     fn handle_register_workspace(&mut self, workspace: Workspace) -> Result<(), String> {
+        let id = workspace.id;
+
+        // If already registered (same ID), update metadata and return Ok.
+        if self.workspaces.contains_key(&id) {
+            info!(workspace_id = %id, name = %workspace.name, "workspace already registered, updating");
+            if let Some(ref db) = self.db
+                && let Err(e) = db.save_workspace(&workspace)
+            {
+                error!(error = %e, "failed to persist workspace update");
+                return Err(format!("persistence error: {e}"));
+            }
+            self.workspaces.insert(id, workspace);
+            return Ok(());
+        }
+
         if self.workspaces.len() >= self.config.max_worktrees {
             return Err(format!(
                 "maximum worktree limit ({}) reached",
@@ -385,7 +400,6 @@ impl DaemonState {
             ));
         }
 
-        let id = workspace.id;
         info!(workspace_id = %id, name = %workspace.name, "registering workspace");
 
         if let Some(ref db) = self.db
@@ -401,7 +415,9 @@ impl DaemonState {
 
     fn handle_remove_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), String> {
         if self.workspaces.remove(&workspace_id).is_none() {
-            return Err(format!("workspace {workspace_id} not found"));
+            // Idempotent: removing a non-existent workspace is a no-op.
+            debug!(workspace_id = %workspace_id, "remove requested for unknown workspace, ignoring");
+            return Ok(());
         }
 
         info!(workspace_id = %workspace_id, "removing workspace");
@@ -1017,17 +1033,16 @@ mod tests {
     }
 
     #[test]
-    fn removing_unknown_workspace_returns_error_without_side_effects() {
+    fn removing_unknown_workspace_is_noop_without_side_effects() {
         let mut state = DaemonState::new(GroveConfig::default(), None);
         state
             .handle_register_workspace(make_workspace("still-here"))
             .unwrap();
         assert_eq!(state.workspace_count(), 1);
 
-        let err = state
-            .handle_remove_workspace(Uuid::new_v4())
-            .expect_err("unknown workspace should fail");
-        assert!(err.contains("not found"));
+        // Removing unknown workspace should succeed as a no-op
+        let result = state.handle_remove_workspace(Uuid::new_v4());
+        assert!(result.is_ok());
         assert_eq!(state.workspace_count(), 1);
     }
 
@@ -1148,6 +1163,70 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn register_existing_workspace_is_idempotent() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let ws = make_workspace("idempotent");
+        let _ws_id = ws.id;
+
+        // Register first time
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RegisterWorkspace {
+            workspace: ws.clone(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        // Register same workspace again — should succeed, not error
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RegisterWorkspace {
+            workspace: ws,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        // Should still have exactly 1 workspace
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::GetStatus,
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        match reply_rx.await.unwrap() {
+            QueryResponse::Status {
+                workspace_count, ..
+            } => assert_eq!(workspace_count, 1),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_nonexistent_workspace_is_noop() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::RemoveWorkspace {
+            workspace_id: Uuid::new_v4(),
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+        // Should succeed (no-op), not error
+        assert!(reply_rx.await.unwrap().is_ok());
 
         tx.send(StateMessage::Shutdown).await.unwrap();
         handle.await.unwrap();
