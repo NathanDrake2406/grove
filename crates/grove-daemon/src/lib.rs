@@ -274,6 +274,7 @@ async fn run_watcher_loop(
                                 &watch_events,
                                 &watched_workspaces,
                                 &base_branch,
+                                &repo_git_dir,
                             ).await;
                             watch_events.clear();
                         }
@@ -284,7 +285,7 @@ async fn run_watcher_loop(
             _ = flush_interval.tick() => {
                 let watch_events = debouncer.flush_debounced();
                 if !watch_events.is_empty() {
-                    forward_watch_events(&state_tx, &watch_events, &watched_workspaces, &base_branch).await;
+                    forward_watch_events(&state_tx, &watch_events, &watched_workspaces, &base_branch, &repo_git_dir).await;
                 }
             }
             _ = refresh_interval.tick() => {
@@ -320,6 +321,7 @@ async fn forward_watch_events(
     events: &[WatchEvent],
     watched_workspaces: &std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf>,
     base_branch: &str,
+    repo_git_dir: &Option<std::path::PathBuf>,
 ) {
     for event in events {
         match event {
@@ -367,7 +369,45 @@ async fn forward_watch_events(
                 }
             }
             WatchEvent::WorktreesChanged => {
-                // Handled by run_watcher_loop directly (requires repo_git_dir context)
+                let Some(git_dir) = repo_git_dir else {
+                    warn!("worktree change detected but no repo_git_dir configured");
+                    continue;
+                };
+                let repo_root = git_dir
+                    .parent()
+                    .unwrap_or(git_dir.as_path())
+                    .to_path_buf();
+
+                match tokio::task::spawn_blocking(move || {
+                    crate::git::enumerate_worktrees(&repo_root)
+                })
+                .await
+                {
+                    Ok(Ok(desired)) => {
+                        info!(count = desired.len(), "re-enumerated worktrees after change");
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if let Err(e) = state_tx
+                            .send(StateMessage::SyncWorktrees {
+                                desired,
+                                reply: reply_tx,
+                            })
+                            .await
+                        {
+                            warn!(error = %e, "failed to send SyncWorktrees");
+                        } else if let Ok(result) = reply_rx.await {
+                            match result {
+                                Ok(sync) => info!(
+                                    added = sync.added.len(),
+                                    removed = sync.removed.len(),
+                                    "auto-synced worktrees"
+                                ),
+                                Err(e) => warn!(error = %e, "SyncWorktrees failed"),
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "failed to enumerate worktrees"),
+                    Err(e) => warn!(error = %e, "worktree enumeration task panicked"),
+                }
             }
         }
     }
