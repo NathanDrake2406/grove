@@ -325,6 +325,9 @@ async fn forward_watch_events(
                     return;
                 }
             }
+            WatchEvent::WorktreesChanged => {
+                // Handled by run_watcher_loop directly (requires repo_git_dir context)
+            }
         }
     }
 }
