@@ -243,6 +243,14 @@ impl DaemonState {
                 }
             }
         }
+
+        // Mark all loaded workspaces dirty so that the base import graph is
+        // rebuilt and analyses are recomputed with dependency overlap info on
+        // the next dispatch cycle (triggered when the worker attaches).
+        for workspace_id in self.workspaces.keys().copied() {
+            self.dirty_workspaces.push(workspace_id);
+        }
+
         self
     }
 
