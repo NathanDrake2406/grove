@@ -29,6 +29,14 @@ pub fn classify_schema_file(path: &Path) -> Option<SchemaCategory> {
             | "go.sum"
             | "pnpm-lock.yaml"
             | "yarn.lock"
+            | "pyproject.toml"
+            | "setup.py"
+            | "setup.cfg"
+            | "requirements.txt"
+            | "Pipfile"
+            | "Pipfile.lock"
+            | "poetry.lock"
+            | "uv.lock"
     ) {
         return Some(SchemaCategory::PackageDep);
     }
@@ -124,6 +132,26 @@ mod tests {
             classify_schema_file(Path::new("Cargo.toml")),
             Some(SchemaCategory::PackageDep)
         );
+    }
+
+    #[test]
+    fn classifies_python_package_deps() {
+        for name in &[
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+            "requirements.txt",
+            "Pipfile",
+            "Pipfile.lock",
+            "poetry.lock",
+            "uv.lock",
+        ] {
+            assert_eq!(
+                classify_schema_file(Path::new(name)),
+                Some(SchemaCategory::PackageDep),
+                "{name} should be PackageDep"
+            );
+        }
     }
 
     #[test]
