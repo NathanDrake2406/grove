@@ -14,15 +14,7 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
     }
     let status_data = status_resp.data.unwrap_or_default();
 
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&status_data).unwrap_or_default()
-        );
-        return Ok(());
-    }
-
-    // Fetch workspaces and analyses for the full picture.
+    // Fetch workspaces and analyses for both JSON and plain-text output.
     let ws_resp = client.list_workspaces().await?;
     let workspaces = ws_resp
         .data
@@ -35,11 +27,47 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
         .and_then(|v| if v.is_array() { Some(v) } else { None })
         .unwrap_or_else(|| serde_json::json!([]));
 
+    if json {
+        let merged = build_status_json(&status_data, &workspaces, &analyses);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&merged).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
     println!(
         "{}",
         format_smart_status(&status_data, &workspaces, &analyses)
     );
     Ok(())
+}
+
+fn build_status_json(
+    status_data: &serde_json::Value,
+    workspaces: &serde_json::Value,
+    analyses: &serde_json::Value,
+) -> serde_json::Value {
+    let workspace_count = status_data
+        .get("workspace_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| workspaces.as_array().map_or(0, |items| items.len() as u64));
+    let analysis_count = status_data
+        .get("analysis_count")
+        .and_then(|v| v.as_u64())
+        .unwrap_or_else(|| analyses.as_array().map_or(0, |items| items.len() as u64));
+    let base_commit = status_data
+        .get("base_commit")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    serde_json::json!({
+        "workspace_count": workspace_count,
+        "analysis_count": analysis_count,
+        "base_commit": base_commit,
+        "workspaces": workspaces,
+        "analyses": analyses,
+    })
 }
 
 /// Format a status data value for plain-text rendering (extracted for testing).
@@ -345,6 +373,67 @@ mod tests {
     #[test]
     fn format_commit_shows_none_for_empty() {
         assert_eq!(format_commit(""), "(none)");
+    }
+
+    #[test]
+    fn build_status_json_includes_expected_top_level_keys() {
+        let status = serde_json::json!({
+            "workspace_count": 2,
+            "analysis_count": 1,
+            "base_commit": "abc123def456",
+        });
+        let workspaces = serde_json::json!([
+            {"id": "ws-1", "name": "main"},
+            {"id": "ws-2", "name": "feature/auth"},
+        ]);
+        let analyses = serde_json::json!([
+            {"workspace_a": "ws-1", "workspace_b": "ws-2", "score": "Yellow"}
+        ]);
+
+        let merged = build_status_json(&status, &workspaces, &analyses);
+
+        assert_eq!(
+            merged.get("workspace_count").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(
+            merged.get("analysis_count").and_then(|v| v.as_u64()),
+            Some(1)
+        );
+        assert_eq!(
+            merged.get("base_commit").and_then(|v| v.as_str()),
+            Some("abc123def456")
+        );
+        assert!(merged.get("workspaces").is_some_and(|v| v.is_array()));
+        assert!(merged.get("analyses").is_some_and(|v| v.is_array()));
+    }
+
+    #[test]
+    fn build_status_json_uses_array_lengths_when_counts_missing() {
+        let status = serde_json::json!({});
+        let workspaces = serde_json::json!([
+            {"id": "ws-1", "name": "main"},
+            {"id": "ws-2", "name": "feature/auth"},
+            {"id": "ws-3", "name": "feature/payments"},
+        ]);
+        let analyses = serde_json::json!([
+            {"workspace_a": "ws-1", "workspace_b": "ws-2", "score": "Green"},
+            {"workspace_a": "ws-2", "workspace_b": "ws-3", "score": "Red"},
+        ]);
+
+        let merged = build_status_json(&status, &workspaces, &analyses);
+
+        assert_eq!(
+            merged.get("workspace_count").and_then(|v| v.as_u64()),
+            Some(3)
+        );
+        assert_eq!(
+            merged.get("analysis_count").and_then(|v| v.as_u64()),
+            Some(2)
+        );
+        assert_eq!(merged.get("base_commit").and_then(|v| v.as_str()), Some(""));
+        assert!(merged.get("workspaces").is_some_and(|v| v.is_array()));
+        assert!(merged.get("analyses").is_some_and(|v| v.is_array()));
     }
 
     #[test]
