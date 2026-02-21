@@ -393,8 +393,20 @@ impl LanguageAnalyzer for JavaAnalyzer {
         Ok(exports)
     }
 
-    fn is_schema_file(&self, _path: &Path) -> bool {
-        false // stub — tests will fail
+    fn is_schema_file(&self, path: &Path) -> bool {
+        let filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        matches!(
+            filename.as_str(),
+            "pom.xml"
+                | "build.gradle"
+                | "build.gradle.kts"
+                | "settings.gradle"
+                | "settings.gradle.kts"
+                | "gradle.properties"
+        )
     }
 }
 
@@ -575,5 +587,19 @@ public interface Repository {
         let exports = analyzer.extract_exports(source).unwrap();
 
         assert!(exports.iter().any(|e| e.name == "Repository"));
+    }
+
+    #[test]
+    fn schema_file_detection() {
+        let analyzer = JavaAnalyzer::new();
+        assert!(analyzer.is_schema_file(Path::new("pom.xml")));
+        assert!(analyzer.is_schema_file(Path::new("build.gradle")));
+        assert!(analyzer.is_schema_file(Path::new("build.gradle.kts")));
+        assert!(analyzer.is_schema_file(Path::new("settings.gradle")));
+        assert!(analyzer.is_schema_file(Path::new("settings.gradle.kts")));
+        assert!(analyzer.is_schema_file(Path::new("gradle.properties")));
+        assert!(analyzer.is_schema_file(Path::new("myproject/pom.xml")));
+        assert!(!analyzer.is_schema_file(Path::new("Main.java")));
+        assert!(!analyzer.is_schema_file(Path::new("pom.xml.bak")));
     }
 }
