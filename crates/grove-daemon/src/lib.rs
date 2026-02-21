@@ -131,6 +131,7 @@ async fn run_inner(
         state_tx.clone(),
         watcher_config,
         config.base_branch.clone(),
+        Duration::from_millis(config.socket_state_reply_timeout_ms),
         watcher_shutdown_rx,
     ));
 
@@ -204,6 +205,7 @@ async fn run_watcher_loop(
     state_tx: tokio::sync::mpsc::Sender<StateMessage>,
     watcher_config: WatcherConfig,
     base_branch: String,
+    state_reply_timeout: Duration,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) -> Result<(), notify::Error> {
     use std::collections::HashMap;
@@ -219,6 +221,7 @@ async fn run_watcher_loop(
         HashMap::new();
     refresh_watched_workspaces(
         &state_tx,
+        state_reply_timeout,
         &mut watcher,
         &mut debouncer,
         &mut watched_workspaces,
@@ -247,6 +250,7 @@ async fn run_watcher_loop(
                                 &watch_events,
                                 &watched_workspaces,
                                 &base_branch,
+                                state_reply_timeout,
                             ).await;
                             watch_events.clear();
                         }
@@ -257,12 +261,20 @@ async fn run_watcher_loop(
             _ = flush_interval.tick() => {
                 let watch_events = debouncer.flush_debounced();
                 if !watch_events.is_empty() {
-                    forward_watch_events(&state_tx, &watch_events, &watched_workspaces, &base_branch).await;
+                    forward_watch_events(
+                        &state_tx,
+                        &watch_events,
+                        &watched_workspaces,
+                        &base_branch,
+                        state_reply_timeout,
+                    )
+                    .await;
                 }
             }
             _ = refresh_interval.tick() => {
                 refresh_watched_workspaces(
                     &state_tx,
+                    state_reply_timeout,
                     &mut watcher,
                     &mut debouncer,
                     &mut watched_workspaces,
@@ -279,6 +291,7 @@ async fn forward_watch_events(
     events: &[WatchEvent],
     watched_workspaces: &std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf>,
     base_branch: &str,
+    state_reply_timeout: Duration,
 ) {
     for event in events {
         match event {
@@ -316,7 +329,8 @@ async fn forward_watch_events(
                 }
             }
             WatchEvent::BaseRefChanged { .. } => {
-                if let Some(commit) = resolve_base_branch_commit(state_tx, base_branch).await
+                if let Some(commit) =
+                    resolve_base_branch_commit(state_tx, base_branch, state_reply_timeout).await
                     && let Err(e) = state_tx
                         .send(StateMessage::BaseRefChanged { new_commit: commit })
                         .await
@@ -331,13 +345,14 @@ async fn forward_watch_events(
 
 async fn refresh_watched_workspaces(
     state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
+    state_reply_timeout: Duration,
     watcher: &mut notify::RecommendedWatcher,
     debouncer: &mut Debouncer,
     watched_workspaces: &mut std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf>,
 ) {
     use std::collections::HashSet;
 
-    let workspaces = list_workspaces(state_tx).await;
+    let workspaces = list_workspaces(state_tx, state_reply_timeout).await;
     let desired: std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf> = workspaces
         .into_iter()
         .map(|workspace| (workspace.id, workspace.path))
@@ -371,30 +386,46 @@ async fn refresh_watched_workspaces(
 
 async fn list_workspaces(
     state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
+    reply_timeout: Duration,
 ) -> Vec<grove_lib::Workspace> {
     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-    if state_tx
+    if let Err(e) = state_tx
         .send(StateMessage::Query {
             request: QueryRequest::ListWorkspaces,
             reply: reply_tx,
         })
         .await
-        .is_err()
     {
+        warn!(error = %e, "failed to query state actor for workspace list");
         return Vec::new();
     }
 
-    match reply_rx.await {
-        Ok(QueryResponse::Workspaces(workspaces)) => workspaces,
-        _ => Vec::new(),
+    match tokio::time::timeout(reply_timeout, reply_rx).await {
+        Ok(Ok(QueryResponse::Workspaces(workspaces))) => workspaces,
+        Ok(Ok(other)) => {
+            warn!(response = ?other, "unexpected response to workspace list query");
+            Vec::new()
+        }
+        Ok(Err(_)) => {
+            warn!("state actor closed workspace list reply channel");
+            Vec::new()
+        }
+        Err(_) => {
+            warn!(
+                timeout_ms = reply_timeout.as_millis() as u64,
+                "timed out waiting for workspace list response from state actor"
+            );
+            Vec::new()
+        }
     }
 }
 
 async fn resolve_base_branch_commit(
     state_tx: &tokio::sync::mpsc::Sender<StateMessage>,
     base_branch: &str,
+    state_reply_timeout: Duration,
 ) -> Option<String> {
-    let workspaces = list_workspaces(state_tx).await;
+    let workspaces = list_workspaces(state_tx, state_reply_timeout).await;
     let repo_path = workspaces.into_iter().next()?.path;
     let base_branch = base_branch.to_string();
 
@@ -433,7 +464,7 @@ mod tests {
     use crate::db::Database;
     use crate::lifecycle::DaemonPaths;
     use crate::socket::SocketServer;
-    use crate::state::{GroveConfig, StateMessage, spawn_state_actor};
+    use crate::state::{GroveConfig, QueryRequest, StateMessage, spawn_state_actor};
 
     #[tokio::test]
     async fn daemon_components_wire_up() {
@@ -535,5 +566,36 @@ mod tests {
             lifecycle_err.to_string(),
             "lifecycle error: invalid PID file contents"
         );
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_returns_empty_when_query_reply_times_out() {
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(1);
+        let hold_reply = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                drop(reply);
+            }
+        });
+
+        let result = list_workspaces(&state_tx, Duration::from_millis(5)).await;
+        assert!(result.is_empty());
+        hold_reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_returns_empty_when_query_reply_channel_closes() {
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(1);
+        let close_reply = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                drop(reply);
+            }
+        });
+
+        let result = list_workspaces(&state_tx, Duration::from_millis(50)).await;
+        assert!(result.is_empty());
+        close_reply.await.unwrap();
     }
 }
