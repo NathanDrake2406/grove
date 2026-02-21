@@ -2,7 +2,7 @@
 
 Cross-worktree conflict intelligence for git. Detects file, hunk, symbol, dependency, and schema overlaps between parallel workstreams before merge time.
 
-Grove watches your git worktrees, continuously analyzes pairwise overlaps, and tells you which branches will conflict — before you attempt to merge.
+Grove watches your git worktrees, continuously analyzes pairwise overlaps, and tells you which branches will conflict before you attempt to merge. Perfect for your multi-agents working in parallel worktrees ;)
 
 ## Why
 
@@ -31,19 +31,9 @@ Requires Rust 1.85+ (edition 2024).
 ## Quick start
 
 ```sh
-# Initialize grove in your repo
-mkdir .grove
-grove daemon start
-
-# See all tracked worktrees and their conflict status
-grove status
-
-# Compare two specific branches
-grove conflicts feat/auth feat/payments
-
-# Machine-readable output for scripts and agents
-grove status --json
-grove conflicts feat/auth feat/payments --json
+grove status                                    # that's it — daemon auto-starts
+grove conflicts feat/auth feat/payments         # compare two branches
+grove conflicts feat/auth feat/payments --json  # machine-readable
 ```
 
 ## Shell integration
