@@ -181,6 +181,66 @@ impl GitRepo {
     }
 }
 
+/// Enumerate all worktrees (main + linked) using gix.
+/// Returns Workspace structs with deterministic IDs (same as socket.rs sync_worktrees).
+pub(crate) fn enumerate_worktrees(
+    repo_path: &Path,
+) -> Result<Vec<grove_lib::Workspace>, WorkerError> {
+    let repo = gix::open(repo_path).map_err(|e| WorkerError::Gix {
+        context: "enumerate_worktrees",
+        repo_path: repo_path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+
+    let mut worktrees = Vec::new();
+
+    // Main worktree
+    if let Some(ws) = workspace_from_repo(&repo) {
+        worktrees.push(ws);
+    }
+
+    // Linked worktrees
+    if let Ok(proxies) = repo.worktrees() {
+        for proxy in proxies {
+            if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree() {
+                if let Some(ws) = workspace_from_repo(&linked) {
+                    worktrees.push(ws);
+                }
+            }
+        }
+    }
+
+    Ok(worktrees)
+}
+
+fn workspace_from_repo(repo: &gix::Repository) -> Option<grove_lib::Workspace> {
+    let path = repo.workdir()?.to_path_buf();
+    let head_ref = repo.head().ok()?;
+    let branch = head_ref
+        .referent_name()
+        .map(|name| name.as_bstr().to_string());
+    let name = match &branch {
+        Some(b) => b.strip_prefix("refs/heads/").unwrap_or(b).to_string(),
+        None => path.file_name()?.to_string_lossy().to_string(),
+    };
+
+    let id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        path.to_string_lossy().as_bytes(),
+    );
+
+    Some(grove_lib::Workspace {
+        id,
+        name,
+        branch: branch.unwrap_or_default(),
+        path,
+        base_ref: String::new(),
+        created_at: chrono::Utc::now(),
+        last_activity: chrono::Utc::now(),
+        metadata: grove_lib::WorkspaceMetadata::default(),
+    })
+}
+
 /// Compute unified diff hunks from old/new content using the `similar` crate.
 ///
 /// Equivalent to `git diff --unified=0` but computed in-process from blob content
