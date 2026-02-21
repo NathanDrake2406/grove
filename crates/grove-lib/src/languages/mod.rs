@@ -1,5 +1,6 @@
 pub mod csharp;
 pub mod go_lang;
+pub mod java;
 pub mod python;
 pub mod rust_lang;
 pub mod typescript;
@@ -42,13 +43,14 @@ impl LanguageRegistry {
         Self { analyzers: vec![] }
     }
 
-    /// Create a registry with the built-in analyzers (TypeScript, Rust, Go, C#, Python).
+    /// Create a registry with the built-in analyzers (TypeScript, Rust, Go, C#, Java, Python).
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(typescript::TypeScriptAnalyzer::new()));
         registry.register(Box::new(rust_lang::RustAnalyzer::new()));
         registry.register(Box::new(go_lang::GoAnalyzer::new()));
         registry.register(Box::new(csharp::CSharpAnalyzer::new()));
+        registry.register(Box::new(java::JavaAnalyzer::new()));
         registry.register(Box::new(python::PythonAnalyzer::new()));
         registry
     }
