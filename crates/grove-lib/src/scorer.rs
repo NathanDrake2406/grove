@@ -530,7 +530,8 @@ mod tests {
         let analysis = score_pair(&scenario.a, &scenario.b, scenario.dependency_overlaps);
         let mut failures = Vec::new();
 
-        if analysis.score < scenario.expected_min_score || analysis.score > scenario.expected_max_score
+        if analysis.score < scenario.expected_min_score
+            || analysis.score > scenario.expected_max_score
         {
             failures.push(format!(
                 "{}: expected score between {:?} and {:?}, got {:?} with overlaps {:?}",

@@ -741,7 +741,12 @@ mod tests {
         run_git(repo, &["config", "user.name", "Grove Tests"]);
     }
 
-    fn add_worktree_from_main(repo: &Path, root: &Path, folder_name: &str, branch: &str) -> PathBuf {
+    fn add_worktree_from_main(
+        repo: &Path,
+        root: &Path,
+        folder_name: &str,
+        branch: &str,
+    ) -> PathBuf {
         let worktree = root.join(folder_name);
         run_git(
             repo,
@@ -1002,12 +1007,7 @@ impl Billing {
         run_git(&repo, &["add", "."]);
         run_git(&repo, &["commit", "-m", "feat a docs"]);
 
-        let wt_b = add_worktree_from_main(
-            &repo,
-            temp.path(),
-            "wt-b-migration",
-            "feat/b-migration",
-        );
+        let wt_b = add_worktree_from_main(&repo, temp.path(), "wt-b-migration", "feat/b-migration");
         write_file(
             &wt_b.join("notes/migrations-changelog.md"),
             "# Migration changelog\nAnother independent docs change.\n",
