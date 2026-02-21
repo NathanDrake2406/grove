@@ -1,6 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use grove_cli::client::DaemonClient;
 use grove_lib::{OrthogonalityScore, Workspace, WorkspacePairAnalysis};
+use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedPanel {
@@ -47,6 +48,9 @@ pub struct App {
 
     // Dual-panel focus
     pub focused_panel: FocusedPanel,
+
+    /// When the data last changed (for the "updated Xs ago" indicator).
+    pub last_data_change: Instant,
 }
 
 impl App {
@@ -61,6 +65,7 @@ impl App {
             selected_worktree_index: 0,
             selected_pair_index: 0,
             focused_panel: FocusedPanel::Worktrees,
+            last_data_change: Instant::now(),
         }
     }
 
@@ -102,6 +107,8 @@ impl App {
 
         if changed || self.view_state == ViewState::Loading {
             self.analyses = new_analyses;
+            self.last_data_change = Instant::now();
+            self.is_dirty = true;
 
             // Sort worktrees: conflicting first, clean last
             let mut sorted = new_workspaces;
@@ -117,7 +124,6 @@ impl App {
 
             self.selected_worktree_index = 0;
             self.selected_pair_index = 0;
-            self.is_dirty = true;
 
             // Automatically transition state
             if self.view_state == ViewState::Loading || self.view_state == ViewState::NoWorktrees {
@@ -176,6 +182,18 @@ impl App {
         let clean_count = worktree_count.saturating_sub(conflict_ws_count);
 
         (worktree_count, base, conflict_count, clean_count)
+    }
+
+    /// Human-friendly label for how long ago data last changed.
+    pub fn last_updated_label(&self) -> String {
+        let elapsed = self.last_data_change.elapsed().as_secs();
+        if elapsed < 5 {
+            "just now".to_string()
+        } else if elapsed < 120 {
+            "< 2m ago".to_string()
+        } else {
+            format!("{}m ago", elapsed / 60)
+        }
     }
 
     pub fn handle_input(&mut self, key: KeyEvent) -> bool {

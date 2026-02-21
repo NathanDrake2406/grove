@@ -99,7 +99,8 @@ fn render_summary_bar(app: &App, frame: &mut Frame, area: Rect) {
     let (worktree_count, base, conflict_count, clean_count) = app.summary_stats();
 
     let line = Line::from(vec![
-        Span::raw(format!("  {} worktrees", worktree_count)),
+        Span::styled("  \u{25cf} ", Style::default().fg(Color::Green)),
+        Span::raw(format!("{} worktrees", worktree_count)),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!("base: {}", base)),
         Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
@@ -115,6 +116,11 @@ fn render_summary_bar(app: &App, frame: &mut Frame, area: Rect) {
         Span::styled(
             format!("{} clean", clean_count),
             Style::default().fg(Color::Green),
+        ),
+        Span::styled("  |  ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("updated {}", app.last_updated_label()),
+            Style::default().fg(Color::DarkGray),
         ),
     ]);
 

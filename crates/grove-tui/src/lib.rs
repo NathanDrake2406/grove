@@ -43,11 +43,19 @@ async fn run_app(
     // Initial render
     terminal.draw(|frame| ui::render(app, frame))?;
 
+    let mut last_timestamp_redraw = std::time::Instant::now();
+
     loop {
         // Only draw if the state has changed (is_dirty)
         if app.is_dirty {
             terminal.draw(|frame| ui::render(app, frame))?;
             app.is_dirty = false;
+            last_timestamp_redraw = std::time::Instant::now();
+        }
+
+        // Redraw every 60s so the "updated Xm ago" stays reasonably current
+        if last_timestamp_redraw.elapsed().as_secs() >= 60 {
+            app.is_dirty = true;
         }
 
         match events.next().await? {
