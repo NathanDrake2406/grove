@@ -35,6 +35,9 @@ pub enum Commands {
     /// List all workspaces
     List,
 
+    /// Check if current worktree has conflicts (exit 1 if yes)
+    Check,
+
     /// Show conflicts between two workspaces
     Conflicts {
         /// First workspace name or ID
@@ -124,6 +127,9 @@ pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Erro
         }
         Some(Commands::List) => {
             commands::list::execute(&client, args.json).await?;
+        }
+        Some(Commands::Check) => {
+            commands::check::execute(&client, args.json).await?;
         }
         Some(Commands::Conflicts { a, b }) => {
             commands::conflicts::execute(&client, &a, &b, args.json).await?;

@@ -1,3 +1,4 @@
+pub mod check;
 pub mod conflicts;
 pub mod init;
 pub mod list;
