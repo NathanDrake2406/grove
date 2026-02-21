@@ -130,7 +130,6 @@ pub enum QueryResponse {
         base_commit: CommitHash,
     },
     AwaitAnalysis {
-        completed: bool,
         in_flight: usize,
         analysis_count: usize,
     },
@@ -139,6 +138,10 @@ pub enum QueryResponse {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum DaemonEvent {
+    AnalysisStarted {
+        workspace_a: WorkspaceId,
+        workspace_b: WorkspaceId,
+    },
     AnalysisComplete {
         workspace_a: WorkspaceId,
         workspace_b: WorkspaceId,
@@ -465,7 +468,6 @@ impl DaemonState {
         match request {
             QueryRequest::AwaitAnalysis { .. } => {
                 let response = QueryResponse::AwaitAnalysis {
-                    completed: self.in_flight_pairs.is_empty(),
                     in_flight: self.in_flight_pairs.len(),
                     analysis_count: self.pair_analyses.len(),
                 };
@@ -489,7 +491,6 @@ impl DaemonState {
         let in_flight = self.in_flight_pairs.len();
         if in_flight == 0 || timeout_ms == 0 {
             let response = QueryResponse::AwaitAnalysis {
-                completed: in_flight == 0,
                 in_flight,
                 analysis_count: self.pair_analyses.len(),
             };
@@ -506,7 +507,6 @@ impl DaemonState {
         }
 
         let response = QueryResponse::AwaitAnalysis {
-            completed: true,
             in_flight: 0,
             analysis_count: self.pair_analyses.len(),
         };
@@ -741,7 +741,12 @@ impl DaemonState {
             .await;
 
             match send_result {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    self.emit_event(DaemonEvent::AnalysisStarted {
+                        workspace_a: pair.0,
+                        workspace_b: pair.1,
+                    });
+                }
                 Ok(Err(e)) => {
                     self.in_flight_pairs.remove(&pair);
                     warn!(
@@ -1068,11 +1073,9 @@ mod tests {
 
         match reply_rx.await.unwrap() {
             QueryResponse::AwaitAnalysis {
-                completed,
                 in_flight,
                 analysis_count,
             } => {
-                assert!(completed);
                 assert_eq!(in_flight, 0);
                 assert_eq!(analysis_count, 0);
             }
@@ -1160,11 +1163,9 @@ mod tests {
             .unwrap()
         {
             QueryResponse::AwaitAnalysis {
-                completed,
                 in_flight,
                 analysis_count,
             } => {
-                assert!(completed);
                 assert_eq!(in_flight, 0);
                 assert_eq!(analysis_count, 1);
             }

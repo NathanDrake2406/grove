@@ -232,12 +232,10 @@ fn query_response_to_socket(response: QueryResponse) -> SocketResponse {
             SocketResponse::success(data)
         }
         QueryResponse::AwaitAnalysis {
-            completed,
             in_flight,
             analysis_count,
         } => {
             let data = serde_json::json!({
-                "completed": completed,
                 "in_flight": in_flight,
                 "analysis_count": analysis_count,
             });
@@ -562,6 +560,8 @@ async fn stream_events_until_client_activity(
     idle_connection_timeout: Duration,
 ) -> Result<StreamingExit, SocketError> {
     let mut event_rx = event_tx.subscribe();
+    let idle_deadline = tokio::time::sleep(idle_connection_timeout);
+    tokio::pin!(idle_deadline);
 
     loop {
         tokio::select! {
@@ -572,6 +572,7 @@ async fn stream_events_until_client_activity(
                             debug!(error = %e, "failed to send daemon event");
                             return Ok(StreamingExit::ClientDisconnected);
                         }
+                        idle_deadline.as_mut().reset(tokio::time::Instant::now() + idle_connection_timeout);
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         warn!(skipped, "subscriber lagged behind daemon events");
@@ -590,7 +591,7 @@ async fn stream_events_until_client_activity(
                     ClientLine::Eof => return Ok(StreamingExit::ClientDisconnected),
                 }
             }
-            _ = tokio::time::sleep(idle_connection_timeout) => {
+            _ = &mut idle_deadline => {
                 debug!(
                     timeout_ms = idle_connection_timeout.as_millis(),
                     "closing streaming mode due to idle timeout"
@@ -895,7 +896,6 @@ async fn await_analysis_timeout_response(
     state_reply_timeout: Duration,
 ) -> QueryResponse {
     let fallback = QueryResponse::AwaitAnalysis {
-        completed: false,
         in_flight: 0,
         analysis_count: 0,
     };
@@ -912,11 +912,9 @@ async fn await_analysis_timeout_response(
 
     match timeout(state_reply_timeout, reply_rx).await {
         Ok(Ok(QueryResponse::AwaitAnalysis {
-            completed: _,
             in_flight,
             analysis_count,
         })) => QueryResponse::AwaitAnalysis {
-            completed: false,
             in_flight,
             analysis_count,
         },
@@ -2364,7 +2362,6 @@ mod tests {
         assert!(!outcome.close_connection);
         assert!(outcome.response.ok);
         let data = outcome.response.data.expect("response should include data");
-        assert_eq!(data["completed"], false);
         assert_eq!(data["in_flight"], 1);
         assert_eq!(data["analysis_count"], 0);
 
@@ -2471,7 +2468,6 @@ mod tests {
         assert!(!outcome.close_connection);
         assert!(outcome.response.ok);
         let data = outcome.response.data.expect("response should include data");
-        assert_eq!(data["completed"], true);
         assert_eq!(data["in_flight"], 0);
         assert_eq!(data["analysis_count"], 1);
 
