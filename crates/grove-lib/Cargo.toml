@@ -9,6 +9,7 @@ tree-sitter = { workspace = true }
 tree-sitter-typescript = { workspace = true }
 tree-sitter-rust = { workspace = true }
 tree-sitter-go = { workspace = true }
+tree-sitter-c-sharp = { workspace = true }
 oxc_resolver = { workspace = true }
 similar = { workspace = true }
 petgraph = { workspace = true }
