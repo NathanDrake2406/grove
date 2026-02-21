@@ -363,6 +363,118 @@ fn parse_using_directive(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<I
     }
 }
 
+/// Check whether a declaration node has a `public` modifier.
+fn has_public_modifier(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    node.children(&mut cursor).any(|child| {
+        child.kind() == "modifier"
+            && child.utf8_text(source).unwrap_or("") == "public"
+    })
+}
+
+/// Recursively extract public declarations as exported symbols.
+fn extract_public_declarations(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    exports: &mut Vec<ExportedSymbol>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "namespace_declaration" | "file_scoped_namespace_declaration" => {
+                let mut ns_cursor = child.walk();
+                for ns_child in child.children(&mut ns_cursor) {
+                    if ns_child.kind() == "declaration_list" {
+                        extract_public_declarations(ns_child, source, exports);
+                    }
+                }
+                if child.kind() == "file_scoped_namespace_declaration" {
+                    extract_public_declarations(child, source, exports);
+                }
+            }
+            "class_declaration" | "struct_declaration" | "interface_declaration"
+            | "enum_declaration" | "record_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        let kind = match child.kind() {
+                            "class_declaration" => SymbolKind::Class,
+                            "struct_declaration" => SymbolKind::Struct,
+                            "interface_declaration" => SymbolKind::Interface,
+                            "enum_declaration" => SymbolKind::Enum,
+                            "record_declaration" => {
+                                if is_record_struct(child) {
+                                    SymbolKind::Struct
+                                } else {
+                                    SymbolKind::Class
+                                }
+                            }
+                            _ => SymbolKind::Class,
+                        };
+                        exports.push(ExportedSymbol {
+                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                            kind,
+                            signature: None,
+                        });
+                    }
+                }
+                // Descend into body for public members
+                if let Some(body) = child.child_by_field_name("body") {
+                    extract_public_declarations(body, source, exports);
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        exports.push(ExportedSymbol {
+                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                            kind: SymbolKind::Method,
+                            signature: Some(get_signature_line(source, child.start_byte())),
+                        });
+                    }
+                }
+            }
+            "property_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name_node) = child.child_by_field_name("name") {
+                        exports.push(ExportedSymbol {
+                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                            kind: SymbolKind::Variable,
+                            signature: None,
+                        });
+                    }
+                }
+            }
+            "field_declaration" => {
+                if has_public_modifier(child, source) {
+                    let mut fc = child.walk();
+                    for fc_child in child.children(&mut fc) {
+                        if fc_child.kind() == "variable_declaration" {
+                            let mut vc = fc_child.walk();
+                            for vc_child in fc_child.children(&mut vc) {
+                                if vc_child.kind() == "variable_declarator" {
+                                    if let Some(name_node) =
+                                        vc_child.child_by_field_name("name")
+                                    {
+                                        exports.push(ExportedSymbol {
+                                            name: name_node
+                                                .utf8_text(source)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            kind: SymbolKind::Variable,
+                                            signature: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 impl LanguageAnalyzer for CSharpAnalyzer {
     fn language_id(&self) -> &str {
         "csharp"
@@ -394,8 +506,15 @@ impl LanguageAnalyzer for CSharpAnalyzer {
         Ok(imports)
     }
 
-    fn extract_exports(&self, _source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
-        todo!()
+    fn extract_exports(&self, source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
+        if source.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tree = self.parse(source)?;
+        let root = tree.root_node();
+        let mut exports = Vec::new();
+        extract_public_declarations(root, source, &mut exports);
+        Ok(exports)
     }
 
     fn is_schema_file(&self, _path: &Path) -> bool {
@@ -546,6 +665,18 @@ using static System.Math;
     }
 
     #[test]
+    fn extracts_static_using_source() {
+        let source = br#"
+using static System.Math;
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "System.Math");
+    }
+
+    #[test]
     fn extracts_usings_inside_namespace() {
         let source = br#"
 namespace MyApp {
@@ -558,5 +689,46 @@ namespace MyApp {
         let imports = analyzer.extract_imports(source).unwrap();
 
         assert!(imports.iter().any(|i| i.source == "System.Linq"));
+    }
+
+    // === Export detection tests ===
+
+    #[test]
+    fn exports_only_public_symbols() {
+        let source = br#"
+public class PublicClass { }
+internal class InternalClass { }
+class DefaultClass { }
+public interface IPublic { }
+private struct PrivateStruct { }
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"PublicClass"));
+        assert!(names.contains(&"IPublic"));
+        assert!(!names.contains(&"InternalClass"));
+        assert!(!names.contains(&"DefaultClass"));
+        assert!(!names.contains(&"PrivateStruct"));
+    }
+
+    #[test]
+    fn public_members_inside_class_are_exported() {
+        let source = br#"
+public class Service {
+    public void DoWork() { }
+    private void Helper() { }
+    public string Name { get; set; }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Service"));
+        assert!(names.contains(&"DoWork"));
+        assert!(names.contains(&"Name"));
+        assert!(!names.contains(&"Helper"));
     }
 }
