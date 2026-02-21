@@ -517,8 +517,19 @@ impl LanguageAnalyzer for CSharpAnalyzer {
         Ok(exports)
     }
 
-    fn is_schema_file(&self, _path: &Path) -> bool {
-        todo!()
+    fn is_schema_file(&self, path: &Path) -> bool {
+        let filename = path
+            .file_name()
+            .map(|f| f.to_string_lossy().to_string())
+            .unwrap_or_default();
+        matches!(
+            filename.as_str(),
+            "Directory.Build.props"
+                | "Directory.Build.targets"
+                | "global.json"
+                | "nuget.config"
+        ) || filename.ends_with(".csproj")
+            || filename.ends_with(".sln")
     }
 }
 
@@ -711,6 +722,22 @@ private struct PrivateStruct { }
         assert!(!names.contains(&"InternalClass"));
         assert!(!names.contains(&"DefaultClass"));
         assert!(!names.contains(&"PrivateStruct"));
+    }
+
+    // === Schema file detection tests ===
+
+    #[test]
+    fn schema_file_detection() {
+        let analyzer = CSharpAnalyzer::new();
+        assert!(analyzer.is_schema_file(Path::new("MyApp.csproj")));
+        assert!(analyzer.is_schema_file(Path::new("src/MyApp/MyApp.csproj")));
+        assert!(analyzer.is_schema_file(Path::new("MySolution.sln")));
+        assert!(analyzer.is_schema_file(Path::new("Directory.Build.props")));
+        assert!(analyzer.is_schema_file(Path::new("Directory.Build.targets")));
+        assert!(analyzer.is_schema_file(Path::new("global.json")));
+        assert!(analyzer.is_schema_file(Path::new("nuget.config")));
+        assert!(!analyzer.is_schema_file(Path::new("Program.cs")));
+        assert!(!analyzer.is_schema_file(Path::new("README.md")));
     }
 
     #[test]
