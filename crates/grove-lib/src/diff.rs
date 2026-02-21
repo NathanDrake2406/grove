@@ -1,25 +1,24 @@
 use crate::types::*;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::Path;
 
 /// Detect files modified in both changesets.
 pub fn compute_file_overlaps(a: &WorkspaceChangeset, b: &WorkspaceChangeset) -> Vec<Overlap> {
-    let a_paths: HashSet<&PathBuf> = a.changed_files.iter().map(|f| &f.path).collect();
+    let a_files_by_path: HashMap<&Path, &FileChange> = a
+        .changed_files
+        .iter()
+        .map(|file| (file.path.as_path(), file))
+        .collect();
 
     b.changed_files
         .iter()
-        .filter(|f| a_paths.contains(&f.path))
-        .map(|b_file| {
-            let a_file = a
-                .changed_files
-                .iter()
-                .find(|f| f.path == b_file.path)
-                .unwrap();
-            Overlap::File {
+        .filter_map(|b_file| {
+            let a_file = a_files_by_path.get(b_file.path.as_path()).copied()?;
+            Some(Overlap::File {
                 path: b_file.path.clone(),
                 a_change: a_file.change_type,
                 b_change: b_file.change_type,
-            }
+            })
         })
         .collect()
 }
@@ -31,9 +30,14 @@ pub fn compute_hunk_overlaps(
     proximity_threshold: u32,
 ) -> Vec<Overlap> {
     let mut overlaps = Vec::new();
+    let b_files_by_path: HashMap<&Path, &FileChange> = b
+        .changed_files
+        .iter()
+        .map(|file| (file.path.as_path(), file))
+        .collect();
 
     for a_file in &a.changed_files {
-        if let Some(b_file) = b.changed_files.iter().find(|f| f.path == a_file.path) {
+        if let Some(b_file) = b_files_by_path.get(a_file.path.as_path()).copied() {
             for a_hunk in &a_file.hunks {
                 let a_range = LineRange {
                     start: a_hunk.new_start,
@@ -65,6 +69,7 @@ pub fn compute_hunk_overlaps(
 mod tests {
     use super::*;
     use std::cmp::Ordering;
+    use std::path::PathBuf;
     use uuid::Uuid;
 
     // ── Property-based tests ──────────────────────────────────────────────────
@@ -98,17 +103,15 @@ mod tests {
         }
 
         fn arb_file_change_for_path(path: PathBuf) -> impl Strategy<Value = FileChange> {
-            (
-                arb_change_type(),
-                prop::collection::vec(arb_hunk(), 0..6),
-            )
-                .prop_map(move |(change_type, hunks)| FileChange {
+            (arb_change_type(), prop::collection::vec(arb_hunk(), 0..6)).prop_map(
+                move |(change_type, hunks)| FileChange {
                     path: path.clone(),
                     change_type,
                     hunks,
                     symbols_modified: vec![],
                     exports_changed: vec![],
-                })
+                },
+            )
         }
 
         fn make_cs(files: Vec<FileChange>) -> WorkspaceChangeset {

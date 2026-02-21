@@ -3,8 +3,14 @@ use crate::types::*;
 use std::path::Path;
 use tree_sitter::Parser;
 
+struct ParseCache {
+    source: Vec<u8>,
+    tree: tree_sitter::Tree,
+}
+
 pub struct RustAnalyzer {
     parser: std::sync::Mutex<Parser>,
+    parse_cache: std::sync::Mutex<Option<ParseCache>>,
 }
 
 impl Default for RustAnalyzer {
@@ -21,7 +27,35 @@ impl RustAnalyzer {
             .expect("failed to set rust language");
         Self {
             parser: std::sync::Mutex::new(parser),
+            parse_cache: std::sync::Mutex::new(None),
         }
+    }
+
+    fn parse(&self, source: &[u8]) -> Result<tree_sitter::Tree, AnalysisError> {
+        {
+            let cache = self.parse_cache.lock().unwrap();
+            if let Some(cached) = cache
+                .as_ref()
+                .filter(|cached| cached.source.as_slice() == source)
+            {
+                return Ok(cached.tree.clone());
+            }
+        }
+
+        let tree = {
+            let mut parser = self.parser.lock().unwrap();
+            parser
+                .parse(source, None)
+                .ok_or_else(|| AnalysisError::ParseError("rust parse failed".into()))?
+        };
+
+        let mut cache = self.parse_cache.lock().unwrap();
+        *cache = Some(ParseCache {
+            source: source.to_vec(),
+            tree: tree.clone(),
+        });
+
+        Ok(tree)
     }
 }
 
@@ -35,10 +69,7 @@ impl LanguageAnalyzer for RustAnalyzer {
     }
 
     fn extract_symbols(&self, source: &[u8]) -> Result<Vec<Symbol>, AnalysisError> {
-        let mut parser = self.parser.lock().unwrap();
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| AnalysisError::ParseError("rust parse failed".into()))?;
+        let tree = self.parse(source)?;
         let root = tree.root_node();
         let mut symbols = Vec::new();
         let mut cursor = root.walk();
@@ -118,10 +149,7 @@ impl LanguageAnalyzer for RustAnalyzer {
     }
 
     fn extract_imports(&self, source: &[u8]) -> Result<Vec<Import>, AnalysisError> {
-        let mut parser = self.parser.lock().unwrap();
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| AnalysisError::ParseError("rust parse failed".into()))?;
+        let tree = self.parse(source)?;
         let root = tree.root_node();
         let mut imports = Vec::new();
         visit_descendants(root, &mut |node| {
@@ -148,10 +176,7 @@ impl LanguageAnalyzer for RustAnalyzer {
 
     fn extract_exports(&self, source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
         // In Rust, "pub" items are exports. Check for pub visibility.
-        let mut parser = self.parser.lock().unwrap();
-        let tree = parser
-            .parse(source, None)
-            .ok_or_else(|| AnalysisError::ParseError("rust parse failed".into()))?;
+        let tree = self.parse(source)?;
         let root = tree.root_node();
         let mut exports = Vec::new();
         let mut cursor = root.walk();

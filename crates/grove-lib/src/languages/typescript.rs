@@ -3,9 +3,16 @@ use crate::types::*;
 use std::path::Path;
 use tree_sitter::Parser;
 
+struct ParseCache {
+    source: Vec<u8>,
+    is_tsx: bool,
+    tree: tree_sitter::Tree,
+}
+
 pub struct TypeScriptAnalyzer {
     parser_ts: std::sync::Mutex<Parser>,
     parser_tsx: std::sync::Mutex<Parser>,
+    parse_cache: std::sync::Mutex<Option<ParseCache>>,
 }
 
 impl Default for TypeScriptAnalyzer {
@@ -29,18 +36,40 @@ impl TypeScriptAnalyzer {
         Self {
             parser_ts: std::sync::Mutex::new(parser_ts),
             parser_tsx: std::sync::Mutex::new(parser_tsx),
+            parse_cache: std::sync::Mutex::new(None),
         }
     }
 
     fn parse(&self, source: &[u8], is_tsx: bool) -> Result<tree_sitter::Tree, AnalysisError> {
-        let mut parser = if is_tsx {
-            self.parser_tsx.lock().unwrap()
-        } else {
-            self.parser_ts.lock().unwrap()
+        {
+            let cache = self.parse_cache.lock().unwrap();
+            if let Some(cached) = cache
+                .as_ref()
+                .filter(|cached| cached.is_tsx == is_tsx && cached.source.as_slice() == source)
+            {
+                return Ok(cached.tree.clone());
+            }
+        }
+
+        let tree = {
+            let mut parser = if is_tsx {
+                self.parser_tsx.lock().unwrap()
+            } else {
+                self.parser_ts.lock().unwrap()
+            };
+            parser
+                .parse(source, None)
+                .ok_or_else(|| AnalysisError::ParseError("tree-sitter parse failed".into()))?
         };
-        parser
-            .parse(source, None)
-            .ok_or_else(|| AnalysisError::ParseError("tree-sitter parse failed".into()))
+
+        let mut cache = self.parse_cache.lock().unwrap();
+        *cache = Some(ParseCache {
+            source: source.to_vec(),
+            is_tsx,
+            tree: tree.clone(),
+        });
+
+        Ok(tree)
     }
 }
 

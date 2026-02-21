@@ -106,6 +106,7 @@ pub fn compute_dependency_overlaps(
 ) -> Vec<Overlap> {
     let mut overlaps = Vec::new();
     let mut emitted_overlap_keys: HashSet<(WorkspaceId, PathBuf, usize, PathBuf)> = HashSet::new();
+    let mut transitive_dependents_cache: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
 
     let b_changed_files: HashSet<&Path> = b_changeset
         .changed_files
@@ -116,6 +117,7 @@ pub fn compute_dependency_overlaps(
         a_changeset,
         &b_changed_files,
         base_graph,
+        &mut transitive_dependents_cache,
         &mut emitted_overlap_keys,
         &mut overlaps,
     );
@@ -129,6 +131,7 @@ pub fn compute_dependency_overlaps(
         b_changeset,
         &a_changed_files,
         base_graph,
+        &mut transitive_dependents_cache,
         &mut emitted_overlap_keys,
         &mut overlaps,
     );
@@ -140,6 +143,7 @@ fn collect_directional_dependency_overlaps(
     source_changeset: &WorkspaceChangeset,
     target_changed_files: &HashSet<&Path>,
     base_graph: &ImportGraph,
+    transitive_dependents_cache: &mut HashMap<PathBuf, Vec<PathBuf>>,
     emitted_overlap_keys: &mut HashSet<(WorkspaceId, PathBuf, usize, PathBuf)>,
     overlaps: &mut Vec<Overlap>,
 ) {
@@ -148,11 +152,14 @@ fn collect_directional_dependency_overlaps(
             continue;
         }
 
-        let transitive_dependents =
-            collect_transitive_dependents(changed_file.path.as_path(), base_graph);
+        let transitive_dependents = transitive_dependents_cache
+            .entry(changed_file.path.clone())
+            .or_insert_with(|| {
+                collect_transitive_dependents(changed_file.path.as_path(), base_graph)
+            });
 
         for (export_delta_idx, export_delta) in changed_file.exports_changed.iter().enumerate() {
-            for dependent_file in &transitive_dependents {
+            for dependent_file in transitive_dependents.iter() {
                 if !target_changed_files.contains(dependent_file.as_path()) {
                     continue;
                 }
