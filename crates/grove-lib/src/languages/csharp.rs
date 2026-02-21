@@ -258,6 +258,111 @@ fn extract_field_symbols(
     }
 }
 
+/// Recursively collect using directives from the AST.
+/// Handles top-level usings and usings inside namespace bodies.
+fn collect_using_directives(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    imports: &mut Vec<Import>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "using_directive" => {
+                if let Some(import) = parse_using_directive(child, source) {
+                    imports.push(import);
+                }
+            }
+            "namespace_declaration" | "file_scoped_namespace_declaration" => {
+                // Descend into namespace body to find nested usings
+                let mut ns_cursor = child.walk();
+                for ns_child in child.children(&mut ns_cursor) {
+                    if ns_child.kind() == "declaration_list" {
+                        collect_using_directives(ns_child, source, imports);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse a single using_directive node into an Import.
+///
+/// Handles three forms:
+/// - `using System;` → source = "System"
+/// - `using Json = System.Text.Json;` → source = "System.Text.Json", symbol = "Json"
+/// - `using static System.Math;` → source = "System.Math"
+fn parse_using_directive(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<Import> {
+    let line = node.start_position().row as u32 + 1;
+    let mut has_equals = false;
+    let mut has_static = false;
+    let mut alias_name: Option<String> = None;
+    let mut namespace_source: Option<String> = None;
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "static" => {
+                has_static = true;
+            }
+            "=" => {
+                has_equals = true;
+            }
+            "identifier" => {
+                let text = child.utf8_text(source).unwrap_or("").to_string();
+                if has_equals {
+                    // identifier after = is a simple namespace (no dots)
+                    namespace_source = Some(text);
+                } else if !has_static && namespace_source.is_none() {
+                    // First identifier before = could be alias or simple namespace
+                    if alias_name.is_none() {
+                        alias_name = Some(text);
+                    }
+                } else {
+                    namespace_source = Some(text);
+                }
+            }
+            "qualified_name" => {
+                let text = child.utf8_text(source).unwrap_or("").to_string();
+                namespace_source = Some(text);
+            }
+            _ => {}
+        }
+    }
+
+    // Determine the final source and symbols
+    if has_equals {
+        // Aliased: `using Alias = Namespace;`
+        let ns = namespace_source?;
+        let alias = alias_name?;
+        Some(Import {
+            source: ns,
+            symbols: vec![ImportedSymbol {
+                name: alias,
+                alias: None,
+            }],
+            line,
+        })
+    } else if let Some(ns) = namespace_source {
+        // `using static Namespace;` or `using QualifiedNamespace;`
+        Some(Import {
+            source: ns,
+            symbols: vec![],
+            line,
+        })
+    } else if let Some(simple) = alias_name {
+        // `using SimpleIdentifier;` (no dots)
+        Some(Import {
+            source: simple,
+            symbols: vec![],
+            line,
+        })
+    } else {
+        None
+    }
+}
+
 impl LanguageAnalyzer for CSharpAnalyzer {
     fn language_id(&self) -> &str {
         "csharp"
@@ -278,8 +383,15 @@ impl LanguageAnalyzer for CSharpAnalyzer {
         Ok(symbols)
     }
 
-    fn extract_imports(&self, _source: &[u8]) -> Result<Vec<Import>, AnalysisError> {
-        todo!()
+    fn extract_imports(&self, source: &[u8]) -> Result<Vec<Import>, AnalysisError> {
+        if source.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tree = self.parse(source)?;
+        let root = tree.root_node();
+        let mut imports = Vec::new();
+        collect_using_directives(root, source, &mut imports);
+        Ok(imports)
     }
 
     fn extract_exports(&self, _source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
@@ -399,5 +511,52 @@ public class Broken {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
         assert!(symbols.iter().any(|s| s.name == "Stable"));
+    }
+
+    // === Import extraction tests ===
+
+    #[test]
+    fn extracts_using_directives() {
+        let source = br#"
+using System;
+using System.Collections.Generic;
+using MyApp.Services;
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 3);
+        assert_eq!(imports[0].source, "System");
+        assert_eq!(imports[1].source, "System.Collections.Generic");
+        assert_eq!(imports[2].source, "MyApp.Services");
+    }
+
+    #[test]
+    fn extracts_aliased_using() {
+        let source = br#"
+using Json = System.Text.Json;
+using static System.Math;
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "System.Text.Json");
+        assert!(imports[0].symbols.iter().any(|s| s.name == "Json"));
+    }
+
+    #[test]
+    fn extracts_usings_inside_namespace() {
+        let source = br#"
+namespace MyApp {
+    using System.Linq;
+
+    public class Processor { }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert!(imports.iter().any(|i| i.source == "System.Linq"));
     }
 }
