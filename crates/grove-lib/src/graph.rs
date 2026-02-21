@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 /// The canonical import graph for the base branch.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImportGraph {
     /// Forward edges: file -> [(imported_file, symbols)]
     pub imports: HashMap<PathBuf, Vec<(PathBuf, Vec<ImportedSymbol>)>>,

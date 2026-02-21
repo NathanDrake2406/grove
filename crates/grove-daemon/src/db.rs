@@ -1,4 +1,5 @@
 use chrono::{DateTime, Utc};
+use grove_lib::graph::ImportGraph;
 use grove_lib::{
     ChangeType, CommitHash, ExportedSymbol, Hunk, Import, MergeOrder, OrthogonalityScore, Symbol,
     Workspace, WorkspaceId, WorkspaceMetadata, WorkspacePairAnalysis,
@@ -91,6 +92,12 @@ impl Database {
                 hunks_json TEXT,
                 symbols_json TEXT,
                 PRIMARY KEY (workspace_id, file_path)
+            );
+
+            CREATE TABLE IF NOT EXISTS base_graph_cache (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                base_commit TEXT NOT NULL,
+                graph_json TEXT NOT NULL
             );
             ",
         )?;
@@ -214,6 +221,42 @@ impl Database {
 
     pub fn delete_all_pair_analyses(&self) -> Result<(), DbError> {
         self.conn.execute("DELETE FROM pair_analyses", [])?;
+        Ok(())
+    }
+
+    // === Base Graph Cache ===
+
+    pub fn save_base_graph_cache(
+        &self,
+        base_commit: &CommitHash,
+        graph: &ImportGraph,
+    ) -> Result<(), DbError> {
+        let graph_json = serde_json::to_string(graph)?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO base_graph_cache (id, base_commit, graph_json) VALUES (1, ?1, ?2)",
+            params![base_commit, graph_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_base_graph_cache(&self) -> Result<Option<(CommitHash, ImportGraph)>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT base_commit, graph_json FROM base_graph_cache WHERE id = 1")?;
+        let row: Option<(String, String)> = stmt
+            .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        match row {
+            Some((base_commit, graph_json)) => {
+                let graph: ImportGraph = serde_json::from_str(&graph_json)?;
+                Ok(Some((base_commit, graph)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn delete_base_graph_cache(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM base_graph_cache", [])?;
         Ok(())
     }
 

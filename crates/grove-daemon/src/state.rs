@@ -244,11 +244,36 @@ impl DaemonState {
             }
         }
 
-        // Mark all loaded workspaces dirty so that the base import graph is
-        // rebuilt and analyses are recomputed with dependency overlap info on
-        // the next dispatch cycle (triggered when the worker attaches).
-        for workspace_id in self.workspaces.keys().copied() {
-            self.dirty_workspaces.push(workspace_id);
+        // Restore the cached base import graph so that persisted analyses
+        // (which may include dependency overlaps) remain valid on restart.
+        if let Some(ref db) = self.db {
+            match db.load_base_graph_cache() {
+                Ok(Some((base_commit, graph))) => {
+                    let edge_count: usize = graph.imports.values().map(Vec::len).sum();
+                    info!(
+                        base_commit = %base_commit,
+                        files = graph.exports.len(),
+                        edges = edge_count,
+                        "restored base import graph from cache"
+                    );
+                    self.base_graph = graph;
+                    self.base_commit = base_commit;
+                }
+                Ok(None) => {
+                    debug!("no cached base graph found");
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to load base graph cache");
+                }
+            }
+        }
+
+        // If the base graph is still empty after loading, mark all workspaces
+        // dirty so the graph build triggers on the first dispatch cycle.
+        if self.base_graph.is_empty() && !self.workspaces.is_empty() {
+            for workspace_id in self.workspaces.keys().copied() {
+                self.dirty_workspaces.push(workspace_id);
+            }
         }
 
         self
@@ -575,10 +600,13 @@ impl DaemonState {
         self.in_flight_pairs.clear();
         self.drain_analysis_waiters();
 
-        if let Some(ref db) = self.db
-            && let Err(e) = db.delete_all_pair_analyses()
-        {
-            error!(error = %e, "failed to delete stale pair analyses from db");
+        if let Some(ref db) = self.db {
+            if let Err(e) = db.delete_all_pair_analyses() {
+                error!(error = %e, "failed to delete stale pair analyses from db");
+            }
+            if let Err(e) = db.delete_base_graph_cache() {
+                error!(error = %e, "failed to delete stale base graph cache from db");
+            }
         }
 
         for workspace_id in self.workspaces.keys().copied() {
@@ -834,7 +862,13 @@ impl DaemonState {
         );
 
         self.base_graph = graph;
-        self.base_commit = base_commit;
+        self.base_commit = base_commit.clone();
+
+        if let Some(ref db) = self.db
+            && let Err(e) = db.save_base_graph_cache(&base_commit, &self.base_graph)
+        {
+            error!(error = %e, "failed to persist base graph cache");
+        }
 
         // Re-mark all workspaces dirty so they re-analyze with the populated graph,
         // picking up dependency overlaps that the initial pass missed.
