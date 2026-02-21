@@ -735,6 +735,60 @@ mod tests {
         }
     }
 
+    fn init_repo_with_main(repo: &Path) {
+        run_git(repo, &["init", "-b", "main"]);
+        run_git(repo, &["config", "user.email", "grove@example.com"]);
+        run_git(repo, &["config", "user.name", "Grove Tests"]);
+    }
+
+    fn add_worktree_from_main(repo: &Path, root: &Path, folder_name: &str, branch: &str) -> PathBuf {
+        let worktree = root.join(folder_name);
+        run_git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                worktree.to_str().expect("path should be utf8"),
+                "-b",
+                branch,
+                "main",
+            ],
+        );
+        run_git(&worktree, &["config", "user.email", "grove@example.com"]);
+        run_git(&worktree, &["config", "user.name", "Grove Tests"]);
+        worktree
+    }
+
+    fn default_config() -> GroveConfig {
+        GroveConfig {
+            base_branch: "main".to_string(),
+            ..GroveConfig::default()
+        }
+    }
+
+    fn assert_score_at_most_yellow(case_name: &str, analysis: &WorkspacePairAnalysis) {
+        assert!(
+            analysis.score <= OrthogonalityScore::Yellow,
+            "{case_name}: expected score <= Yellow, got {:?} with overlaps {:?}",
+            analysis.score,
+            analysis.overlaps
+        );
+    }
+
+    fn assert_no_symbol_or_schema_overlaps(case_name: &str, analysis: &WorkspacePairAnalysis) {
+        let has_symbol_or_schema = analysis.overlaps.iter().any(|overlap| {
+            matches!(
+                overlap,
+                grove_lib::Overlap::Symbol { .. } | grove_lib::Overlap::Schema { .. }
+            )
+        });
+        assert!(
+            !has_symbol_or_schema,
+            "{case_name}: expected no symbol/schema overlaps, got {:?}",
+            analysis.overlaps
+        );
+    }
+
     #[test]
     fn analyze_workspace_pair_scores_shared_file_changes() {
         let temp = tempdir().expect("temp dir should be created");
@@ -807,6 +861,210 @@ mod tests {
                 | MergeOrder::NeedsCoordination
                 | MergeOrder::Either
         ));
+    }
+
+    #[test]
+    fn analyze_workspace_pair_scoped_same_name_methods_do_not_escalate_to_red() {
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+        init_repo_with_main(&repo);
+
+        let base_source = r#"
+pub struct Auth;
+
+impl Auth {
+    pub fn handle(&self, token: &str) -> bool {
+        !token.is_empty()
+    }
+}
+
+pub struct Billing;
+
+impl Billing {
+    pub fn handle(&self, amount: u64) -> bool {
+        amount > 0
+    }
+}
+"#;
+        write_file(&repo.join("src/lib.rs"), base_source);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        run_git(&repo, &["checkout", "-b", "feat/a"]);
+        let a_source = r#"
+pub struct Auth;
+
+impl Auth {
+    pub fn handle(&self, token: &str) -> bool {
+        token.starts_with("tok_")
+    }
+}
+
+pub struct Billing;
+
+impl Billing {
+    pub fn handle(&self, amount: u64) -> bool {
+        amount > 0
+    }
+}
+"#;
+        write_file(&repo.join("src/lib.rs"), a_source);
+        run_git(&repo, &["commit", "-am", "feat a"]);
+
+        let wt_b = add_worktree_from_main(&repo, temp.path(), "wt-b-symbol", "feat/b-symbol");
+        let b_source = r#"
+pub struct Auth;
+
+impl Auth {
+    pub fn handle(&self, token: &str) -> bool {
+        !token.is_empty()
+    }
+}
+
+pub struct Billing;
+
+impl Billing {
+    pub fn handle(&self, amount: u64) -> bool {
+        amount >= 1
+    }
+}
+"#;
+        write_file(&wt_b.join("src/lib.rs"), b_source);
+        run_git(&wt_b, &["commit", "-am", "feat b"]);
+
+        let ws_a = make_workspace(repo.clone(), "feat/a");
+        let ws_b = make_workspace(wt_b.clone(), "feat/b-symbol");
+        let analysis = analyze_workspace_pair(&default_config(), &ws_a, &ws_b, &ImportGraph::new())
+            .expect("analysis should succeed");
+
+        assert_score_at_most_yellow("scoped_same_name_methods", &analysis);
+        assert_no_symbol_or_schema_overlaps("scoped_same_name_methods", &analysis);
+    }
+
+    #[test]
+    fn analyze_workspace_pair_docs_route_keywords_do_not_create_schema_overlap() {
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+        init_repo_with_main(&repo);
+
+        write_file(&repo.join("README.md"), "base\n");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        run_git(&repo, &["checkout", "-b", "feat/a"]);
+        write_file(
+            &repo.join("docs/router-guide.md"),
+            "# Router guide\nIndependent docs change.\n",
+        );
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "feat a docs"]);
+
+        let wt_b = add_worktree_from_main(&repo, temp.path(), "wt-b-route", "feat/b-route");
+        write_file(
+            &wt_b.join("docs/router-patterns.md"),
+            "# Router patterns\nAnother independent docs change.\n",
+        );
+        run_git(&wt_b, &["add", "."]);
+        run_git(&wt_b, &["commit", "-m", "feat b docs"]);
+
+        let ws_a = make_workspace(repo.clone(), "feat/a");
+        let ws_b = make_workspace(wt_b.clone(), "feat/b-route");
+        let analysis = analyze_workspace_pair(&default_config(), &ws_a, &ws_b, &ImportGraph::new())
+            .expect("analysis should succeed");
+
+        assert_eq!(
+            analysis.score,
+            OrthogonalityScore::Green,
+            "route keyword-only docs should stay green: {:?}",
+            analysis.overlaps
+        );
+        assert_no_symbol_or_schema_overlaps("route_keyword_docs", &analysis);
+    }
+
+    #[test]
+    fn analyze_workspace_pair_docs_migration_keywords_do_not_create_schema_overlap() {
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+        init_repo_with_main(&repo);
+
+        write_file(&repo.join("README.md"), "base\n");
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        run_git(&repo, &["checkout", "-b", "feat/a"]);
+        write_file(
+            &repo.join("docs/migrations-playbook.md"),
+            "# Migrations playbook\nIndependent docs change.\n",
+        );
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "feat a docs"]);
+
+        let wt_b = add_worktree_from_main(
+            &repo,
+            temp.path(),
+            "wt-b-migration",
+            "feat/b-migration",
+        );
+        write_file(
+            &wt_b.join("notes/migrations-changelog.md"),
+            "# Migration changelog\nAnother independent docs change.\n",
+        );
+        run_git(&wt_b, &["add", "."]);
+        run_git(&wt_b, &["commit", "-m", "feat b docs"]);
+
+        let ws_a = make_workspace(repo.clone(), "feat/a");
+        let ws_b = make_workspace(wt_b.clone(), "feat/b-migration");
+        let analysis = analyze_workspace_pair(&default_config(), &ws_a, &ws_b, &ImportGraph::new())
+            .expect("analysis should succeed");
+
+        assert_eq!(
+            analysis.score,
+            OrthogonalityScore::Green,
+            "migration keyword-only docs should stay green: {:?}",
+            analysis.overlaps
+        );
+        assert_no_symbol_or_schema_overlaps("migration_keyword_docs", &analysis);
+    }
+
+    #[test]
+    fn analyze_workspace_pair_independent_import_churn_stays_at_or_below_yellow() {
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+        init_repo_with_main(&repo);
+
+        let gap = "\n".repeat(140);
+        let base_source = format!(
+            "use std::collections::HashMap;\n\npub fn top() -> usize {{\n    1\n}}\n{gap}use std::collections::HashSet;\n\npub fn bottom() -> usize {{\n    2\n}}\n"
+        );
+        write_file(&repo.join("src/lib.rs"), &base_source);
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        run_git(&repo, &["checkout", "-b", "feat/a"]);
+        let a_source = format!(
+            "use std::collections::BTreeMap;\n\npub fn top() -> usize {{\n    1\n}}\n{gap}use std::collections::HashSet;\n\npub fn bottom() -> usize {{\n    2\n}}\n"
+        );
+        write_file(&repo.join("src/lib.rs"), &a_source);
+        run_git(&repo, &["commit", "-am", "feat a import"]);
+
+        let wt_b = add_worktree_from_main(&repo, temp.path(), "wt-b-import", "feat/b-import");
+        let b_source = format!(
+            "use std::collections::HashMap;\n\npub fn top() -> usize {{\n    1\n}}\n{gap}use std::collections::VecDeque;\n\npub fn bottom() -> usize {{\n    2\n}}\n"
+        );
+        write_file(&wt_b.join("src/lib.rs"), &b_source);
+        run_git(&wt_b, &["commit", "-am", "feat b import"]);
+
+        let ws_a = make_workspace(repo.clone(), "feat/a");
+        let ws_b = make_workspace(wt_b.clone(), "feat/b-import");
+        let analysis = analyze_workspace_pair(&default_config(), &ws_a, &ws_b, &ImportGraph::new())
+            .expect("analysis should succeed");
+
+        assert_score_at_most_yellow("independent_import_churn", &analysis);
+        assert_no_symbol_or_schema_overlaps("independent_import_churn", &analysis);
     }
 
     #[test]
