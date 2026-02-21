@@ -96,21 +96,42 @@ impl GitRepo {
         for change in changes {
             use gix::object::tree::diff::ChangeDetached;
             match change {
-                ChangeDetached::Addition { location, .. } => {
+                ChangeDetached::Addition {
+                    location,
+                    entry_mode,
+                    ..
+                } => {
+                    if entry_mode.is_tree() {
+                        continue;
+                    }
                     statuses.push(DiffFileStatus {
                         path: PathBuf::from(location.to_string()),
                         old_path: None,
                         change_type: ChangeType::Added,
                     });
                 }
-                ChangeDetached::Deletion { location, .. } => {
+                ChangeDetached::Deletion {
+                    location,
+                    entry_mode,
+                    ..
+                } => {
+                    if entry_mode.is_tree() {
+                        continue;
+                    }
                     statuses.push(DiffFileStatus {
                         path: PathBuf::from(location.to_string()),
                         old_path: None,
                         change_type: ChangeType::Deleted,
                     });
                 }
-                ChangeDetached::Modification { location, .. } => {
+                ChangeDetached::Modification {
+                    location,
+                    entry_mode,
+                    ..
+                } => {
+                    if entry_mode.is_tree() {
+                        continue;
+                    }
                     statuses.push(DiffFileStatus {
                         path: PathBuf::from(location.to_string()),
                         old_path: None,
@@ -120,8 +141,12 @@ impl GitRepo {
                 ChangeDetached::Rewrite {
                     source_location,
                     location,
+                    entry_mode,
                     ..
                 } => {
+                    if entry_mode.is_tree() {
+                        continue;
+                    }
                     statuses.push(DiffFileStatus {
                         path: PathBuf::from(location.to_string()),
                         old_path: Some(PathBuf::from(source_location.to_string())),
