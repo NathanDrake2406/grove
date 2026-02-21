@@ -602,4 +602,184 @@ public interface Repository {
         assert!(!analyzer.is_schema_file(Path::new("Main.java")));
         assert!(!analyzer.is_schema_file(Path::new("pom.xml.bak")));
     }
+
+    // === Stress tests and edge cases ===
+
+    #[test]
+    fn empty_source_returns_empty() {
+        let analyzer = JavaAnalyzer::new();
+        assert!(analyzer.extract_symbols(b"").unwrap().is_empty());
+        assert!(analyzer.extract_imports(b"").unwrap().is_empty());
+        assert!(analyzer.extract_exports(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_source_recovers() {
+        let source = br#"
+public class Stable {
+    public void stableMethod() {}
+}
+
+public class Broken {
+    public void brokenMethod( {
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "Stable"));
+        assert!(symbols.iter().any(|s| s.name == "stableMethod"));
+    }
+
+    #[test]
+    fn nested_classes_extracted() {
+        let source = br#"
+public class Outer {
+    public class Inner {
+        public void innerMethod() {}
+    }
+    private static class StaticNested {}
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Outer" && s.kind == SymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "Inner" && s.kind == SymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "innerMethod" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "StaticNested" && s.kind == SymbolKind::Class));
+    }
+
+    #[test]
+    fn generic_class_extracted() {
+        let source = br#"
+public class Box<T> {
+    private T value;
+    public T getValue() { return value; }
+}
+
+public interface Comparable<T> {
+    int compareTo(T other);
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Box" && s.kind == SymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "getValue" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "Comparable" && s.kind == SymbolKind::Interface));
+    }
+
+    #[test]
+    fn realistic_spring_controller() {
+        let source = br#"
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.beans.factory.annotation.Autowired;
+import java.util.List;
+
+@RestController
+public class UserController {
+    @Autowired
+    private UserService userService;
+
+    @GetMapping("/users")
+    public List<User> getUsers() {
+        return userService.findAll();
+    }
+
+    @PostMapping("/users")
+    public User createUser(User user) {
+        return userService.save(user);
+    }
+
+    private void validateUser(User user) {
+        // internal validation
+    }
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "UserController"));
+        assert!(symbols.iter().any(|s| s.name == "getUsers"));
+        assert!(symbols.iter().any(|s| s.name == "createUser"));
+        assert!(symbols.iter().any(|s| s.name == "validateUser"));
+        assert!(symbols.iter().any(|s| s.name == "userService" && s.kind == SymbolKind::Variable));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 5);
+        assert!(imports.iter().any(|i| i.source == "org.springframework.web.bind.annotation.RestController"));
+        assert!(imports.iter().any(|i| i.source == "java.util.List"));
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        let export_names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(export_names.contains(&"UserController"));
+        assert!(export_names.contains(&"getUsers"));
+        assert!(export_names.contains(&"createUser"));
+        assert!(!export_names.contains(&"validateUser"));
+    }
+
+    #[test]
+    fn line_numbers_are_correct() {
+        let source = br#"import java.util.List;
+
+public class Main {
+    public void first() {}
+
+    public void second() {}
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let first = symbols.iter().find(|s| s.name == "first").unwrap();
+        assert_eq!(first.range.start, 4);
+        let second = symbols.iter().find(|s| s.name == "second").unwrap();
+        assert_eq!(second.range.start, 6);
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports[0].line, 1);
+    }
+
+    #[test]
+    fn registry_matches_java_files() {
+        let registry = super::super::LanguageRegistry::with_defaults();
+        let analyzer = registry.analyzer_for_file(Path::new("Main.java"));
+        assert!(analyzer.is_some());
+        assert_eq!(analyzer.unwrap().language_id(), "java");
+
+        assert!(registry.analyzer_for_file(Path::new("src/com/example/Service.java")).is_some());
+        assert_ne!(
+            registry.analyzer_for_file(Path::new("lib.rs")).unwrap().language_id(),
+            "java"
+        );
+    }
+
+    #[test]
+    fn parse_cache_returns_consistent_results() {
+        let source = br#"
+public class Cached {
+    public void method() {}
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let first = analyzer.extract_symbols(source).unwrap();
+        let second = analyzer.extract_symbols(source).unwrap();
+        assert_eq!(first.len(), second.len());
+        assert_eq!(first[0].name, second[0].name);
+    }
+
+    #[test]
+    fn comments_do_not_produce_symbols() {
+        let source = br#"
+// public class NotAClass {}
+/* public interface NotAnInterface {} */
+
+public class RealClass {}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "RealClass");
+    }
 }
