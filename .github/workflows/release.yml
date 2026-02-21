@@ -40,11 +40,6 @@ jobs:
             use_cross: false
             archive_ext: tar.gz
 
-          - target: x86_64-pc-windows-msvc
-            os: windows-2022
-            use_cross: false
-            archive_ext: zip
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -98,18 +93,6 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "dist/${STEM}/"
           cp README.md LICENSE-MIT LICENSE-APACHE dist/${STEM}/ 2>/dev/null || true
           tar -czf "dist/${{ steps.archive.outputs.filename }}" -C dist "${STEM}"
-
-      - name: Package binary (Windows zip)
-        if: matrix.archive_ext == 'zip'
-        shell: pwsh
-        run: |
-          $Stem = "${{ steps.archive.outputs.stem }}"
-          New-Item -ItemType Directory -Force -Path "dist/$Stem"
-          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" "dist/$Stem/"
-          if (Test-Path README.md) { Copy-Item README.md "dist/$Stem/" }
-          if (Test-Path LICENSE-MIT) { Copy-Item LICENSE-MIT "dist/$Stem/" }
-          if (Test-Path LICENSE-APACHE) { Copy-Item LICENSE-APACHE "dist/$Stem/" }
-          Compress-Archive -Path "dist/$Stem" -DestinationPath "dist/${{ steps.archive.outputs.filename }}"
 
       - name: Generate checksum
         shell: bash
