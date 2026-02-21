@@ -134,6 +134,45 @@ impl GitRepo {
         Ok(statuses)
     }
 
+    /// Detect files that differ between HEAD and the working tree (staged + unstaged).
+    /// Returns relative paths of dirty files mapped to their change type.
+    /// Uses `git status --porcelain=v1 -z` subprocess (same pattern as rev-list).
+    pub fn worktree_status(&self) -> Result<Vec<DiffFileStatus>, WorkerError> {
+        let repo_path = self.work_dir();
+        let output = crate::worker::git_output(
+            &repo_path,
+            ["status", "--porcelain=v1", "-z", "--no-renames"],
+            "status --porcelain",
+        )?;
+
+        let mut statuses = Vec::new();
+        // Porcelain v1 with -z: entries separated by NUL, each entry is "XY path"
+        for entry in output.split('\0') {
+            if entry.len() < 4 {
+                continue; // "XY " + at least 1 char path
+            }
+            let index_status = entry.as_bytes()[0];
+            let worktree_status = entry.as_bytes()[1];
+            let path = PathBuf::from(&entry[3..]);
+
+            // Determine change type from the most "dirty" indicator.
+            // Prefer worktree status over index status (unstaged > staged).
+            let change_type = match (index_status, worktree_status) {
+                (b'D', _) | (_, b'D') => ChangeType::Deleted,
+                (b'A', _) | (b'?', _) => ChangeType::Added,
+                _ => ChangeType::Modified,
+            };
+
+            statuses.push(DiffFileStatus {
+                path,
+                old_path: None,
+                change_type,
+            });
+        }
+
+        Ok(statuses)
+    }
+
     fn work_dir(&self) -> PathBuf {
         self.repo
             .workdir()

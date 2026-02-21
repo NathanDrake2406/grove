@@ -215,6 +215,18 @@ fn extract_changeset(
     let head_tree = git.resolve_tree("HEAD")?;
     let statuses = git.diff_name_status(&base_tree, &head_tree)?;
 
+    // Merge in working-tree dirty files not already in the committed diff.
+    // This catches files that are modified on disk but not yet committed.
+    let wt_statuses = git.worktree_status().unwrap_or_default();
+    let mut statuses = statuses;
+    let committed_paths: std::collections::HashSet<PathBuf> =
+        statuses.iter().map(|s| s.path.clone()).collect();
+    for wt in wt_statuses {
+        if !committed_paths.contains(&wt.path) {
+            statuses.push(wt);
+        }
+    }
+
     // Phase 1: resolve trees once, reuse for all blob reads (was 2N subprocesses)
     let mut base_tree_mut = git.resolve_tree(&merge_base)?;
     let mut head_tree_mut = git.resolve_tree("HEAD")?;
@@ -235,10 +247,15 @@ fn extract_changeset(
             }
         };
 
+        // Read new-side from working tree (disk), falling back to HEAD blob.
+        // This captures uncommitted changes that the watcher triggered on.
         let new_content = match status.change_type {
             ChangeType::Deleted => None,
             ChangeType::Added | ChangeType::Modified | ChangeType::Renamed => {
-                git.read_blob(&mut head_tree_mut, new_path)
+                let disk_path = workspace.path.join(new_path);
+                std::fs::read(&disk_path)
+                    .ok()
+                    .or_else(|| git.read_blob(&mut head_tree_mut, new_path))
             }
         };
 
@@ -441,7 +458,7 @@ fn exported_to_symbol(exported: &ExportedSymbol) -> Symbol {
     }
 }
 
-fn git_output_line<const N: usize>(
+pub(crate) fn git_output_line<const N: usize>(
     repo_path: &Path,
     args: [&str; N],
     context: &'static str,
@@ -450,7 +467,7 @@ fn git_output_line<const N: usize>(
     Ok(output.lines().next().unwrap_or_default().trim().to_string())
 }
 
-fn git_output<const N: usize>(
+pub(crate) fn git_output<const N: usize>(
     repo_path: &Path,
     args: [&str; N],
     context: &'static str,
@@ -629,5 +646,115 @@ mod tests {
                 | MergeOrder::NeedsCoordination
                 | MergeOrder::Either
         ));
+    }
+
+    #[test]
+    fn extract_changeset_includes_uncommitted_changes() {
+        // Setup: temp repo with initial commit on main, then a branch with
+        // an uncommitted file change — extract_changeset should see it.
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "grove@example.com"]);
+        run_git(&repo, &["config", "user.name", "Grove Tests"]);
+
+        write_file(
+            &repo.join("src/lib.rs"),
+            "pub fn hello() -> &'static str {\n    \"hello\"\n}\n",
+        );
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        // Create branch but do NOT commit the change — only write to disk.
+        run_git(&repo, &["checkout", "-b", "feat/dirty"]);
+        write_file(
+            &repo.join("src/lib.rs"),
+            "pub fn hello() -> &'static str {\n    \"world\"\n}\n",
+        );
+
+        let ws = make_workspace(repo.clone(), "feat/dirty");
+        let config = GroveConfig {
+            base_branch: "main".to_string(),
+            ..GroveConfig::default()
+        };
+
+        let changeset = extract_changeset(&config, &ws).expect("extract should succeed");
+
+        // The uncommitted file should appear in changed_files.
+        assert!(
+            changeset
+                .changed_files
+                .iter()
+                .any(|f| f.path == PathBuf::from("src/lib.rs")),
+            "uncommitted dirty file should appear in changeset"
+        );
+
+        // The hunks should reflect the working-tree diff (\"hello\" -> \"world\").
+        let file = changeset
+            .changed_files
+            .iter()
+            .find(|f| f.path == PathBuf::from("src/lib.rs"))
+            .expect("src/lib.rs should be in changeset");
+        assert!(
+            !file.hunks.is_empty(),
+            "dirty file should have diff hunks"
+        );
+    }
+
+    #[test]
+    fn extract_changeset_merges_committed_and_uncommitted_changes() {
+        // A file that has both committed changes (merge-base to HEAD) AND further
+        // uncommitted edits should show the full diff from merge-base to working-tree.
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "grove@example.com"]);
+        run_git(&repo, &["config", "user.name", "Grove Tests"]);
+
+        write_file(
+            &repo.join("src/lib.rs"),
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+        );
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        // Committed change on branch: modify line 1
+        run_git(&repo, &["checkout", "-b", "feat/combo"]);
+        write_file(
+            &repo.join("src/lib.rs"),
+            "fn one_modified() {}\nfn two() {}\nfn three() {}\n",
+        );
+        run_git(&repo, &["commit", "-am", "modify one"]);
+
+        // Further uncommitted change: also modify line 3
+        write_file(
+            &repo.join("src/lib.rs"),
+            "fn one_modified() {}\nfn two() {}\nfn three_modified() {}\n",
+        );
+
+        let ws = make_workspace(repo.clone(), "feat/combo");
+        let config = GroveConfig {
+            base_branch: "main".to_string(),
+            ..GroveConfig::default()
+        };
+
+        let changeset = extract_changeset(&config, &ws).expect("extract should succeed");
+
+        let file = changeset
+            .changed_files
+            .iter()
+            .find(|f| f.path == PathBuf::from("src/lib.rs"))
+            .expect("src/lib.rs should be in changeset");
+
+        // Should see hunks covering both changes (line 1 and line 3).
+        assert!(
+            file.hunks.len() >= 2,
+            "should have hunks for both committed and uncommitted changes, got {}",
+            file.hunks.len()
+        );
     }
 }
