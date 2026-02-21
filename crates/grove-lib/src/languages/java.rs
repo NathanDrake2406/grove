@@ -209,6 +209,104 @@ fn extract_field_names(
     }
 }
 
+fn has_public_modifier(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "modifiers" {
+            let mut mod_cursor = child.walk();
+            for modifier in child.children(&mut mod_cursor) {
+                if modifier.utf8_text(source).unwrap_or("") == "public" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn collect_exports(node: tree_sitter::Node<'_>, source: &[u8], exports: &mut Vec<ExportedSymbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "class_declaration" | "record_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        exports.push(ExportedSymbol {
+                            name: name.utf8_text(source).unwrap_or("").to_string(),
+                            kind: SymbolKind::Class,
+                            signature: None,
+                        });
+                    }
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_exports(body, source, exports);
+                }
+            }
+            "interface_declaration" | "annotation_type_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        exports.push(ExportedSymbol {
+                            name: name.utf8_text(source).unwrap_or("").to_string(),
+                            kind: SymbolKind::Interface,
+                            signature: None,
+                        });
+                    }
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_exports(body, source, exports);
+                }
+            }
+            "enum_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        exports.push(ExportedSymbol {
+                            name: name.utf8_text(source).unwrap_or("").to_string(),
+                            kind: SymbolKind::Enum,
+                            signature: None,
+                        });
+                    }
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_exports(body, source, exports);
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                if has_public_modifier(child, source) {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        exports.push(ExportedSymbol {
+                            name: name.utf8_text(source).unwrap_or("").to_string(),
+                            kind: SymbolKind::Method,
+                            signature: Some(get_signature_line(source, child.start_byte())),
+                        });
+                    }
+                }
+            }
+            "field_declaration" | "constant_declaration" => {
+                if has_public_modifier(child, source) {
+                    let kind = if child.kind() == "constant_declaration" {
+                        SymbolKind::Constant
+                    } else {
+                        SymbolKind::Variable
+                    };
+                    let mut field_cursor = child.walk();
+                    for field_child in child.children(&mut field_cursor) {
+                        if field_child.kind() == "variable_declarator" {
+                            if let Some(name) = field_child.child_by_field_name("name") {
+                                exports.push(ExportedSymbol {
+                                    name: name.utf8_text(source).unwrap_or("").to_string(),
+                                    kind,
+                                    signature: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn flatten_scoped_identifier(
     node: tree_sitter::Node<'_>,
     source: &[u8],
@@ -287,8 +385,12 @@ impl LanguageAnalyzer for JavaAnalyzer {
         Ok(imports)
     }
 
-    fn extract_exports(&self, _source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
-        Ok(vec![]) // stub — tests will fail
+    fn extract_exports(&self, source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
+        let tree = self.parse(source)?;
+        let root = tree.root_node();
+        let mut exports = Vec::new();
+        collect_exports(root, source, &mut exports);
+        Ok(exports)
     }
 
     fn is_schema_file(&self, _path: &Path) -> bool {
@@ -437,5 +539,41 @@ import java.io.IOException;
         assert_eq!(imports[0].source, "java.util.List");
         assert_eq!(imports[1].source, "java.util.Map");
         assert_eq!(imports[2].source, "java.io.IOException");
+    }
+
+    #[test]
+    fn exports_only_public_symbols() {
+        let source = br#"
+public class UserService {
+    public void createUser(String name) {}
+    private void validate(String name) {}
+    void helper() {}
+}
+
+class InternalHelper {
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"UserService"));
+        assert!(names.contains(&"createUser"));
+        assert!(!names.contains(&"validate"));
+        assert!(!names.contains(&"helper"));
+        assert!(!names.contains(&"InternalHelper"));
+    }
+
+    #[test]
+    fn public_interface_is_exported() {
+        let source = br#"
+public interface Repository {
+    void save(Object entity);
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert!(exports.iter().any(|e| e.name == "Repository"));
     }
 }
