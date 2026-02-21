@@ -7,8 +7,8 @@ use grove_lib::{
     ChangeType, ExportDelta, ExportedSymbol, FileChange, Hunk, LineRange, Signature, Symbol,
     Workspace, WorkspaceChangeset, WorkspacePairAnalysis,
 };
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
@@ -176,6 +176,158 @@ pub(crate) fn analyze_workspace_pair(
     );
 
     Ok(analysis)
+}
+
+/// Build the base-branch import graph for a workspace repository.
+///
+/// The graph is built from the configured base branch tree (or workspace base_ref
+/// when present) so dependency overlap detection can trace changed exports through
+/// dependents even before a merge is attempted.
+pub(crate) fn build_base_graph_from_workspace(
+    config: &GroveConfig,
+    workspace: &Workspace,
+) -> Result<(ImportGraph, String), WorkerError> {
+    let base_ref = if workspace.base_ref.is_empty() {
+        config.base_branch.as_str()
+    } else {
+        workspace.base_ref.as_str()
+    };
+
+    let base_commit = git_output_line(
+        &workspace.path,
+        ["rev-parse", base_ref],
+        "rev-parse base ref",
+    )?;
+
+    let files_output = git_output(
+        &workspace.path,
+        ["ls-tree", "-r", "--name-only", base_ref],
+        "ls-tree base branch",
+    )?;
+
+    let file_paths: Vec<PathBuf> = files_output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let file_set: HashSet<PathBuf> = file_paths.iter().cloned().collect();
+
+    let registry = LanguageRegistry::with_defaults();
+    let mut graph = ImportGraph::new();
+    let max_file_size_bytes = config.max_file_size_kb.saturating_mul(1024);
+
+    for file_path in file_paths {
+        let Some(analyzer) = registry.analyzer_for_file(file_path.as_path()) else {
+            continue;
+        };
+
+        let show_spec = format!("{base_ref}:{}", file_path.to_string_lossy());
+        let content = match git_output_bytes(
+            &workspace.path,
+            ["show", show_spec.as_str()],
+            "show base file",
+        ) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                debug!(
+                    path = %file_path.display(),
+                    error = %err,
+                    "skipping file while building base graph"
+                );
+                continue;
+            }
+        };
+
+        if content.len() as u64 > max_file_size_bytes {
+            debug!(
+                path = %file_path.display(),
+                size = content.len(),
+                max = max_file_size_bytes,
+                "skipping oversized file while building base graph"
+            );
+            continue;
+        }
+
+        let exports = analyzer.extract_exports(&content).unwrap_or_default();
+        graph.set_exports(file_path.clone(), exports);
+
+        let imports = analyzer.extract_imports(&content).unwrap_or_default();
+        for import in imports {
+            if let Some(target_path) = resolve_import_target(
+                file_path.as_path(),
+                &import.source,
+                &file_set,
+                analyzer.file_extensions(),
+            ) {
+                graph.add_import(file_path.clone(), target_path, import.symbols);
+            }
+        }
+    }
+
+    Ok((graph, base_commit))
+}
+
+fn resolve_import_target(
+    importer: &Path,
+    source: &str,
+    file_set: &HashSet<PathBuf>,
+    importer_extensions: &[&str],
+) -> Option<PathBuf> {
+    if source.is_empty() {
+        return None;
+    }
+
+    // Dependency overlap tracking is currently path-based; resolve local imports.
+    if !source.starts_with("./") && !source.starts_with("../") {
+        return None;
+    }
+
+    let importer_dir = importer.parent().unwrap_or(Path::new(""));
+    let base_candidate = normalize_relative_path(importer_dir.join(source));
+
+    if file_set.contains(&base_candidate) {
+        return Some(base_candidate);
+    }
+
+    if base_candidate.extension().is_some() {
+        return None;
+    }
+
+    for ext in importer_extensions {
+        let with_extension = base_candidate.with_extension(ext);
+        if file_set.contains(&with_extension) {
+            return Some(with_extension);
+        }
+    }
+
+    for ext in importer_extensions {
+        let index_path = base_candidate.join(format!("index.{ext}"));
+        if file_set.contains(&index_path) {
+            return Some(index_path);
+        }
+    }
+
+    None
+}
+
+fn normalize_relative_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
 }
 
 fn extract_changeset(
@@ -472,6 +624,19 @@ pub(crate) fn git_output<const N: usize>(
     args: [&str; N],
     context: &'static str,
 ) -> Result<String, WorkerError> {
+    let output = git_output_bytes(repo_path, args, context)?;
+    String::from_utf8(output).map_err(|source| WorkerError::InvalidUtf8 {
+        context,
+        repo_path: repo_path.to_path_buf(),
+        source,
+    })
+}
+
+pub(crate) fn git_output_bytes<const N: usize>(
+    repo_path: &Path,
+    args: [&str; N],
+    context: &'static str,
+) -> Result<Vec<u8>, WorkerError> {
     let output = Command::new("git")
         .current_dir(repo_path)
         .args(args)
@@ -490,11 +655,7 @@ pub(crate) fn git_output<const N: usize>(
         });
     }
 
-    String::from_utf8(output.stdout).map_err(|source| WorkerError::InvalidUtf8 {
-        context,
-        repo_path: repo_path.to_path_buf(),
-        source,
-    })
+    Ok(output.stdout)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -752,6 +913,48 @@ mod tests {
             file.hunks.len() >= 2,
             "should have hunks for both committed and uncommitted changes, got {}",
             file.hunks.len()
+        );
+    }
+
+    #[test]
+    fn build_base_graph_from_workspace_resolves_relative_imports() {
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "grove@example.com"]);
+        run_git(&repo, &["config", "user.name", "Grove Tests"]);
+
+        write_file(
+            &repo.join("src/shared.ts"),
+            "export function authenticate(token: string): boolean { return token.length > 0; }\n",
+        );
+        write_file(
+            &repo.join("src/api.ts"),
+            "import { authenticate } from \"./shared\";\nexport function checkout(token: string): boolean { return authenticate(token); }\n",
+        );
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        let ws = make_workspace(repo.clone(), "main");
+        let config = GroveConfig {
+            base_branch: "main".to_string(),
+            ..GroveConfig::default()
+        };
+
+        let (graph, base_commit) =
+            build_base_graph_from_workspace(&config, &ws).expect("base graph build should pass");
+
+        assert!(
+            !base_commit.is_empty(),
+            "base commit should be resolved when graph builds"
+        );
+        assert!(
+            graph
+                .get_dependents(&PathBuf::from("src/shared.ts"))
+                .contains(&&PathBuf::from("src/api.ts")),
+            "shared.ts should have api.ts as a dependent"
         );
     }
 }

@@ -18,6 +18,11 @@ impl ImportGraph {
         Self::default()
     }
 
+    /// Returns true if the graph contains no data.
+    pub fn is_empty(&self) -> bool {
+        self.imports.is_empty() && self.dependents.is_empty() && self.exports.is_empty()
+    }
+
     /// Add a resolved import relationship.
     pub fn add_import(
         &mut self,
