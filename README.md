@@ -4,6 +4,8 @@ Cross-worktree conflict intelligence for git. Detects file, hunk, symbol, depend
 
 Grove watches your git worktrees, continuously analyzes pairwise overlaps, and tells you which branches will conflict before you attempt to merge. Perfect for your multi-agents working in parallel worktrees ;)
 
+![Grove TUI dashboard](assets/demo.png)
+
 ## Why
 
 When multiple people (or agents) work in parallel branches, merge conflicts are discovered too late — at merge time. Grove shifts conflict detection left by analyzing worktree diffs against a shared base and scoring how likely they are to collide.
