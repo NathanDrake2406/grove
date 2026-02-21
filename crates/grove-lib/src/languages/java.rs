@@ -59,6 +59,156 @@ impl JavaAnalyzer {
     }
 }
 
+fn get_signature_line(source: &[u8], start: usize) -> String {
+    let slice = &source[start..];
+    let text = String::from_utf8_lossy(slice);
+    text.lines().next().unwrap_or("").to_string()
+}
+
+fn collect_symbols(node: tree_sitter::Node<'_>, source: &[u8], symbols: &mut Vec<Symbol>) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "class_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Class,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_symbols(body, source, symbols);
+                }
+            }
+            "interface_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Interface,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_symbols(body, source, symbols);
+                }
+            }
+            "enum_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Enum,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_symbols(body, source, symbols);
+                }
+            }
+            "record_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Class,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_symbols(body, source, symbols);
+                }
+            }
+            "annotation_type_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Interface,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
+                }
+            }
+            "method_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Method,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: Some(get_signature_line(source, child.start_byte())),
+                    });
+                }
+            }
+            "constructor_declaration" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    symbols.push(Symbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Method,
+                        range: LineRange {
+                            start: child.start_position().row as u32 + 1,
+                            end: child.end_position().row as u32 + 1,
+                        },
+                        signature: Some(get_signature_line(source, child.start_byte())),
+                    });
+                }
+            }
+            "field_declaration" | "constant_declaration" => {
+                extract_field_names(child, source, symbols);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_field_names(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    symbols: &mut Vec<Symbol>,
+) {
+    let kind = if node.kind() == "constant_declaration" {
+        SymbolKind::Constant
+    } else {
+        SymbolKind::Variable
+    };
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "variable_declarator" {
+            if let Some(name) = child.child_by_field_name("name") {
+                symbols.push(Symbol {
+                    name: name.utf8_text(source).unwrap_or("").to_string(),
+                    kind,
+                    range: LineRange {
+                        start: node.start_position().row as u32 + 1,
+                        end: node.end_position().row as u32 + 1,
+                    },
+                    signature: None,
+                });
+            }
+        }
+    }
+}
+
 impl LanguageAnalyzer for JavaAnalyzer {
     fn language_id(&self) -> &str {
         "java"
@@ -68,8 +218,12 @@ impl LanguageAnalyzer for JavaAnalyzer {
         &["java"]
     }
 
-    fn extract_symbols(&self, _source: &[u8]) -> Result<Vec<Symbol>, AnalysisError> {
-        Ok(vec![]) // stub — tests will fail
+    fn extract_symbols(&self, source: &[u8]) -> Result<Vec<Symbol>, AnalysisError> {
+        let tree = self.parse(source)?;
+        let root = tree.root_node();
+        let mut symbols = Vec::new();
+        collect_symbols(root, source, &mut symbols);
+        Ok(symbols)
     }
 
     fn extract_imports(&self, _source: &[u8]) -> Result<Vec<Import>, AnalysisError> {
