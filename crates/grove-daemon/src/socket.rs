@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
-use crate::state::{QueryRequest, QueryResponse, StateMessage};
+use crate::state::{DaemonEvent, QueryRequest, QueryResponse, StateMessage};
 
 #[cfg(test)]
 use futures::{SinkExt, StreamExt};
@@ -92,6 +92,7 @@ impl SocketResponse {
 #[derive(Debug)]
 enum ParsedRequest {
     Query(QueryRequest),
+    Subscribe,
     SyncWorktrees { desired: Vec<grove_lib::Workspace> },
 }
 
@@ -146,6 +147,7 @@ fn parse_request(request: &SocketRequest) -> Result<ParsedRequest, String> {
                 timeout_ms,
             }))
         }
+        "subscribe" => Ok(ParsedRequest::Subscribe),
         "sync_worktrees" => {
             let worktrees = request
                 .params
@@ -249,6 +251,7 @@ fn query_response_to_socket(response: QueryResponse) -> SocketResponse {
 pub struct SocketServer {
     path: PathBuf,
     state_tx: mpsc::Sender<StateMessage>,
+    event_tx: broadcast::Sender<DaemonEvent>,
     shutdown_trigger: Option<broadcast::Sender<()>>,
     shutdown_token: Option<String>,
     idle_connection_timeout: Duration,
@@ -256,10 +259,15 @@ pub struct SocketServer {
 }
 
 impl SocketServer {
-    pub fn new(path: impl Into<PathBuf>, state_tx: mpsc::Sender<StateMessage>) -> Self {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        state_tx: mpsc::Sender<StateMessage>,
+        event_tx: broadcast::Sender<DaemonEvent>,
+    ) -> Self {
         Self {
             path: path.into(),
             state_tx,
+            event_tx,
             shutdown_trigger: None,
             shutdown_token: None,
             idle_connection_timeout: DEFAULT_IDLE_CONNECTION_TIMEOUT,
@@ -324,6 +332,7 @@ impl SocketServer {
                         Ok((stream, _addr)) => {
                             debug!("accepted new connection");
                             let state_tx = self.state_tx.clone();
+                            let event_tx = self.event_tx.clone();
                             let shutdown_trigger = self.shutdown_trigger.clone();
                             let shutdown_token = self.shutdown_token.clone();
                             let idle_connection_timeout = self.idle_connection_timeout;
@@ -333,6 +342,7 @@ impl SocketServer {
                                     handle_connection(
                                         stream,
                                         state_tx,
+                                        event_tx,
                                         shutdown_trigger,
                                         shutdown_token,
                                         idle_connection_timeout,
@@ -419,6 +429,7 @@ impl SocketServer {
 async fn handle_connection(
     stream: UnixStream,
     state_tx: mpsc::Sender<StateMessage>,
+    event_tx: broadcast::Sender<DaemonEvent>,
     shutdown_trigger: Option<broadcast::Sender<()>>,
     shutdown_token: Option<String>,
     idle_connection_timeout: Duration,
@@ -426,46 +437,37 @@ async fn handle_connection(
 ) -> Result<(), SocketError> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut pending_line: Option<String> = None;
 
     loop {
-        let frame = match timeout(
-            idle_connection_timeout,
-            read_next_line_frame(&mut reader, MAX_NDJSON_LINE_BYTES),
-        )
-        .await
-        {
-            Ok(frame_result) => frame_result?,
-            Err(_) => {
-                debug!(
-                    timeout_ms = idle_connection_timeout.as_millis(),
-                    "closing idle socket connection"
-                );
-                break;
-            }
-        };
+        let line = match pending_line.take() {
+            Some(line) => line,
+            None => {
+                let client_line =
+                    match timeout(idle_connection_timeout, read_client_line(&mut reader)).await {
+                        Ok(line_result) => line_result?,
+                        Err(_) => {
+                            debug!(
+                                timeout_ms = idle_connection_timeout.as_millis(),
+                                "closing idle socket connection"
+                            );
+                            break;
+                        }
+                    };
 
-        let line_bytes = match frame {
-            ReadLineFrame::Line(line) => line,
-            ReadLineFrame::ProtocolError(message) => {
-                let response = SocketResponse::error(format!("protocol error: {message}"));
-                if let Err(send_err) = write_response_line(&mut write_half, &response).await {
-                    debug!(error = %send_err, "failed to send error response");
-                    break;
+                match client_line {
+                    ClientLine::Line(line) => line,
+                    ClientLine::ProtocolError(message) => {
+                        let response = SocketResponse::error(format!("protocol error: {message}"));
+                        if let Err(send_err) = write_response_line(&mut write_half, &response).await
+                        {
+                            debug!(error = %send_err, "failed to send error response");
+                            break;
+                        }
+                        continue;
+                    }
+                    ClientLine::Eof => break,
                 }
-                continue;
-            }
-            ReadLineFrame::Eof => break,
-        };
-
-        let line = match std::str::from_utf8(trim_line_ending(&line_bytes)) {
-            Ok(line) => line,
-            Err(e) => {
-                let response = SocketResponse::error(format!("protocol error: invalid UTF-8: {e}"));
-                if let Err(send_err) = write_response_line(&mut write_half, &response).await {
-                    debug!(error = %send_err, "failed to send UTF-8 protocol error response");
-                    break;
-                }
-                continue;
             }
         };
 
@@ -474,7 +476,7 @@ async fn handle_connection(
         }
 
         let outcome = handle_request_with_options(
-            line,
+            &line,
             &state_tx,
             shutdown_trigger.as_ref(),
             shutdown_token.as_deref(),
@@ -488,10 +490,115 @@ async fn handle_connection(
         if outcome.close_connection {
             break;
         }
+        if outcome.enter_streaming {
+            let stream_exit = stream_events_until_client_activity(
+                &mut reader,
+                &mut write_half,
+                &event_tx,
+                idle_connection_timeout,
+            )
+            .await?;
+            match stream_exit {
+                StreamingExit::ClientLine(line) => {
+                    if !line.trim().is_empty() {
+                        pending_line = Some(line);
+                    }
+                }
+                StreamingExit::ProtocolError(message) => {
+                    let response = SocketResponse::error(format!("protocol error: {message}"));
+                    if let Err(send_err) = write_response_line(&mut write_half, &response).await {
+                        debug!(
+                            error = %send_err,
+                            "failed to send protocol error while leaving streaming mode"
+                        );
+                        break;
+                    }
+                }
+                StreamingExit::ClientDisconnected => break,
+                StreamingExit::IdleTimeout => {}
+                StreamingExit::EventChannelClosed => {}
+            }
+        }
     }
 
     debug!("connection closed");
     Ok(())
+}
+
+#[derive(Debug)]
+enum ClientLine {
+    Line(String),
+    ProtocolError(String),
+    Eof,
+}
+
+async fn read_client_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+) -> Result<ClientLine, std::io::Error> {
+    let frame = read_next_line_frame(reader, MAX_NDJSON_LINE_BYTES).await?;
+    match frame {
+        ReadLineFrame::Line(line) => match std::str::from_utf8(trim_line_ending(&line)) {
+            Ok(line) => Ok(ClientLine::Line(line.to_string())),
+            Err(e) => Ok(ClientLine::ProtocolError(format!("invalid UTF-8: {e}"))),
+        },
+        ReadLineFrame::ProtocolError(message) => Ok(ClientLine::ProtocolError(message)),
+        ReadLineFrame::Eof => Ok(ClientLine::Eof),
+    }
+}
+
+#[derive(Debug)]
+enum StreamingExit {
+    ClientLine(String),
+    ProtocolError(String),
+    ClientDisconnected,
+    IdleTimeout,
+    EventChannelClosed,
+}
+
+async fn stream_events_until_client_activity(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    writer: &mut OwnedWriteHalf,
+    event_tx: &broadcast::Sender<DaemonEvent>,
+    idle_connection_timeout: Duration,
+) -> Result<StreamingExit, SocketError> {
+    let mut event_rx = event_tx.subscribe();
+
+    loop {
+        tokio::select! {
+            event_result = event_rx.recv() => {
+                match event_result {
+                    Ok(event) => {
+                        if let Err(e) = write_event_line(writer, &event).await {
+                            debug!(error = %e, "failed to send daemon event");
+                            return Ok(StreamingExit::ClientDisconnected);
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!(skipped, "subscriber lagged behind daemon events");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        debug!("daemon event channel closed");
+                        return Ok(StreamingExit::EventChannelClosed);
+                    }
+                }
+            }
+            line_result = read_client_line(reader) => {
+                let client_line = line_result?;
+                match client_line {
+                    ClientLine::Line(line) => return Ok(StreamingExit::ClientLine(line)),
+                    ClientLine::ProtocolError(message) => return Ok(StreamingExit::ProtocolError(message)),
+                    ClientLine::Eof => return Ok(StreamingExit::ClientDisconnected),
+                }
+            }
+            _ = tokio::time::sleep(idle_connection_timeout) => {
+                debug!(
+                    timeout_ms = idle_connection_timeout.as_millis(),
+                    "closing streaming mode due to idle timeout"
+                );
+                return Ok(StreamingExit::IdleTimeout);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -566,6 +673,16 @@ async fn write_response_line(
     Ok(())
 }
 
+async fn write_event_line(
+    writer: &mut OwnedWriteHalf,
+    event: &DaemonEvent,
+) -> Result<(), SocketError> {
+    let mut event_json = serde_json::to_vec(event)?;
+    event_json.push(b'\n');
+    writer.write_all(&event_json).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 async fn handle_request(line: &str, state_tx: &mpsc::Sender<StateMessage>) -> SocketResponse {
     handle_request_with_options(line, state_tx, None, None, DEFAULT_STATE_REPLY_TIMEOUT)
@@ -576,6 +693,7 @@ async fn handle_request(line: &str, state_tx: &mpsc::Sender<StateMessage>) -> So
 struct RequestOutcome {
     response: SocketResponse,
     close_connection: bool,
+    enter_streaming: bool,
 }
 
 async fn handle_request_with_options(
@@ -592,6 +710,7 @@ async fn handle_request_with_options(
             return RequestOutcome {
                 response: SocketResponse::error(format!("invalid JSON: {e}")),
                 close_connection: false,
+                enter_streaming: false,
             };
         }
     };
@@ -605,6 +724,7 @@ async fn handle_request_with_options(
                 return RequestOutcome {
                     response: SocketResponse::error("unauthorized shutdown request"),
                     close_connection: false,
+                    enter_streaming: false,
                 };
             }
         }
@@ -618,12 +738,14 @@ async fn handle_request_with_options(
                     "status": "shutting_down"
                 })),
                 close_connection: true,
+                enter_streaming: false,
             };
         }
 
         return RequestOutcome {
             response: SocketResponse::error("shutdown unavailable"),
             close_connection: false,
+            enter_streaming: false,
         };
     }
 
@@ -633,11 +755,12 @@ async fn handle_request_with_options(
             return RequestOutcome {
                 response: SocketResponse::error(e),
                 close_connection: false,
+                enter_streaming: false,
             };
         }
     };
 
-    let response = match parsed {
+    let (response, enter_streaming) = match parsed {
         ParsedRequest::Query(query) => match query {
             QueryRequest::AwaitAnalysis { timeout_ms } => {
                 let (reply_tx, reply_rx) = oneshot::channel();
@@ -650,16 +773,17 @@ async fn handle_request_with_options(
                     return RequestOutcome {
                         response: SocketResponse::error("daemon state unavailable"),
                         close_connection: false,
+                        enter_streaming: false,
                     };
                 }
 
                 match timeout(Duration::from_millis(timeout_ms), reply_rx).await {
-                    Ok(Ok(response)) => query_response_to_socket(response),
-                    Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
+                    Ok(Ok(response)) => (query_response_to_socket(response), false),
+                    Ok(Err(_)) => (SocketResponse::error("state actor did not respond"), false),
                     Err(_) => {
                         let timeout_response =
                             await_analysis_timeout_response(state_tx, state_reply_timeout).await;
-                        query_response_to_socket(timeout_response)
+                        (query_response_to_socket(timeout_response), false)
                     }
                 }
             }
@@ -678,16 +802,26 @@ async fn handle_request_with_options(
                     return RequestOutcome {
                         response: SocketResponse::error("daemon state unavailable"),
                         close_connection: false,
+                        enter_streaming: false,
                     };
                 }
 
                 match timeout(state_reply_timeout, reply_rx).await {
-                    Ok(Ok(response)) => query_response_to_socket(response),
-                    Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
-                    Err(_) => SocketResponse::error("state actor response timed out"),
+                    Ok(Ok(response)) => (query_response_to_socket(response), false),
+                    Ok(Err(_)) => (SocketResponse::error("state actor did not respond"), false),
+                    Err(_) => (
+                        SocketResponse::error("state actor response timed out"),
+                        false,
+                    ),
                 }
             }
         },
+        ParsedRequest::Subscribe => (
+            SocketResponse::success(serde_json::json!({
+                "subscribed": true
+            })),
+            true,
+        ),
         ParsedRequest::SyncWorktrees { desired } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             let message = StateMessage::SyncWorktrees {
@@ -699,6 +833,7 @@ async fn handle_request_with_options(
                 return RequestOutcome {
                     response: SocketResponse::error("daemon state unavailable"),
                     close_connection: false,
+                    enter_streaming: false,
                 };
             }
 
@@ -724,19 +859,26 @@ async fn handle_request_with_options(
                                     "serialization error: {e}"
                                 )),
                                 close_connection: false,
+                                enter_streaming: false,
                             };
                         }
                     };
-                    SocketResponse::success(serde_json::json!({
-                        "added": added,
-                        "removed": removed,
-                        "unchanged": unchanged,
-                        "workspaces": workspaces,
-                    }))
+                    (
+                        SocketResponse::success(serde_json::json!({
+                            "added": added,
+                            "removed": removed,
+                            "unchanged": unchanged,
+                            "workspaces": workspaces,
+                        })),
+                        false,
+                    )
                 }
-                Ok(Ok(Err(e))) => SocketResponse::error(e),
-                Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
-                Err(_) => SocketResponse::error("state actor response timed out"),
+                Ok(Ok(Err(e))) => (SocketResponse::error(e), false),
+                Ok(Err(_)) => (SocketResponse::error("state actor did not respond"), false),
+                Err(_) => (
+                    SocketResponse::error("state actor response timed out"),
+                    false,
+                ),
             }
         }
     };
@@ -744,6 +886,7 @@ async fn handle_request_with_options(
     RequestOutcome {
         response,
         close_connection: false,
+        enter_streaming,
     }
 }
 
@@ -844,9 +987,9 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         let mut ready = false;
@@ -895,9 +1038,9 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone())
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone())
             .with_shutdown_trigger(shutdown_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
@@ -1055,6 +1198,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_subscribe_request() {
+        let req = SocketRequest {
+            method: "subscribe".to_string(),
+            params: serde_json::json!({}),
+        };
+        let result = parse_request(&req);
+        assert!(matches!(result, Ok(ParsedRequest::Subscribe)));
+    }
+
+    #[test]
     fn parse_sync_worktrees_request() {
         let req = SocketRequest {
             method: "sync_worktrees".to_string(),
@@ -1154,10 +1307,10 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         // Wait briefly for the server to start listening
@@ -1194,10 +1347,10 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1228,10 +1381,10 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1262,10 +1415,10 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1301,10 +1454,10 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1339,6 +1492,184 @@ mod tests {
         let resp3 = framed.next().await.unwrap().unwrap();
         let resp3: serde_json::Value = serde_json::from_str(&resp3).unwrap();
         assert_eq!(resp3["ok"], true);
+
+        drop(shutdown_tx);
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        let _ = server_handle.await;
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_receives_emitted_events() {
+        let (_dir, socket_path, state_tx, state_handle, shutdown_tx, server_handle) =
+            start_test_server().await;
+
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let codec = LinesCodec::new_with_max_length(1_048_576);
+        let mut framed = Framed::new(stream, codec);
+
+        framed
+            .send(r#"{"method":"subscribe","params":{}}"#.to_string())
+            .await
+            .unwrap();
+
+        let ack_line = framed.next().await.unwrap().unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&ack_line).unwrap();
+        assert_eq!(ack["ok"], true);
+        assert_eq!(ack["data"]["subscribed"], true);
+
+        let workspace = make_workspace("subscribed-workspace");
+        let workspace_id = workspace.id;
+        let branch = workspace.branch.clone();
+        let name = workspace.name.clone();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state_tx
+            .send(StateMessage::RegisterWorkspace {
+                workspace,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        let event_line = tokio::time::timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("expected workspace_added event")
+            .expect("stream should remain open")
+            .expect("expected event line");
+        let event: serde_json::Value = serde_json::from_str(&event_line).unwrap();
+        assert_eq!(event["event"], "workspace_added");
+        assert_eq!(event["data"]["workspace_id"], workspace_id.to_string());
+        assert_eq!(event["data"]["name"], name);
+        assert_eq!(event["data"]["branch"], branch);
+
+        drop(shutdown_tx);
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        let _ = server_handle.await;
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disconnect_after_subscribe_does_not_panic() {
+        let (_dir, socket_path, state_tx, state_handle, shutdown_tx, server_handle) =
+            start_test_server().await;
+
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let codec = LinesCodec::new_with_max_length(1_048_576);
+        let mut framed = Framed::new(stream, codec);
+        framed
+            .send(r#"{"method":"subscribe","params":{}}"#.to_string())
+            .await
+            .unwrap();
+        let _ack = framed.next().await.unwrap().unwrap();
+        drop(framed);
+
+        // Server should stay healthy after subscriber disconnect.
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let codec = LinesCodec::new_with_max_length(1_048_576);
+        let mut framed = Framed::new(stream, codec);
+        framed
+            .send(r#"{"method":"status","params":{}}"#.to_string())
+            .await
+            .unwrap();
+        let status_line = framed.next().await.unwrap().unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status_line).unwrap();
+        assert_eq!(status["ok"], true);
+
+        drop(shutdown_tx);
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        let _ = server_handle.await;
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn two_subscribers_receive_same_event() {
+        let (_dir, socket_path, state_tx, state_handle, shutdown_tx, server_handle) =
+            start_test_server().await;
+
+        let stream_a = UnixStream::connect(&socket_path).await.unwrap();
+        let stream_b = UnixStream::connect(&socket_path).await.unwrap();
+        let codec_a = LinesCodec::new_with_max_length(1_048_576);
+        let codec_b = LinesCodec::new_with_max_length(1_048_576);
+        let mut sub_a = Framed::new(stream_a, codec_a);
+        let mut sub_b = Framed::new(stream_b, codec_b);
+
+        sub_a
+            .send(r#"{"method":"subscribe","params":{}}"#.to_string())
+            .await
+            .unwrap();
+        sub_b
+            .send(r#"{"method":"subscribe","params":{}}"#.to_string())
+            .await
+            .unwrap();
+        let _ = sub_a.next().await.unwrap().unwrap();
+        let _ = sub_b.next().await.unwrap().unwrap();
+
+        let workspace = make_workspace("shared-event");
+        let workspace_id = workspace.id;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        state_tx
+            .send(StateMessage::RegisterWorkspace {
+                workspace,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        let event_a_line = tokio::time::timeout(Duration::from_secs(1), sub_a.next())
+            .await
+            .expect("subscriber A should receive event")
+            .expect("subscriber A stream should stay open")
+            .expect("subscriber A expected event line");
+        let event_b_line = tokio::time::timeout(Duration::from_secs(1), sub_b.next())
+            .await
+            .expect("subscriber B should receive event")
+            .expect("subscriber B stream should stay open")
+            .expect("subscriber B expected event line");
+        let event_a: serde_json::Value = serde_json::from_str(&event_a_line).unwrap();
+        let event_b: serde_json::Value = serde_json::from_str(&event_b_line).unwrap();
+        assert_eq!(event_a["event"], "workspace_added");
+        assert_eq!(event_b["event"], "workspace_added");
+        assert_eq!(event_a["data"]["workspace_id"], workspace_id.to_string());
+        assert_eq!(event_b["data"]["workspace_id"], workspace_id.to_string());
+
+        drop(shutdown_tx);
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        let _ = server_handle.await;
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscribe_mode_exits_on_request_and_processes_next_request_normally() {
+        let (_dir, socket_path, state_tx, state_handle, shutdown_tx, server_handle) =
+            start_test_server().await;
+
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let codec = LinesCodec::new_with_max_length(1_048_576);
+        let mut framed = Framed::new(stream, codec);
+
+        framed
+            .send(r#"{"method":"subscribe","params":{}}"#.to_string())
+            .await
+            .unwrap();
+        let ack_line = framed.next().await.unwrap().unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&ack_line).unwrap();
+        assert_eq!(ack["ok"], true);
+        assert_eq!(ack["data"]["subscribed"], true);
+
+        framed
+            .send(r#"{"method":"status","params":{}}"#.to_string())
+            .await
+            .unwrap();
+        let status_line = tokio::time::timeout(Duration::from_secs(1), framed.next())
+            .await
+            .expect("expected status response after exiting subscribe mode")
+            .expect("stream should stay open")
+            .expect("expected response line");
+        let status: serde_json::Value = serde_json::from_str(&status_line).unwrap();
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["data"]["workspace_count"], 0);
 
         drop(shutdown_tx);
         state_tx.send(StateMessage::Shutdown).await.unwrap();
@@ -1391,9 +1722,9 @@ mod tests {
         let dir = short_temp_dir();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         // Trigger shutdown immediately after spawn to hit startup/shutdown race windows.
@@ -1483,9 +1814,11 @@ mod tests {
             "first server should remove socket path before restart"
         );
 
-        let (state_tx_2, state_handle_2) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx_2, event_tx_2, state_handle_2) =
+            spawn_state_actor(GroveConfig::default(), None);
         let (shutdown_tx_2, shutdown_rx_2) = tokio::sync::broadcast::channel(1);
-        let server_2 = SocketServer::new(socket_path.clone(), state_tx_2.clone());
+        let server_2 =
+            SocketServer::new(socket_path.clone(), state_tx_2.clone(), event_tx_2.clone());
         let server_handle_2 = tokio::spawn(async move { server_2.run(shutdown_rx_2).await });
 
         let mut ready = false;
@@ -1976,7 +2309,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_await_analysis_timeout_returns_completed_false_with_counts() {
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws_a = make_workspace("await-timeout-a");
         let ws_b = make_workspace("await-timeout-b");
         let id_a = ws_a.id;
@@ -2056,7 +2389,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_await_analysis_returns_completed_true_after_completion() {
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws_a = make_workspace("await-complete-a");
         let ws_b = make_workspace("await-complete-b");
         let id_a = ws_a.id;
@@ -2188,7 +2521,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_sequence_survives_malformed_json_between_valid_requests() {
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let first = handle_request(r#"{"method":"status","params":{}}"#, &state_tx).await;
         assert!(first.ok);
@@ -2214,7 +2547,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_request_returns_state_unavailable_after_shutdown() {
-        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (state_tx, _event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let warmup = handle_request(r#"{"method":"status","params":{}}"#, &state_tx).await;
         assert!(warmup.ok);
