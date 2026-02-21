@@ -1626,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "grove"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1644,7 +1644,7 @@ dependencies = [
 
 [[package]]
 name = "grove-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "colored",
@@ -1662,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "grove-daemon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "futures",
@@ -1686,7 +1686,7 @@ dependencies = [
 
 [[package]]
 name = "grove-lib"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "chrono",
