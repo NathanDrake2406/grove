@@ -104,7 +104,7 @@ async fn run_inner(
     info!(db_path = %paths.db_file.display(), "database opened");
 
     // Start state actor
-    let (state_tx, state_handle) = state::spawn_state_actor(config.clone(), Some(db));
+    let (state_tx, event_tx, state_handle) = state::spawn_state_actor(config.clone(), Some(db));
     info!("state actor started");
 
     let worker_pool = spawn_worker_pool(config.clone(), state_tx.clone());
@@ -145,7 +145,7 @@ async fn run_inner(
     ));
 
     // Create and run socket server
-    let server = SocketServer::new(&paths.socket_file, state_tx.clone())
+    let server = SocketServer::new(&paths.socket_file, state_tx.clone(), event_tx.clone())
         .with_timeouts(
             Duration::from_millis(config.socket_idle_timeout_ms),
             Duration::from_millis(config.socket_state_reply_timeout_ms),
@@ -566,10 +566,10 @@ mod tests {
 
         // State actor starts
         let config = GroveConfig::default();
-        let (tx, handle) = spawn_state_actor(config, Some(db));
+        let (tx, event_tx, handle) = spawn_state_actor(config, Some(db));
 
         // Socket server constructs (don't run, just verify creation)
-        let _server = SocketServer::new(&paths.socket_file, tx.clone());
+        let _server = SocketServer::new(&paths.socket_file, tx.clone(), event_tx.clone());
 
         // Watcher debouncer constructs
         let _debouncer = Debouncer::new(WatcherConfig::default());

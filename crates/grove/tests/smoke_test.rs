@@ -39,10 +39,10 @@ impl TestDaemon {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("grove.sock");
 
-        let (state_tx, state_handle) = spawn_state_actor(config, None);
+        let (state_tx, event_tx, state_handle) = spawn_state_actor(config, None);
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
-        let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+        let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
         let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
         // Wait for socket to be ready
@@ -701,9 +701,9 @@ async fn startup_readiness_retry_loop_eventually_reaches_daemon() {
     let dir = tempfile::tempdir().unwrap();
     let socket_path = dir.path().join("grove.sock");
 
-    let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+    let (state_tx, event_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let server = SocketServer::new(socket_path.clone(), state_tx.clone());
+    let server = SocketServer::new(socket_path.clone(), state_tx.clone(), event_tx.clone());
     let server_handle = tokio::spawn(async move { server.run(shutdown_rx).await });
 
     // Simulate caller-side startup retries while the socket is still coming up.
