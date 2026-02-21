@@ -70,9 +70,75 @@ gr conflicts feat/auth feat/payments
 | `grove daemon start` | Start the background daemon |
 | `grove daemon stop` | Stop the daemon |
 | `grove daemon status` | Daemon health check |
+| `grove check` | Exit 0 if clean, exit 1 with conflict one-liners on stderr |
 | `grove init <shell>` | Emit shell integration (`zsh`, `bash`, `fish`) |
 
 All read commands accept `--json` for machine-readable output.
+
+## Claude Code hook
+
+Grove integrates with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via a post-tool hook that runs `grove check` after every file edit. When a conflict is detected, Claude sees the warning in its tool output and can course-correct before the problem compounds.
+
+Add this to your project's `.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grove check 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+After any file edit, Claude will see output like:
+
+```
+[Red] feat/payments: processPayment() in src/shared.ts (+2 more)
+[Yellow] feat/auth: 3 shared file(s)
+```
+
+Or silence when clean (exit 0, no output).
+
+### How it works
+
+1. Claude edits a file via `Edit`, `Write`, or `MultiEdit`
+2. The hook runs `grove check` in the current worktree
+3. If conflicts exist, `grove check` prints one-liners to stderr and exits 1
+4. The `|| true` ensures the hook never blocks Claude — conflicts are advisory
+5. Claude sees the conflict warnings and can adjust its approach
+
+### JSON mode for structured parsing
+
+For agents that prefer structured output, use `grove check --json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "grove check --json 2>&1 || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+This returns a JSON object with `workspace`, `clean`, and `conflicts` fields.
 
 ## Architecture
 
