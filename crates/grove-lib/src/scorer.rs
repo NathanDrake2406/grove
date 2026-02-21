@@ -94,6 +94,7 @@ pub fn score_pair(
 mod tests {
     use super::*;
     use chrono::{DateTime, Utc};
+    use serde::Deserialize;
     use std::path::PathBuf;
     use uuid::Uuid;
 
@@ -470,6 +471,105 @@ mod tests {
                 failures.push(format!(
                     "{case_name}: expected no symbol overlaps, got {:?}",
                     analysis.overlaps
+                ));
+            }
+        }
+
+        failures
+    }
+
+    fn overlap_kind(overlap: &Overlap) -> &'static str {
+        match overlap {
+            Overlap::File { .. } => "File",
+            Overlap::Hunk { .. } => "Hunk",
+            Overlap::Symbol { .. } => "Symbol",
+            Overlap::Dependency { .. } => "Dependency",
+            Overlap::Schema { .. } => "Schema",
+        }
+    }
+
+    fn default_true() -> bool {
+        true
+    }
+
+    fn default_expected_min_score() -> OrthogonalityScore {
+        OrthogonalityScore::Green
+    }
+
+    fn default_expected_max_score() -> OrthogonalityScore {
+        OrthogonalityScore::Yellow
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NonConflictFixtureCorpus {
+        scenarios: Vec<NonConflictFixtureScenario>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NonConflictFixtureScenario {
+        name: String,
+        a: WorkspaceChangeset,
+        b: WorkspaceChangeset,
+        #[serde(default)]
+        dependency_overlaps: Vec<Overlap>,
+        #[serde(default = "default_expected_min_score")]
+        expected_min_score: OrthogonalityScore,
+        #[serde(default = "default_expected_max_score")]
+        expected_max_score: OrthogonalityScore,
+        #[serde(default = "default_true")]
+        expect_no_symbol_overlap: bool,
+        #[serde(default = "default_true")]
+        expect_no_schema_overlap: bool,
+        #[serde(default)]
+        required_overlap_kinds: Vec<String>,
+        #[serde(default)]
+        forbidden_overlap_kinds: Vec<String>,
+    }
+
+    fn fixture_scenario_failures(scenario: NonConflictFixtureScenario) -> Vec<String> {
+        let analysis = score_pair(&scenario.a, &scenario.b, scenario.dependency_overlaps);
+        let mut failures = Vec::new();
+
+        if analysis.score < scenario.expected_min_score || analysis.score > scenario.expected_max_score
+        {
+            failures.push(format!(
+                "{}: expected score between {:?} and {:?}, got {:?} with overlaps {:?}",
+                scenario.name,
+                scenario.expected_min_score,
+                scenario.expected_max_score,
+                analysis.score,
+                analysis.overlaps
+            ));
+        }
+
+        let overlap_kinds: Vec<&'static str> = analysis.overlaps.iter().map(overlap_kind).collect();
+
+        if scenario.expect_no_symbol_overlap && overlap_kinds.contains(&"Symbol") {
+            failures.push(format!(
+                "{}: expected no Symbol overlap, got {:?}",
+                scenario.name, analysis.overlaps
+            ));
+        }
+        if scenario.expect_no_schema_overlap && overlap_kinds.contains(&"Schema") {
+            failures.push(format!(
+                "{}: expected no Schema overlap, got {:?}",
+                scenario.name, analysis.overlaps
+            ));
+        }
+
+        for required in &scenario.required_overlap_kinds {
+            if !overlap_kinds.iter().any(|kind| kind == required) {
+                failures.push(format!(
+                    "{}: missing required overlap kind {}, got kinds {:?}",
+                    scenario.name, required, overlap_kinds
+                ));
+            }
+        }
+        for forbidden in &scenario.forbidden_overlap_kinds {
+            if overlap_kinds.iter().any(|kind| kind == forbidden) {
+                failures.push(format!(
+                    "{}: found forbidden overlap kind {}, got overlaps {:?}",
+                    scenario.name, forbidden, analysis.overlaps
                 ));
             }
         }
@@ -1278,6 +1378,44 @@ mod tests {
         assert!(
             failures.is_empty(),
             "low-noise adversarial cases failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn fixture_non_conflicting_pairs_remain_low_noise() {
+        let corpus: NonConflictFixtureCorpus = serde_json::from_str(include_str!(
+            "../tests/fixtures/scorer_non_conflicting_pairs.json"
+        ))
+        .expect("non-conflicting fixture corpus should be valid json");
+
+        let mut failures = Vec::new();
+        for scenario in corpus.scenarios {
+            failures.extend(fixture_scenario_failures(scenario));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "non-conflicting fixture corpus failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    #[test]
+    fn fixture_conflicting_pairs_trigger_red_or_black() {
+        let corpus: NonConflictFixtureCorpus = serde_json::from_str(include_str!(
+            "../tests/fixtures/scorer_conflicting_pairs.json"
+        ))
+        .expect("conflicting fixture corpus should be valid json");
+
+        let mut failures = Vec::new();
+        for scenario in corpus.scenarios {
+            failures.extend(fixture_scenario_failures(scenario));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "conflicting fixture corpus failures:\n{}",
             failures.join("\n")
         );
     }
