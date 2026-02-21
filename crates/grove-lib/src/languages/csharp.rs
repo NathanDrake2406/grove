@@ -837,4 +837,309 @@ public class Service {
         assert!(names.contains(&"Name"));
         assert!(!names.contains(&"Helper"));
     }
+
+    // === Stress tests and edge cases ===
+
+    #[test]
+    fn empty_source_returns_empty_all_methods() {
+        let analyzer = CSharpAnalyzer::new();
+        assert!(analyzer.extract_symbols(b"").unwrap().is_empty());
+        assert!(analyzer.extract_imports(b"").unwrap().is_empty());
+        assert!(analyzer.extract_exports(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_source_recovers() {
+        let source = br#"
+public class ValidClass {}
+
+public class Broken {
+    void Missing(
+    public string Oops
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ValidClass" && s.kind == SymbolKind::Class)
+        );
+    }
+
+    #[test]
+    fn large_namespace_with_many_classes() {
+        let mut source = String::from("namespace Stress {\n");
+        for i in 0..100 {
+            source.push_str(&format!("    public class Class{i} {{}}\n"));
+        }
+        source.push_str("}\n");
+
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source.as_bytes()).unwrap();
+        let exports = analyzer.extract_exports(source.as_bytes()).unwrap();
+
+        for i in 0..100 {
+            let name = format!("Class{i}");
+            assert!(
+                symbols.iter().any(|s| s.name == name),
+                "symbol Class{i} not found"
+            );
+            assert!(
+                exports.iter().any(|e| e.name == name),
+                "export Class{i} not found"
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_namespaces() {
+        let source = br#"
+namespace A {
+    namespace B {
+        namespace C {
+            public class Deep {}
+        }
+    }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Deep" && s.kind == SymbolKind::Class)
+        );
+    }
+
+    #[test]
+    fn realistic_aspnet_controller() {
+        let source = br#"
+using Microsoft.AspNetCore.Mvc;
+using System.Threading.Tasks;
+using MyApp.Services;
+
+namespace MyApp.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class UsersController : ControllerBase
+    {
+        private readonly IUserService _userService;
+
+        public UsersController(IUserService userService)
+        {
+            _userService = userService;
+        }
+
+        [HttpGet]
+        public async Task<IActionResult> GetAll()
+        {
+            var users = await _userService.GetAllAsync();
+            return Ok(users);
+        }
+
+        [HttpPost]
+        public async Task<IActionResult> Create([FromBody] CreateUserDto dto)
+        {
+            var user = await _userService.CreateAsync(dto);
+            return CreatedAtAction(nameof(GetAll), user);
+        }
+
+        private void ValidateDto(CreateUserDto dto) { }
+    }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "UsersController" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "UsersController" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "GetAll" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "Create" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "ValidateDto" && s.kind == SymbolKind::Method));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "_userService" && s.kind == SymbolKind::Variable));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 3);
+        assert!(imports
+            .iter()
+            .any(|i| i.source == "Microsoft.AspNetCore.Mvc"));
+        assert!(imports
+            .iter()
+            .any(|i| i.source == "System.Threading.Tasks"));
+        assert!(imports.iter().any(|i| i.source == "MyApp.Services"));
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        let export_names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(export_names.contains(&"UsersController"));
+        assert!(export_names.contains(&"GetAll"));
+        assert!(export_names.contains(&"Create"));
+        assert!(!export_names.contains(&"ValidateDto"));
+    }
+
+    #[test]
+    fn generic_types_with_constraints() {
+        let source = br#"
+public class Repository<T> where T : class, IEntity
+{
+    public async Task<T> FindAsync<T>(int id)
+    {
+        return default;
+    }
+
+    public void AddRange<TItem>(IEnumerable<TItem> items) where TItem : T { }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Repository" && s.kind == SymbolKind::Class));
+        assert!(symbols.iter().any(|s| s.name == "FindAsync" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "AddRange" && s.kind == SymbolKind::Method));
+    }
+
+    #[test]
+    fn line_numbers_are_correct() {
+        let source = br#"using System;
+
+public class Main {
+    public void First() {}
+
+    public void Second() {}
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let first = symbols.iter().find(|s| s.name == "First").unwrap();
+        assert_eq!(first.range.start, 4);
+        let second = symbols.iter().find(|s| s.name == "Second").unwrap();
+        assert_eq!(second.range.start, 6);
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports[0].line, 1);
+    }
+
+    #[test]
+    fn parse_cache_returns_consistent_results() {
+        let source = br#"
+public class Cached {
+    public void Method() {}
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let first = analyzer.extract_symbols(source).unwrap();
+        let second = analyzer.extract_symbols(source).unwrap();
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.range, b.range);
+        }
+    }
+
+    #[test]
+    fn comments_do_not_produce_symbols() {
+        let source = br#"
+// public class NotAClass {}
+/* public interface NotAnInterface {} */
+/// <summary>
+/// public class AlsoNotAClass {}
+/// </summary>
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn partial_classes_and_interfaces() {
+        let source = br#"
+public partial class Foo {
+    public void PartA() {}
+}
+
+public partial class Foo {
+    public void PartB() {}
+}
+
+public partial interface IBar {
+    void DoSomething();
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let foo_classes: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.name == "Foo" && s.kind == SymbolKind::Class)
+            .collect();
+        assert_eq!(foo_classes.len(), 2, "both partial class declarations should be extracted");
+
+        assert!(symbols.iter().any(|s| s.name == "PartA" && s.kind == SymbolKind::Method));
+        assert!(symbols.iter().any(|s| s.name == "PartB" && s.kind == SymbolKind::Method));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "IBar" && s.kind == SymbolKind::Interface));
+    }
+
+    #[test]
+    fn records_and_init_properties() {
+        let source = br#"
+public record Person(string Name, int Age);
+
+public class Config {
+    public int Count { get; init; }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Person" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Config" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Count" && s.kind == SymbolKind::Variable));
+    }
+
+    #[test]
+    fn nullable_reference_types() {
+        let source = br#"
+public class NullableExample {
+    public string? Name { get; set; }
+    public List<int?> Numbers { get; set; }
+    public Nullable<DateTime> Timestamp { get; set; }
+
+    public string? GetNullable() { return null; }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "NullableExample" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Name" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Numbers" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Timestamp" && s.kind == SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "GetNullable" && s.kind == SymbolKind::Method));
+    }
 }

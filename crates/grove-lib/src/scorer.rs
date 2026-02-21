@@ -1117,4 +1117,176 @@ mod tests {
             }
         }
     }
+
+    // === Stress tests and edge cases ===
+
+    #[test]
+    fn hundred_files_per_workspace_all_overlapping() {
+        let files: Vec<FileChange> = (0..100)
+            .map(|i| FileChange {
+                path: PathBuf::from(format!("src/module_{i}.ts")),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                symbols_modified: vec![],
+                exports_changed: vec![],
+            })
+            .collect();
+
+        let a = make_changeset_with_id(Uuid::new_v4(), files.clone());
+        let b = make_changeset_with_id(Uuid::new_v4(), files);
+
+        let result = score_pair(&a, &b, vec![]);
+
+        let file_overlap_count = result
+            .overlaps
+            .iter()
+            .filter(|o| matches!(o, Overlap::File { .. }))
+            .count();
+        assert_eq!(file_overlap_count, 100);
+        assert!(result.score >= OrthogonalityScore::Yellow);
+    }
+
+    #[test]
+    fn many_symbols_same_file() {
+        let symbols_a: Vec<Symbol> = (0..50)
+            .map(|i| Symbol {
+                name: format!("sym_{i}"),
+                kind: SymbolKind::Function,
+                range: LineRange {
+                    start: i * 10,
+                    end: i * 10 + 5,
+                },
+                signature: None,
+            })
+            .collect();
+
+        let symbols_b: Vec<Symbol> = (0..50)
+            .map(|i| Symbol {
+                name: format!("sym_{i}"),
+                kind: SymbolKind::Method,
+                range: LineRange {
+                    start: i * 20,
+                    end: i * 20 + 8,
+                },
+                signature: None,
+            })
+            .collect();
+
+        let a = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![FileChange {
+                path: PathBuf::from("src/big_module.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                symbols_modified: symbols_a,
+                exports_changed: vec![],
+            }],
+        );
+        let b = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![FileChange {
+                path: PathBuf::from("src/big_module.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                symbols_modified: symbols_b,
+                exports_changed: vec![],
+            }],
+        );
+
+        let symbol_overlaps = compute_symbol_overlaps(&a, &b);
+        assert_eq!(symbol_overlaps.len(), 50);
+
+        for overlap in &symbol_overlaps {
+            let (path, _) = expect_symbol_overlap(overlap);
+            assert_eq!(path, &PathBuf::from("src/big_module.ts"));
+        }
+    }
+
+    #[test]
+    fn empty_changesets_score_green() {
+        let a = make_changeset_with_id(Uuid::new_v4(), vec![]);
+        let b = make_changeset_with_id(Uuid::new_v4(), vec![]);
+
+        let result = score_pair(&a, &b, vec![]);
+        assert_eq!(result.score, OrthogonalityScore::Green);
+        assert!(result.overlaps.is_empty());
+    }
+
+    #[test]
+    fn single_file_no_hunks_scores_yellow() {
+        let a = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![FileChange {
+                path: PathBuf::from("src/shared.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                symbols_modified: vec![],
+                exports_changed: vec![],
+            }],
+        );
+        let b = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![FileChange {
+                path: PathBuf::from("src/shared.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                symbols_modified: vec![],
+                exports_changed: vec![],
+            }],
+        );
+
+        let result = score_pair(&a, &b, vec![]);
+        assert_eq!(result.score, OrthogonalityScore::Yellow);
+    }
+
+    #[test]
+    fn score_is_deterministic() {
+        let a = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![FileChange {
+                path: PathBuf::from("src/shared.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![Hunk {
+                    old_start: 10,
+                    old_lines: 5,
+                    new_start: 10,
+                    new_lines: 5,
+                }],
+                symbols_modified: vec![Symbol {
+                    name: "handler".into(),
+                    kind: SymbolKind::Function,
+                    range: LineRange { start: 10, end: 14 },
+                    signature: None,
+                }],
+                exports_changed: vec![],
+            }],
+        );
+        let b = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![FileChange {
+                path: PathBuf::from("src/shared.ts"),
+                change_type: ChangeType::Modified,
+                hunks: vec![Hunk {
+                    old_start: 12,
+                    old_lines: 3,
+                    new_start: 12,
+                    new_lines: 3,
+                }],
+                symbols_modified: vec![Symbol {
+                    name: "handler".into(),
+                    kind: SymbolKind::Function,
+                    range: LineRange { start: 12, end: 14 },
+                    signature: None,
+                }],
+                exports_changed: vec![],
+            }],
+        );
+
+        let first = score_pair(&a, &b, vec![]);
+        let second = score_pair(&a, &b, vec![]);
+
+        assert_eq!(first.score, second.score);
+        assert_eq!(first.overlaps.len(), second.overlaps.len());
+        assert_eq!(first.merge_order_hint, second.merge_order_hint);
+    }
 }

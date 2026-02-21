@@ -1016,4 +1016,200 @@ def real_func():
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "real_func");
     }
+
+    // === Stress tests and edge cases ===
+
+    #[test]
+    fn large_module_with_many_functions() {
+        let mut source = String::new();
+        for i in 0..100 {
+            source.push_str(&format!("def func_{}(): pass\n", i));
+        }
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source.as_bytes()).unwrap();
+
+        let functions: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(functions.len(), 100);
+        for i in 0..100 {
+            assert!(
+                functions.iter().any(|s| s.name == format!("func_{}", i)),
+                "missing func_{}",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_classes() {
+        let source = b"class A:\n  class B:\n    class C:\n      def deep(self): pass\n";
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        // Top-level class A is extracted
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "A" && s.kind == SymbolKind::Class));
+        // Nested classes are not extracted by the current top-level-only walk,
+        // but the analyzer does not crash on deeply nested structures.
+    }
+
+    #[test]
+    fn realistic_fastapi_endpoint() {
+        let source = br#"from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+
+app = FastAPI()
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    age: Optional[int] = None
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+
+@app.post("/users", response_model=UserResponse)
+async def create_user(user: UserCreate) -> UserResponse:
+    if not user.name:
+        raise HTTPException(status_code=400, detail="Name required")
+    return UserResponse(id=1, name=user.name, email=user.email)
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: int) -> UserResponse:
+    return UserResponse(id=user_id, name="test", email="test@test.com")
+"#;
+        let analyzer = PythonAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"UserCreate"));
+        assert!(names.contains(&"UserResponse"));
+        assert!(names.contains(&"create_user"));
+        assert!(names.contains(&"get_user"));
+        assert!(names.contains(&"app"));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert!(imports.iter().any(|i| i.source == "fastapi"
+            && i.symbols.iter().any(|s| s.name == "FastAPI")
+            && i.symbols.iter().any(|s| s.name == "HTTPException")));
+        assert!(imports
+            .iter()
+            .any(|i| i.source == "pydantic" && i.symbols.iter().any(|s| s.name == "BaseModel")));
+        assert!(imports
+            .iter()
+            .any(|i| i.source == "typing" && i.symbols.iter().any(|s| s.name == "Optional")));
+    }
+
+    #[test]
+    fn async_generators_and_comprehensions() {
+        let source = br#"async def gen():
+    async for x in some_iter():
+        yield x
+
+def comprehensions():
+    squares = [x**2 for x in range(10)]
+    evens = {x for x in range(20) if x % 2 == 0}
+    mapping = {k: v for k, v in items()}
+    return squares, evens, mapping
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "gen" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "comprehensions" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn decorator_stacking() {
+        let source = br#"@auth_required
+@rate_limit(100)
+@cache(ttl=300)
+@log_calls
+def protected_endpoint(request):
+    return {"ok": True}
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "protected_endpoint");
+        assert_eq!(symbols[0].kind, SymbolKind::Function);
+        // Range starts at the first decorator
+        assert_eq!(symbols[0].range.start, 1);
+        assert!(symbols[0]
+            .signature
+            .as_ref()
+            .unwrap()
+            .contains("def protected_endpoint"));
+    }
+
+    #[test]
+    fn star_imports_and_relative_imports() {
+        let source = br#"from . import foo
+from ..bar import baz
+from ...deep.pkg import something
+from module import *
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 4);
+
+        // from . import foo
+        assert_eq!(imports[0].source, ".");
+        assert_eq!(imports[0].symbols[0].name, "foo");
+
+        // from ..bar import baz
+        assert_eq!(imports[1].source, "..bar");
+        assert_eq!(imports[1].symbols[0].name, "baz");
+
+        // from ...deep.pkg import something
+        assert_eq!(imports[2].source, "...deep.pkg");
+        assert_eq!(imports[2].symbols[0].name, "something");
+
+        // from module import *
+        assert_eq!(imports[3].source, "module");
+        assert_eq!(imports[3].symbols[0].name, "*");
+    }
+
+    #[test]
+    fn walrus_operator_and_match_statement() {
+        let source = br#"def uses_walrus(data):
+    if (n := len(data)) > 10:
+        return n
+    return 0
+
+def uses_match(command):
+    match command:
+        case "quit":
+            return False
+        case "help":
+            print("help text")
+        case _:
+            pass
+    return True
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "uses_walrus");
+        assert_eq!(symbols[0].kind, SymbolKind::Function);
+        assert_eq!(symbols[1].name, "uses_match");
+        assert_eq!(symbols[1].kind, SymbolKind::Function);
+
+        // Imports and exports also succeed without crashing
+        assert!(analyzer.extract_imports(source).unwrap().is_empty());
+        assert_eq!(analyzer.extract_exports(source).unwrap().len(), 2);
+    }
 }

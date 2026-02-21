@@ -756,4 +756,282 @@ import Client, { connect as openConnection } from "./client";
             Some("openConnection")
         );
     }
+
+    // === Stress tests and edge cases ===
+
+    #[test]
+    fn empty_source_returns_empty() {
+        let analyzer = TypeScriptAnalyzer::new();
+        assert!(analyzer.extract_symbols(b"").unwrap().is_empty());
+        assert!(analyzer.extract_imports(b"").unwrap().is_empty());
+        assert!(analyzer.extract_exports(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_source_recovers_stable_parts() {
+        let source = br#"
+function stableBeforeBroken(): void {}
+
+class Broken {
+    method( { // broken method signature
+
+export function validAfterBroken(): void {
+    return;
+}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        // Stable function before the broken syntax should always be recovered
+        assert!(symbols.iter().any(|s| s.name == "stableBeforeBroken"));
+    }
+
+    #[test]
+    fn large_module_with_many_exports() {
+        let mut source = String::new();
+        for i in 0..100 {
+            source.push_str(&format!("export function fn_{}(): void {{}}\n", i));
+        }
+        let source_bytes = source.as_bytes();
+        let analyzer = TypeScriptAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source_bytes).unwrap();
+        let functions: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(functions.len(), 100);
+
+        let exports = analyzer.extract_exports(source_bytes).unwrap();
+        assert_eq!(exports.len(), 100);
+        for i in 0..100 {
+            let name = format!("fn_{}", i);
+            assert!(
+                exports.iter().any(|e| e.name == name),
+                "missing export: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn deeply_nested_callbacks() {
+        let mut source = String::new();
+        for i in 0..10 {
+            source.push_str(&format!("const cb_{} = () => {{\n", i));
+        }
+        source.push_str("return 'deep';\n");
+        for _ in 0..10 {
+            source.push_str("};\n");
+        }
+        let source_bytes = source.as_bytes();
+        let analyzer = TypeScriptAnalyzer::new();
+
+        // Should not panic or hang
+        let symbols = analyzer.extract_symbols(source_bytes).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "cb_0"));
+        assert!(symbols.iter().any(|s| s.name == "cb_9"));
+    }
+
+    #[test]
+    fn realistic_nextjs_api_route() {
+        let source = br#"
+import { NextRequest, NextResponse } from 'next/server';
+import { validateToken } from '@/lib/auth';
+import { db } from '@/lib/db';
+
+interface UserPayload {
+    name: string;
+    email: string;
+}
+
+type ApiResponse = {
+    data?: UserPayload;
+    error?: string;
+};
+
+export async function GET(request: NextRequest): Promise<NextResponse<ApiResponse>> {
+    try {
+        const token = request.headers.get('authorization');
+        const user = await validateToken(token);
+        return NextResponse.json({ data: user });
+    } catch (error) {
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+    }
+}
+
+export async function POST(request: NextRequest): Promise<NextResponse<ApiResponse>> {
+    const body: UserPayload = await request.json();
+    const user = await db.users.create({ data: body });
+    return NextResponse.json({ data: user }, { status: 201 });
+}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "GET" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "POST" && s.kind == SymbolKind::Function));
+        assert!(symbols.iter().any(|s| s.name == "UserPayload" && s.kind == SymbolKind::Interface));
+        assert!(symbols.iter().any(|s| s.name == "ApiResponse" && s.kind == SymbolKind::TypeAlias));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 3);
+        assert!(imports.iter().any(|i| i.source == "next/server"));
+        assert!(imports.iter().any(|i| i.source == "@/lib/auth"));
+        assert!(imports.iter().any(|i| i.source == "@/lib/db"));
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        assert!(exports.iter().any(|e| e.name == "GET"));
+        assert!(exports.iter().any(|e| e.name == "POST"));
+    }
+
+    #[test]
+    fn tsx_component_with_jsx() {
+        // The extract_symbols method parses as TS (not TSX), so tree-sitter
+        // may partially recover from JSX syntax. Verify stable symbol extraction.
+        let source = br#"
+import React, { useState, useEffect } from 'react';
+
+interface ButtonProps {
+    label: string;
+    onClick: () => void;
+}
+
+function Button(props: ButtonProps) {
+    const [count, setCount] = useState(0);
+
+    useEffect(() => {
+        console.log('mounted');
+    }, []);
+
+    return <button onClick={props.onClick}>{props.label} ({count})</button>;
+}
+
+export default Button;
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+
+        // Symbols: tree-sitter TS grammar may recover the interface and function
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "ButtonProps" && s.kind == SymbolKind::Interface));
+        assert!(symbols.iter().any(|s| s.name == "Button" && s.kind == SymbolKind::Function));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert!(imports.iter().any(|i| i.source == "react"));
+        let react_import = imports.iter().find(|i| i.source == "react").unwrap();
+        assert!(react_import.symbols.iter().any(|s| s.name == "useState"));
+        assert!(react_import.symbols.iter().any(|s| s.name == "useEffect"));
+    }
+
+    #[test]
+    fn line_numbers_are_correct() {
+        let source = br#"import { foo } from './foo';
+
+function first() {}
+
+function second() {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports[0].line, 1);
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        let first = symbols.iter().find(|s| s.name == "first").unwrap();
+        assert_eq!(first.range.start, 3);
+        let second = symbols.iter().find(|s| s.name == "second").unwrap();
+        assert_eq!(second.range.start, 5);
+    }
+
+    #[test]
+    fn parse_cache_returns_consistent_results() {
+        let source = br#"
+function cached() {}
+class CachedClass {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let first = analyzer.extract_symbols(source).unwrap();
+        let second = analyzer.extract_symbols(source).unwrap();
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.range, b.range);
+        }
+    }
+
+    #[test]
+    fn comments_do_not_produce_symbols() {
+        let source = br#"
+// function notAFunction() {}
+// class NotAClass {}
+/* interface NotAnInterface {} */
+/* export function notExported() {} */
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.is_empty());
+        let exports = analyzer.extract_exports(source).unwrap();
+        assert!(exports.is_empty());
+    }
+
+    #[test]
+    fn unicode_identifiers() {
+        let source = br#"
+const greeting = "Hello, \u4e16\u754c!"; // Chinese characters
+// Comment with emoji: rocket ship
+function processData(): string {
+    return `Result: ${greeting}`;
+}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "greeting"));
+        assert!(symbols.iter().any(|s| s.name == "processData"));
+    }
+
+    #[test]
+    fn mixed_ts_and_js_features() {
+        let source = br#"
+import { esModule } from './es-module';
+const legacy = require('./legacy');
+const { destructured } = require('./another');
+
+export function modernExport(): void {}
+module.exports = { legacyExport: true };
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "legacy" && s.kind == SymbolKind::Variable));
+        assert!(symbols.iter().any(|s| s.name == "destructured" && s.kind == SymbolKind::Variable));
+        assert!(symbols.iter().any(|s| s.name == "modernExport" && s.kind == SymbolKind::Function));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert!(imports.iter().any(|i| i.source == "./es-module"));
+        // require() calls are not import statements, so they should not appear
+        assert!(!imports.iter().any(|i| i.source == "./legacy"));
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        assert!(exports.iter().any(|e| e.name == "modernExport"));
+    }
+
+    #[test]
+    fn re_exports() {
+        let source = br#"
+export { foo } from './bar';
+export * from './baz';
+export { default as Thing } from './thing';
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        assert!(
+            exports.iter().any(|e| e.name == "foo"),
+            "missing re-export: foo"
+        );
+        assert!(
+            exports.iter().any(|e| e.name == "Thing"),
+            "missing aliased default re-export: Thing"
+        );
+    }
 }

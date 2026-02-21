@@ -970,6 +970,307 @@ func Cached() {}
         assert_eq!(first[0].name, second[0].name);
     }
 
+    // === Stress tests and edge cases ===
+
+    #[test]
+    fn stress_empty_source_returns_empty() {
+        let analyzer = GoAnalyzer::new();
+        assert!(analyzer.extract_symbols(b"").unwrap().is_empty());
+        assert!(analyzer.extract_imports(b"").unwrap().is_empty());
+        assert!(analyzer.extract_exports(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn stress_malformed_source_recovers() {
+        let source = br#"package main
+
+func validFunc() {}
+
+func brokenFunc( {
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(
+            symbols.iter().any(|s| s.name == "validFunc"),
+            "tree-sitter should recover and find validFunc despite broken syntax"
+        );
+    }
+
+    #[test]
+    fn stress_large_package_with_many_functions() {
+        let mut source = String::from("package main\n");
+        for i in 0..100 {
+            source.push_str(&format!("func Func{}() {{}}\n", i));
+        }
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source.as_bytes()).unwrap();
+        let funcs: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert_eq!(funcs.len(), 100);
+        for i in 0..100 {
+            assert!(
+                funcs.iter().any(|s| s.name == format!("Func{}", i)),
+                "missing Func{}",
+                i,
+            );
+        }
+    }
+
+    #[test]
+    fn stress_deeply_nested_structs_and_interfaces() {
+        let source = br#"package main
+
+type Outer struct {
+    Inner InnerStruct
+}
+
+type InnerStruct struct {
+    Value string
+}
+
+type Composite interface {
+    Embedded
+}
+
+type Embedded interface {
+    DoWork()
+}
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Outer" && s.kind == SymbolKind::Struct));
+        assert!(symbols.iter().any(|s| s.name == "InnerStruct" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Composite" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Embedded" && s.kind == SymbolKind::Interface)
+        );
+        assert_eq!(symbols.len(), 4);
+    }
+
+    #[test]
+    fn stress_realistic_http_handler() {
+        let source = br#"package api
+
+import (
+    "encoding/json"
+    "fmt"
+    "net/http"
+)
+
+type ApiResponse struct {
+    Status  int    `json:"status"`
+    Message string `json:"message"`
+}
+
+func HandleHealth(w http.ResponseWriter, r *http.Request) {
+    resp := ApiResponse{Status: 200, Message: "ok"}
+    w.Header().Set("Content-Type", "application/json")
+    json.NewEncoder(w).Encode(resp)
+}
+
+func (a *ApiResponse) Format() string {
+    return fmt.Sprintf("%d: %s", a.Status, a.Message)
+}
+"#;
+        let analyzer = GoAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "ApiResponse" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "HandleHealth" && s.kind == SymbolKind::Function)
+        );
+        assert!(symbols.iter().any(|s| s.name == "Format" && s.kind == SymbolKind::Method));
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 3);
+        assert!(imports.iter().any(|i| i.source == "net/http"));
+        assert!(imports.iter().any(|i| i.source == "encoding/json"));
+        assert!(imports.iter().any(|i| i.source == "fmt"));
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        let export_names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(export_names.contains(&"ApiResponse"));
+        assert!(export_names.contains(&"HandleHealth"));
+        assert!(export_names.contains(&"Format"));
+    }
+
+    #[test]
+    fn stress_generic_types_go118() {
+        let source = br#"package collections
+
+type Set[T comparable] struct {
+    items map[T]struct{}
+}
+
+func Map[T, U any](slice []T, f func(T) U) []U {
+    result := make([]U, len(slice))
+    for i, v := range slice {
+        result[i] = f(v)
+    }
+    return result
+}
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Set" && s.kind == SymbolKind::Struct));
+        assert!(symbols.iter().any(|s| s.name == "Map" && s.kind == SymbolKind::Function));
+    }
+
+    #[test]
+    fn stress_line_numbers_are_correct() {
+        let source = b"package main\n\nfunc Alpha() {}\n\nfunc Beta() {}\n";
+        // Line 1: package main
+        // Line 2: (empty)
+        // Line 3: func Alpha() {}
+        // Line 4: (empty)
+        // Line 5: func Beta() {}
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert_eq!(symbols[0].name, "Alpha");
+        assert_eq!(symbols[0].range.start, 3, "Alpha should be on line 3 (1-based)");
+        assert_eq!(symbols[1].name, "Beta");
+        assert_eq!(symbols[1].range.start, 5, "Beta should be on line 5 (1-based)");
+    }
+
+    #[test]
+    fn stress_parse_cache_returns_consistent_results() {
+        let source = br#"package main
+
+func Cached() {}
+type CachedType struct {}
+"#;
+        let analyzer = GoAnalyzer::new();
+        let first = analyzer.extract_symbols(source).unwrap();
+        let second = analyzer.extract_symbols(source).unwrap();
+
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(second.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.range.start, b.range.start);
+            assert_eq!(a.range.end, b.range.end);
+        }
+    }
+
+    #[test]
+    fn stress_comments_do_not_produce_symbols() {
+        let source = br#"package main
+
+// func FakeFunc() {}
+// type FakeType struct {}
+
+/*
+func BlockCommentFunc() {}
+type BlockCommentType struct {}
+*/
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(
+            symbols.is_empty(),
+            "comments should not produce symbols, found: {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn stress_interface_method_sets() {
+        let source = br#"package io
+
+type Reader interface {
+    Read(p []byte) (n int, err error)
+}
+
+type ReadWriter interface {
+    Reader
+    Write(p []byte) (n int, err error)
+}
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Reader" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ReadWriter" && s.kind == SymbolKind::Interface)
+        );
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        assert_eq!(exports.len(), 2);
+        assert!(exports.iter().any(|e| e.name == "Reader"));
+        assert!(exports.iter().any(|e| e.name == "ReadWriter"));
+    }
+
+    #[test]
+    fn stress_init_function_and_blank_imports() {
+        let source = br#"package main
+
+import _ "embed"
+
+func init() {
+    setup()
+}
+"#;
+        let analyzer = GoAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(
+            symbols.iter().any(|s| s.name == "init"),
+            "init function should be extracted"
+        );
+
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "embed");
+        assert_eq!(imports[0].symbols[0].name, "_");
+
+        // init is not exported (lowercase)
+        let exports = analyzer.extract_exports(source).unwrap();
+        assert!(exports.is_empty(), "init should not be exported");
+    }
+
+    #[test]
+    fn stress_multiple_return_values_and_named_returns() {
+        let source = br#"package main
+
+func divide(a, b int) (result int, err error) {
+    if b == 0 {
+        return 0, fmt.Errorf("division by zero")
+    }
+    return a / b, nil
+}
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "divide");
+        assert_eq!(symbols[0].kind, SymbolKind::Function);
+
+        let sig = symbols[0].signature.as_ref().unwrap();
+        assert!(sig.contains("divide"), "signature should contain function name");
+        assert!(sig.contains("result int"), "signature should contain named return 'result int'");
+        assert!(sig.contains("err error"), "signature should contain named return 'err error'");
+    }
+
     #[test]
     fn cgo_preamble_does_not_crash() {
         let source = br#"package main
