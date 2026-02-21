@@ -22,6 +22,7 @@ impl Default for JavaAnalyzer {
 impl JavaAnalyzer {
     pub fn new() -> Self {
         let mut parser = Parser::new();
+        // Grammar ABI compatibility is a build/link invariant; failure means the build is broken.
         parser
             .set_language(&tree_sitter_java::LANGUAGE.into())
             .expect("failed to set java language");
@@ -566,6 +567,18 @@ import java.io.IOException;
     }
 
     #[test]
+    fn flattens_multilevel_import_path() {
+        let source = br#"
+import java.util.Map.Entry;
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "java.util.Map.Entry");
+    }
+
+    #[test]
     fn exports_only_public_symbols() {
         let source = br#"
 public class UserService {
@@ -586,6 +599,48 @@ class InternalHelper {
         assert!(!names.contains(&"validate"));
         assert!(!names.contains(&"helper"));
         assert!(!names.contains(&"InternalHelper"));
+    }
+
+    #[test]
+    fn exports_public_constant_and_omits_private_constant() {
+        let source = br#"
+public class Config {
+    public static final String API_VERSION = "v1";
+    private static final String SECRET_KEY = "internal";
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert!(symbols.iter().any(|s| s.name == "API_VERSION"));
+        assert!(symbols.iter().any(|s| s.name == "SECRET_KEY"));
+
+        let exports = analyzer.extract_exports(source).unwrap();
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Config"));
+        assert!(names.contains(&"API_VERSION"));
+        assert!(!names.contains(&"SECRET_KEY"));
+    }
+
+    #[test]
+    fn exports_nested_public_static_class_and_public_method() {
+        let source = br#"
+public class Outer {
+    public static class Inner {
+        public void exposed() {}
+    }
+
+    private static class Hidden {}
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Outer"));
+        assert!(names.contains(&"Inner"));
+        assert!(names.contains(&"exposed"));
+        assert!(!names.contains(&"Hidden"));
     }
 
     #[test]
