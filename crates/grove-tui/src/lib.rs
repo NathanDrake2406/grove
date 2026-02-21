@@ -6,6 +6,7 @@ use std::error::Error;
 
 use crossterm::{
     ExecutableCommand,
+    event::KeyCode,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use grove_cli::client::DaemonClient;
@@ -60,6 +61,11 @@ async fn run_app(
 
         match events.next().await? {
             events::Event::Input(key) => {
+                // Force an immediate data fetch on manual refresh input.
+                if key.code == KeyCode::Char('r') {
+                    app.refresh_data().await?;
+                }
+
                 // If input handling returns true, we need to exit
                 if app.handle_input(key) {
                     break;
