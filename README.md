@@ -8,7 +8,7 @@ Grove watches your git worktrees, continuously analyzes pairwise overlaps, and t
 
 ## Why
 
-When multiple people (or agents) work in parallel branches, merge conflicts are discovered too late — at merge time. Grove shifts conflict detection left by analyzing worktree diffs against a shared base and scoring how likely they are to collide.
+When multiple people (or agents) work in parallel branches, merge conflicts are discovered too late — at merge time. Grove shifts conflict detection left by analyzing worktree diffs against a shared base and scoring how likely they are to collide. You can setup your agents to check this automatically.
 
 Five overlap layers, from coarse to precise:
 
