@@ -216,6 +216,21 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
+    fn expect_dependency_overlap(overlap: &Overlap) -> (WorkspaceId, &PathBuf, &PathBuf) {
+        match overlap {
+            Overlap::Dependency {
+                changed_in,
+                changed_file,
+                affected_file,
+                ..
+            } => (*changed_in, changed_file, affected_file),
+            Overlap::File { .. }
+            | Overlap::Hunk { .. }
+            | Overlap::Symbol { .. }
+            | Overlap::Schema { .. } => panic!("expected dependency overlap"),
+        }
+    }
+
     #[test]
     fn import_graph_tracks_relationships() {
         let mut graph = ImportGraph::new();
@@ -295,19 +310,10 @@ mod tests {
         let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
 
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Dependency {
-                changed_in,
-                changed_file,
-                affected_file,
-                ..
-            } => {
-                assert_eq!(*changed_in, a_id);
-                assert_eq!(changed_file, &PathBuf::from("src/auth.ts"));
-                assert_eq!(affected_file, &PathBuf::from("src/router.ts"));
-            }
-            _ => panic!("expected dependency overlap"),
-        }
+        let (changed_in, changed_file, affected_file) = expect_dependency_overlap(&overlaps[0]);
+        assert_eq!(changed_in, a_id);
+        assert_eq!(changed_file, &PathBuf::from("src/auth.ts"));
+        assert_eq!(affected_file, &PathBuf::from("src/router.ts"));
     }
 
     #[test]
@@ -466,19 +472,10 @@ mod tests {
         let overlaps = compute_dependency_overlaps(&a_changeset, &b_changeset, &base_graph);
 
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Dependency {
-                changed_in,
-                changed_file,
-                affected_file,
-                ..
-            } => {
-                assert_eq!(*changed_in, a_id);
-                assert_eq!(changed_file, &PathBuf::from("A.ts"));
-                assert_eq!(affected_file, &PathBuf::from("D.ts"));
-            }
-            _ => panic!("expected dependency overlap"),
-        }
+        let (changed_in, changed_file, affected_file) = expect_dependency_overlap(&overlaps[0]);
+        assert_eq!(changed_in, a_id);
+        assert_eq!(changed_file, &PathBuf::from("A.ts"));
+        assert_eq!(affected_file, &PathBuf::from("D.ts"));
     }
 
     #[test]
@@ -644,20 +641,11 @@ mod tests {
 
         assert_eq!(overlaps.len(), 4);
         let mut affected = std::collections::HashSet::new();
-        for overlap in overlaps {
-            match overlap {
-                Overlap::Dependency {
-                    changed_in,
-                    changed_file,
-                    affected_file,
-                    ..
-                } => {
-                    assert_eq!(changed_in, a_id);
-                    assert_eq!(changed_file, api);
-                    affected.insert(affected_file);
-                }
-                _ => panic!("expected dependency overlap"),
-            }
+        for overlap in &overlaps {
+            let (changed_in, changed_file, affected_file) = expect_dependency_overlap(overlap);
+            assert_eq!(changed_in, a_id);
+            assert_eq!(changed_file, &api);
+            affected.insert(affected_file.clone());
         }
         assert_eq!(affected.len(), 2);
         assert!(affected.contains(&consumer_a));
@@ -747,11 +735,8 @@ mod tests {
         assert_eq!(overlaps.len(), 2);
 
         let changed_in: std::collections::HashSet<_> = overlaps
-            .into_iter()
-            .map(|o| match o {
-                Overlap::Dependency { changed_in, .. } => changed_in,
-                _ => panic!("expected dependency overlap"),
-            })
+            .iter()
+            .map(|overlap| expect_dependency_overlap(overlap).0)
             .collect();
         assert!(changed_in.contains(&a_id));
         assert!(changed_in.contains(&b_id));
@@ -825,17 +810,9 @@ mod tests {
 
         let overlaps = compute_dependency_overlaps(&a, &b, &base_graph);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Dependency {
-                changed_file,
-                affected_file,
-                ..
-            } => {
-                assert_eq!(changed_file, &PathBuf::from("src/api.ts"));
-                assert_eq!(affected_file, &PathBuf::from("src/leaf.ts"));
-            }
-            _ => panic!("expected dependency overlap"),
-        }
+        let (_, changed_file, affected_file) = expect_dependency_overlap(&overlaps[0]);
+        assert_eq!(changed_file, &PathBuf::from("src/api.ts"));
+        assert_eq!(affected_file, &PathBuf::from("src/leaf.ts"));
     }
 
     #[test]
@@ -921,11 +898,8 @@ mod tests {
 
         assert_eq!(overlaps.len(), 2);
         let affected_files: HashSet<_> = overlaps
-            .into_iter()
-            .map(|overlap| match overlap {
-                Overlap::Dependency { affected_file, .. } => affected_file,
-                _ => panic!("expected dependency overlap"),
-            })
+            .iter()
+            .map(|overlap| expect_dependency_overlap(overlap).2.clone())
             .collect();
         assert!(affected_files.contains(&PathBuf::from("B.ts")));
         assert!(affected_files.contains(&PathBuf::from("C.ts")));

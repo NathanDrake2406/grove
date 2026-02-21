@@ -22,6 +22,7 @@ impl Default for PythonAnalyzer {
 impl PythonAnalyzer {
     pub fn new() -> Self {
         let mut parser = Parser::new();
+        // Grammar ABI compatibility is a build/link invariant; failure means the build is broken.
         parser
             .set_language(&tree_sitter_python::LANGUAGE.into())
             .expect("failed to set python language");
@@ -541,6 +542,24 @@ class Bar(Base):
         assert_eq!(symbols[2].name, "method_b");
         assert_eq!(symbols[2].kind, SymbolKind::Method);
         assert!(symbols[2].signature.as_ref().unwrap().contains("def method_b"));
+    }
+
+    #[test]
+    fn extracts_async_class_method_as_method() {
+        let source = br#"class Client:
+    async def fetch(self, url):
+        return url
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let method = symbols.iter().find(|s| s.name == "fetch").unwrap();
+        assert_eq!(method.kind, SymbolKind::Method);
+        assert!(method
+            .signature
+            .as_ref()
+            .unwrap()
+            .contains("async def fetch"));
     }
 
     #[test]

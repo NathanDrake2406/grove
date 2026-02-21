@@ -22,6 +22,7 @@ impl Default for RustAnalyzer {
 impl RustAnalyzer {
     pub fn new() -> Self {
         let mut parser = Parser::new();
+        // Grammar ABI compatibility is a build/link invariant; failure means the build is broken.
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .expect("failed to set rust language");

@@ -429,6 +429,18 @@ mod tests {
         }
     }
 
+    fn expect_symbol_overlap(overlap: &Overlap) -> (&PathBuf, &str) {
+        match overlap {
+            Overlap::Symbol {
+                path, symbol_name, ..
+            } => (path, symbol_name),
+            Overlap::File { .. }
+            | Overlap::Hunk { .. }
+            | Overlap::Dependency { .. }
+            | Overlap::Schema { .. } => panic!("expected symbol overlap"),
+        }
+    }
+
     #[test]
     fn disjoint_workspaces_score_green() {
         let a = make_changeset_with_id(
@@ -847,15 +859,9 @@ mod tests {
 
         let overlaps = compute_symbol_overlaps(&a, &b);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Symbol {
-                path, symbol_name, ..
-            } => {
-                assert_eq!(path, &PathBuf::from("src/shared.ts"));
-                assert_eq!(symbol_name, "token");
-            }
-            _ => panic!("expected symbol overlap"),
-        }
+        let (path, symbol_name) = expect_symbol_overlap(&overlaps[0]);
+        assert_eq!(path, &PathBuf::from("src/shared.ts"));
+        assert_eq!(symbol_name, "token");
     }
 
     #[test]

@@ -27,7 +27,13 @@ fn main() {
                 //       .expect("failed to daemonize");
 
                 // Build tokio runtime AFTER fork (or in foreground mode, just here).
-                let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        eprintln!("error: failed to create tokio runtime: {e}");
+                        std::process::exit(1);
+                    }
+                };
 
                 let config = grove_daemon::state::GroveConfig::default();
                 if let Err(e) = rt.block_on(grove_daemon::run(config, &grove_dir)) {
@@ -50,7 +56,13 @@ fn main() {
 
 /// Build a tokio runtime and run the CLI entry point.
 fn run_cli(args: grove_cli::CliArgs) -> ! {
-    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: failed to create tokio runtime: {e}");
+            std::process::exit(1);
+        }
+    };
     
     // Check if we requested the TUI explicitly
     let is_explicit_dashboard = matches!(args.command, Some(grove_cli::Commands::Dashboard));

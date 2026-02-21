@@ -114,6 +114,7 @@ fn is_process_alive(pid: u32) -> bool {
 pub async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
+    // Signal registration is a startup invariant on supported Unix targets; failure means runtime setup is broken.
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to register SIGINT handler");
 

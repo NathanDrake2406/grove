@@ -24,11 +24,13 @@ impl Default for TypeScriptAnalyzer {
 impl TypeScriptAnalyzer {
     pub fn new() -> Self {
         let mut parser_ts = Parser::new();
+        // Grammar ABI compatibility is a build/link invariant; failure means the build is broken.
         parser_ts
             .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
             .expect("failed to set typescript language");
 
         let mut parser_tsx = Parser::new();
+        // Grammar ABI compatibility is a build/link invariant; failure means the build is broken.
         parser_tsx
             .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
             .expect("failed to set tsx language");

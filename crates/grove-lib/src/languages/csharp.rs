@@ -22,6 +22,7 @@ impl Default for CSharpAnalyzer {
 impl CSharpAnalyzer {
     pub fn new() -> Self {
         let mut parser = Parser::new();
+        // Grammar ABI compatibility is a build/link invariant; failure means the build is broken.
         parser
             .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
             .expect("failed to set C# language");
@@ -586,6 +587,20 @@ public record struct Measurement(double Value, string Unit);
     }
 
     #[test]
+    fn file_scoped_namespace_symbols_are_found() {
+        let source = br#"
+namespace MyApp.Core;
+
+public class Worker {
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        assert!(symbols.iter().any(|s| s.name == "Worker" && s.kind == SymbolKind::Class));
+    }
+
+    #[test]
     fn extracts_methods_and_constructors() {
         let source = br#"
 public class Service {
@@ -604,6 +619,37 @@ public class Service {
     }
 
     #[test]
+    fn method_and_constructor_signature_lines_are_tracked() {
+        let source = br#"
+public class Service {
+    public Service(
+        int id
+    ) { }
+
+    private int Calculate(
+        int x
+    ) {
+        return x;
+    }
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let constructor = symbols
+            .iter()
+            .find(|s| s.name == "Service" && s.kind == SymbolKind::Method)
+            .unwrap();
+        let method = symbols
+            .iter()
+            .find(|s| s.name == "Calculate" && s.kind == SymbolKind::Method)
+            .unwrap();
+
+        assert_eq!(constructor.signature.as_deref(), Some("public Service("));
+        assert_eq!(method.signature.as_deref(), Some("private int Calculate("));
+    }
+
+    #[test]
     fn extracts_properties_and_fields() {
         let source = br#"
 public class Config {
@@ -618,6 +664,28 @@ public class Config {
         assert!(symbols.iter().any(|s| s.name == "Name" && s.kind == SymbolKind::Variable));
         assert!(symbols.iter().any(|s| s.name == "_count" && s.kind == SymbolKind::Variable));
         assert!(symbols.iter().any(|s| s.name == "Version" && s.kind == SymbolKind::Variable));
+    }
+
+    #[test]
+    fn multi_variable_field_declaration_yields_each_symbol() {
+        let source = br#"
+public class Point {
+    public int X, Y;
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let x = symbols
+            .iter()
+            .find(|s| s.name == "X" && s.kind == SymbolKind::Variable)
+            .unwrap();
+        let y = symbols
+            .iter()
+            .find(|s| s.name == "Y" && s.kind == SymbolKind::Variable)
+            .unwrap();
+
+        assert_eq!(x.range, y.range);
     }
 
     #[test]
@@ -697,6 +765,20 @@ namespace MyApp {
         let imports = analyzer.extract_imports(source).unwrap();
 
         assert!(imports.iter().any(|i| i.source == "System.Linq"));
+    }
+
+    #[test]
+    fn usings_after_file_scoped_namespace_are_collected() {
+        let source = br#"
+namespace MyApp.Core;
+using System.Text;
+
+public class Worker { }
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert!(imports.iter().any(|i| i.source == "System.Text"));
     }
 
     // === Export detection tests ===

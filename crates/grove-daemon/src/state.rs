@@ -2,6 +2,7 @@ use grove_lib::graph::{GraphOverlay, ImportGraph};
 use grove_lib::{CommitHash, Workspace, WorkspaceId, WorkspacePairAnalysis};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
@@ -447,6 +448,12 @@ impl DaemonState {
         }
 
         if self.workspaces.len() >= self.config.max_worktrees {
+            warn!(
+                workspace_id = %id,
+                current_count = self.workspaces.len(),
+                max_worktrees = self.config.max_worktrees,
+                "rejecting workspace registration: maximum worktree limit reached"
+            );
             return Err(format!(
                 "maximum worktree limit ({}) reached",
                 self.config.max_worktrees
@@ -586,23 +593,38 @@ impl DaemonState {
             };
 
             self.in_flight_pairs.insert(pair);
-            let send_result = worker_tx
-                .send(WorkerMessage::AnalyzePair {
+            let send_result = tokio::time::timeout(
+                Duration::from_millis(self.config.analysis_timeout_ms),
+                worker_tx.send(WorkerMessage::AnalyzePair {
                     workspace_a,
                     workspace_b,
                     base_graph: self.base_graph.clone(),
-                })
-                .await;
+                }),
+            )
+            .await;
 
-            if let Err(e) = send_result {
-                self.in_flight_pairs.remove(&pair);
-                warn!(
-                    workspace_a = %pair.0,
-                    workspace_b = %pair.1,
-                    error = %e,
-                    "failed to dispatch analysis pair"
-                );
-                return Err(());
+            match send_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    self.in_flight_pairs.remove(&pair);
+                    warn!(
+                        workspace_a = %pair.0,
+                        workspace_b = %pair.1,
+                        error = %e,
+                        "worker channel closed while dispatching analysis pair"
+                    );
+                    return Err(());
+                }
+                Err(_) => {
+                    self.in_flight_pairs.remove(&pair);
+                    warn!(
+                        workspace_a = %pair.0,
+                        workspace_b = %pair.1,
+                        timeout_ms = self.config.analysis_timeout_ms,
+                        "timed out dispatching analysis pair to worker queue"
+                    );
+                    return Err(());
+                }
             }
 
             debug!(
@@ -1238,6 +1260,62 @@ mod tests {
 
         tx.send(StateMessage::Shutdown).await.unwrap();
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_timeout_retains_dirty_workspace_and_clears_in_flight_pair() {
+        let mut state = DaemonState::new(
+            GroveConfig {
+                analysis_timeout_ms: 10,
+                ..GroveConfig::default()
+            },
+            None,
+        );
+        let ws_a = make_workspace("timeout-a");
+        let ws_b = make_workspace("timeout-b");
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+
+        state.handle_register_workspace(ws_a.clone()).unwrap();
+        state.handle_register_workspace(ws_b.clone()).unwrap();
+
+        let (worker_tx, _worker_rx) = mpsc::channel(1);
+        worker_tx
+            .try_send(WorkerMessage::AnalyzePair {
+                workspace_a: ws_a,
+                workspace_b: ws_b,
+                base_graph: ImportGraph::new(),
+            })
+            .unwrap();
+        state.handle_attach_worker(worker_tx);
+
+        state.dirty_workspaces.push(id_a);
+        state.dispatch_dirty_workspaces().await;
+
+        assert_eq!(state.dirty_workspaces, vec![id_a]);
+        assert!(!state.in_flight_pairs.contains(&canonical_pair(id_a, id_b)));
+    }
+
+    #[tokio::test]
+    async fn dispatch_closed_worker_channel_retains_dirty_workspace_and_clears_in_flight_pair() {
+        let mut state = DaemonState::new(GroveConfig::default(), None);
+        let ws_a = make_workspace("closed-a");
+        let ws_b = make_workspace("closed-b");
+        let id_a = ws_a.id;
+        let id_b = ws_b.id;
+
+        state.handle_register_workspace(ws_a).unwrap();
+        state.handle_register_workspace(ws_b).unwrap();
+
+        let (worker_tx, worker_rx) = mpsc::channel(1);
+        drop(worker_rx);
+        state.handle_attach_worker(worker_tx);
+
+        state.dirty_workspaces.push(id_a);
+        state.dispatch_dirty_workspaces().await;
+
+        assert_eq!(state.dirty_workspaces, vec![id_a]);
+        assert!(!state.in_flight_pairs.contains(&canonical_pair(id_a, id_b)));
     }
 
     #[tokio::test]
