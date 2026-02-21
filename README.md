@@ -23,10 +23,14 @@ The worst overlap determines the pair's **orthogonality score**: Green (safe) < 
 ## Install
 
 ```sh
-cargo install --path crates/grove
+brew install NathanDrake2406/tap/grove
 ```
 
-Requires Rust 1.85+ (edition 2024).
+Or from source:
+
+```sh
+cargo install --path crates/grove
+```
 
 ## Quick start
 
