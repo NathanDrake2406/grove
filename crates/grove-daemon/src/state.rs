@@ -1,9 +1,9 @@
 use grove_lib::graph::{GraphOverlay, ImportGraph};
-use grove_lib::{CommitHash, Workspace, WorkspaceId, WorkspacePairAnalysis};
+use grove_lib::{CommitHash, OrthogonalityScore, Workspace, WorkspaceId, WorkspacePairAnalysis};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
@@ -136,6 +136,27 @@ pub enum QueryResponse {
     },
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+pub enum DaemonEvent {
+    AnalysisComplete {
+        workspace_a: WorkspaceId,
+        workspace_b: WorkspaceId,
+        score: OrthogonalityScore,
+    },
+    WorkspaceAdded {
+        workspace_id: WorkspaceId,
+        name: String,
+        branch: String,
+    },
+    WorkspaceRemoved {
+        workspace_id: WorkspaceId,
+    },
+    BaseRefChanged {
+        new_commit: CommitHash,
+    },
+}
+
 // === Daemon State ===
 
 pub struct DaemonState {
@@ -149,12 +170,22 @@ pub struct DaemonState {
     dirty_workspaces: Vec<WorkspaceId>,
     in_flight_pairs: HashSet<(WorkspaceId, WorkspaceId)>,
     analysis_waiters: Vec<oneshot::Sender<QueryResponse>>,
+    event_tx: broadcast::Sender<DaemonEvent>,
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
     db: Option<Database>,
 }
 
 impl DaemonState {
     pub fn new(config: GroveConfig, db: Option<Database>) -> Self {
+        let (event_tx, _event_rx) = broadcast::channel(256);
+        Self::new_with_event_tx(config, db, event_tx)
+    }
+
+    pub fn new_with_event_tx(
+        config: GroveConfig,
+        db: Option<Database>,
+        event_tx: broadcast::Sender<DaemonEvent>,
+    ) -> Self {
         Self {
             config,
             workspaces: HashMap::new(),
@@ -165,6 +196,7 @@ impl DaemonState {
             dirty_workspaces: Vec::new(),
             in_flight_pairs: HashSet::new(),
             analysis_waiters: Vec::new(),
+            event_tx,
             worker_tx: None,
             db,
         }
@@ -349,6 +381,7 @@ impl DaemonState {
         pair: (WorkspaceId, WorkspaceId),
         result: WorkspacePairAnalysis,
     ) {
+        let score = result.score;
         self.in_flight_pairs.remove(&canonical_pair(pair.0, pair.1));
 
         info!(
@@ -366,6 +399,11 @@ impl DaemonState {
         }
 
         self.pair_analyses.insert(pair, result);
+        self.emit_event(DaemonEvent::AnalysisComplete {
+            workspace_a: pair.0,
+            workspace_b: pair.1,
+            score,
+        });
 
         if self.in_flight_pairs.is_empty() {
             self.drain_analysis_waiters();
@@ -485,6 +523,12 @@ impl DaemonState {
         }
     }
 
+    fn emit_event(&self, event: DaemonEvent) {
+        if self.event_tx.send(event).is_err() {
+            debug!("dropping daemon event: no active subscribers");
+        }
+    }
+
     fn handle_base_ref_changed(&mut self, new_commit: CommitHash) {
         if new_commit == self.base_commit {
             debug!("base ref unchanged, skipping rebuild");
@@ -502,6 +546,9 @@ impl DaemonState {
         // Clear stale analyses since they reference the old base.
         self.pair_analyses.clear();
         self.workspace_overlays.clear();
+        self.emit_event(DaemonEvent::BaseRefChanged {
+            new_commit: self.base_commit.clone(),
+        });
     }
 
     fn handle_worktree_reindex_complete(
@@ -552,7 +599,13 @@ impl DaemonState {
             return Err(format!("persistence error: {e}"));
         }
 
+        let event = DaemonEvent::WorkspaceAdded {
+            workspace_id: id,
+            name: workspace.name.clone(),
+            branch: workspace.branch.clone(),
+        };
         self.workspaces.insert(id, workspace);
+        self.emit_event(event);
         Ok(())
     }
 
@@ -580,6 +633,7 @@ impl DaemonState {
             error!(error = %e, "failed to delete workspace from db");
         }
 
+        self.emit_event(DaemonEvent::WorkspaceRemoved { workspace_id });
         Ok(())
     }
 
@@ -743,11 +797,16 @@ impl DaemonState {
 pub fn spawn_state_actor(
     config: GroveConfig,
     db: Option<Database>,
-) -> (mpsc::Sender<StateMessage>, tokio::task::JoinHandle<()>) {
+) -> (
+    mpsc::Sender<StateMessage>,
+    broadcast::Sender<DaemonEvent>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel(256);
-    let state = DaemonState::new(config, db).with_persisted_state();
+    let (event_tx, _event_rx) = broadcast::channel(256);
+    let state = DaemonState::new_with_event_tx(config, db, event_tx.clone()).with_persisted_state();
     let handle = tokio::spawn(state.run(rx));
-    (tx, handle)
+    (tx, event_tx, handle)
 }
 
 #[cfg(test)]
@@ -774,7 +833,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_and_query_workspace() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let ws = make_workspace("auth-refactor");
         let ws_id = ws.id;
@@ -813,7 +872,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_workspaces() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         for name in &["alpha", "beta", "gamma"] {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -845,7 +904,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_workspace_cleans_up() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let ws = make_workspace("to-remove");
         let ws_id = ws.id;
@@ -892,7 +951,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_changed_marks_dirty() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let ws = make_workspace("active");
         let ws_id = ws.id;
@@ -937,7 +996,7 @@ mod tests {
 
     #[tokio::test]
     async fn analysis_complete_stores_result() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let ws_a = make_workspace("a");
         let ws_b = make_workspace("b");
@@ -997,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_analysis_returns_completed_immediately_when_idle() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(StateMessage::Query {
@@ -1026,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_analysis_waiter_completes_when_in_flight_pair_finishes() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws_a = make_workspace("await-a");
         let ws_b = make_workspace("await-b");
         let id_a = ws_a.id;
@@ -1118,7 +1177,7 @@ mod tests {
 
     #[tokio::test]
     async fn base_ref_change_clears_analyses() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let ws_a = make_workspace("a");
         let ws_b = make_workspace("b");
@@ -1182,7 +1241,7 @@ mod tests {
             max_worktrees: 2,
             ..GroveConfig::default()
         };
-        let (tx, handle) = spawn_state_actor(config, None);
+        let (tx, _event_tx, handle) = spawn_state_actor(config, None);
 
         for name in &["a", "b"] {
             let (reply_tx, reply_rx) = oneshot::channel();
@@ -1215,7 +1274,7 @@ mod tests {
             max_worktrees: 200,
             ..GroveConfig::default()
         };
-        let (tx, handle) = spawn_state_actor(config, None);
+        let (tx, _event_tx, handle) = spawn_state_actor(config, None);
 
         let mut tasks = Vec::new();
         for i in 0..100 {
@@ -1274,7 +1333,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_then_remove_same_workspace_immediately() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws = make_workspace("quick-remove");
         let ws_id = ws.id;
 
@@ -1317,7 +1376,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_after_remove_message_returns_none() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws = make_workspace("remove-query");
         let ws_id = ws.id;
 
@@ -1359,7 +1418,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_pair_analysis_query_is_order_insensitive() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws_a = make_workspace("pair-a");
         let ws_b = make_workspace("pair-b");
         let id_a = ws_a.id;
@@ -1417,7 +1476,7 @@ mod tests {
 
     #[tokio::test]
     async fn file_changed_dispatches_analysis_for_related_pairs() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
         let ws_a = make_workspace("dispatch-a");
         let ws_b = make_workspace("dispatch-b");
         let id_a = ws_a.id;
@@ -1593,7 +1652,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_query_reply_channel_does_not_break_actor() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let (dropped_reply_tx, dropped_reply_rx) = oneshot::channel();
         drop(dropped_reply_rx);
@@ -1629,7 +1688,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_file_change_burst_keeps_actor_responsive() {
-        let (tx, handle) = spawn_state_actor(
+        let (tx, _event_tx, handle) = spawn_state_actor(
             GroveConfig {
                 max_worktrees: 5,
                 ..GroveConfig::default()
@@ -1690,7 +1749,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_existing_workspace_is_idempotent() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let ws = make_workspace("idempotent");
         let _ws_id = ws.id;
@@ -1736,7 +1795,7 @@ mod tests {
 
     #[tokio::test]
     async fn remove_nonexistent_workspace_is_noop() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         let (reply_tx, reply_rx) = oneshot::channel();
         tx.send(StateMessage::RemoveWorkspace {
@@ -1785,7 +1844,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_worktrees_adds_new_and_removes_stale() {
-        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
 
         // Register two workspaces
         let ws_a = make_workspace("alpha");
