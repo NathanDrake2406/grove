@@ -91,6 +91,21 @@ mod tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    fn expect_schema_overlap(overlap: &Overlap) -> (SchemaCategory, &PathBuf, &PathBuf) {
+        match overlap {
+            Overlap::Schema {
+                category,
+                a_file,
+                b_file,
+                ..
+            } => (*category, a_file, b_file),
+            Overlap::File { .. }
+            | Overlap::Hunk { .. }
+            | Overlap::Symbol { .. }
+            | Overlap::Dependency { .. } => panic!("expected schema overlap"),
+        }
+    }
+
     fn make_changeset(paths: &[&str]) -> WorkspaceChangeset {
         WorkspaceChangeset {
             workspace_id: Uuid::new_v4(),
@@ -187,10 +202,8 @@ mod tests {
 
         let overlaps = compute_schema_overlaps(&a, &b);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Schema { category, .. } => assert_eq!(*category, SchemaCategory::PackageDep),
-            _ => panic!("expected schema overlap"),
-        }
+        let (category, _, _) = expect_schema_overlap(&overlaps[0]);
+        assert_eq!(category, SchemaCategory::PackageDep);
     }
 
     #[test]
@@ -233,10 +246,8 @@ mod tests {
 
         let overlaps = compute_schema_overlaps(&a, &b);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Schema { category, .. } => assert_eq!(*category, SchemaCategory::EnvConfig),
-            _ => panic!("expected schema overlap"),
-        }
+        let (category, _, _) = expect_schema_overlap(&overlaps[0]);
+        assert_eq!(category, SchemaCategory::EnvConfig);
     }
 
     #[test]
@@ -270,22 +281,13 @@ mod tests {
         }
 
         fn key(overlap: &Overlap) -> (SchemaCategory, PathBuf, PathBuf) {
-            match overlap {
-                Overlap::Schema {
-                    category,
-                    a_file,
-                    b_file,
-                    ..
-                } => {
-                    let left = a_file.clone();
-                    let right = b_file.clone();
-                    if left <= right {
-                        (*category, left, right)
-                    } else {
-                        (*category, right, left)
-                    }
-                }
-                _ => panic!("expected schema overlap"),
+            let (category, a_file, b_file) = expect_schema_overlap(overlap);
+            let left = a_file.clone();
+            let right = b_file.clone();
+            if left <= right {
+                (category, left, right)
+            } else {
+                (category, right, left)
             }
         }
 
@@ -325,10 +327,11 @@ mod tests {
 
         let overlaps = compute_schema_overlaps(&a, &b);
         assert_eq!(overlaps.len(), 18 * 23);
-        assert!(overlaps.iter().all(|o| match o {
-            Overlap::Schema { category, .. } => *category == SchemaCategory::Migration,
-            _ => false,
-        }));
+        assert!(
+            overlaps
+                .iter()
+                .all(|overlap| expect_schema_overlap(overlap).0 == SchemaCategory::Migration)
+        );
     }
 
     #[test]
@@ -344,10 +347,7 @@ mod tests {
         let overlaps = compute_schema_overlaps(&a, &b);
         let categories: Vec<_> = overlaps
             .iter()
-            .map(|o| match o {
-                Overlap::Schema { category, .. } => *category,
-                _ => panic!("expected schema overlap"),
-            })
+            .map(|overlap| expect_schema_overlap(overlap).0)
             .collect();
 
         assert_eq!(categories.len(), 3);

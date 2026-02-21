@@ -149,14 +149,10 @@ mod tests {
                     }
                 }
                 fn normalize(o: &Overlap) -> (PathBuf, u8, u8) {
-                    match o {
-                        Overlap::File { path, a_change, b_change } => {
-                            let ra = rank(*a_change);
-                            let rb = rank(*b_change);
-                            (path.clone(), ra.min(rb), ra.max(rb))
-                        }
-                        _ => panic!("unexpected overlap variant"),
-                    }
+                    let (path, a_change, b_change) = expect_file_overlap(o);
+                    let ra = rank(a_change);
+                    let rb = rank(b_change);
+                    (path.clone(), ra.min(rb), ra.max(rb))
                 }
 
                 let mut left: Vec<_> = compute_file_overlaps(&cs_a, &cs_b)
@@ -199,17 +195,17 @@ mod tests {
                 }]);
 
                 fn key(o: &Overlap) -> (std::path::PathBuf, u32, u32, u32, u32, u32) {
-                    match o {
-                        Overlap::Hunk { path, a_range, b_range, distance } => {
-                            let mut ranges = [
-                                (a_range.start, a_range.end),
-                                (b_range.start, b_range.end),
-                            ];
-                            ranges.sort();
-                            (path.clone(), *distance, ranges[0].0, ranges[0].1, ranges[1].0, ranges[1].1)
-                        }
-                        _ => panic!("unexpected overlap variant"),
-                    }
+                    let (path, a_range, b_range, distance) = expect_hunk_overlap(o);
+                    let mut ranges = [(a_range.start, a_range.end), (b_range.start, b_range.end)];
+                    ranges.sort();
+                    (
+                        path.clone(),
+                        distance,
+                        ranges[0].0,
+                        ranges[0].1,
+                        ranges[1].0,
+                        ranges[1].1,
+                    )
                 }
 
                 let mut left: Vec<_> = compute_hunk_overlaps(&cs_a, &cs_b, threshold)
@@ -286,17 +282,10 @@ mod tests {
                 let large_threshold = small_threshold + extra;
 
                 fn key(o: &Overlap) -> (u32, u32, u32, u32, u32) {
-                    match o {
-                        Overlap::Hunk { a_range, b_range, distance, .. } => {
-                            let mut ranges = [
-                                (a_range.start, a_range.end),
-                                (b_range.start, b_range.end),
-                            ];
-                            ranges.sort();
-                            (*distance, ranges[0].0, ranges[0].1, ranges[1].0, ranges[1].1)
-                        }
-                        _ => panic!("unexpected overlap variant"),
-                    }
+                    let (_, a_range, b_range, distance) = expect_hunk_overlap(o);
+                    let mut ranges = [(a_range.start, a_range.end), (b_range.start, b_range.end)];
+                    ranges.sort();
+                    (distance, ranges[0].0, ranges[0].1, ranges[1].0, ranges[1].1)
                 }
 
                 let cs_a = make_cs(vec![FileChange {
@@ -382,6 +371,35 @@ mod tests {
         }
     }
 
+    fn expect_file_overlap(overlap: &Overlap) -> (&PathBuf, ChangeType, ChangeType) {
+        match overlap {
+            Overlap::File {
+                path,
+                a_change,
+                b_change,
+            } => (path, *a_change, *b_change),
+            Overlap::Hunk { .. }
+            | Overlap::Symbol { .. }
+            | Overlap::Dependency { .. }
+            | Overlap::Schema { .. } => panic!("expected file overlap"),
+        }
+    }
+
+    fn expect_hunk_overlap(overlap: &Overlap) -> (&PathBuf, &LineRange, &LineRange, u32) {
+        match overlap {
+            Overlap::Hunk {
+                path,
+                a_range,
+                b_range,
+                distance,
+            } => (path, a_range, b_range, *distance),
+            Overlap::File { .. }
+            | Overlap::Symbol { .. }
+            | Overlap::Dependency { .. }
+            | Overlap::Schema { .. } => panic!("expected hunk overlap"),
+        }
+    }
+
     #[test]
     fn file_overlap_detects_shared_files() {
         let a = make_changeset(vec![
@@ -395,10 +413,8 @@ mod tests {
 
         let overlaps = compute_file_overlaps(&a, &b);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::File { path, .. } => assert_eq!(path, &PathBuf::from("src/payment.ts")),
-            _ => panic!("expected file overlap"),
-        }
+        let (path, _, _) = expect_file_overlap(&overlaps[0]);
+        assert_eq!(path, &PathBuf::from("src/payment.ts"));
     }
 
     #[test]
@@ -433,10 +449,8 @@ mod tests {
 
         let overlaps = compute_hunk_overlaps(&a, &b, 5);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Hunk { distance, .. } => assert_eq!(*distance, 0),
-            _ => panic!("expected hunk overlap"),
-        }
+        let (_, _, _, distance) = expect_hunk_overlap(&overlaps[0]);
+        assert_eq!(distance, 0);
     }
 
     #[test]
@@ -463,10 +477,8 @@ mod tests {
         // a_range: 10-14, b_range: 18-22, distance = 4 (within threshold of 5)
         let overlaps = compute_hunk_overlaps(&a, &b, 5);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Hunk { distance, .. } => assert_eq!(*distance, 4),
-            _ => panic!("expected hunk overlap"),
-        }
+        let (_, _, _, distance) = expect_hunk_overlap(&overlaps[0]);
+        assert_eq!(distance, 4);
     }
 
     #[test]
@@ -547,26 +559,17 @@ mod tests {
         let right = compute_hunk_overlaps(&b, &a, 5);
 
         fn key(overlap: &Overlap) -> (PathBuf, u32, (u32, u32), (u32, u32)) {
-            match overlap {
-                Overlap::Hunk {
-                    path,
-                    a_range,
-                    b_range,
-                    distance,
-                } => {
-                    let mut ranges = [(a_range.start, a_range.end), (b_range.start, b_range.end)];
-                    ranges.sort_by(|l, r| {
-                        let by_start = l.0.cmp(&r.0);
-                        if by_start == Ordering::Equal {
-                            l.1.cmp(&r.1)
-                        } else {
-                            by_start
-                        }
-                    });
-                    (path.clone(), *distance, ranges[0], ranges[1])
+            let (path, a_range, b_range, distance) = expect_hunk_overlap(overlap);
+            let mut ranges = [(a_range.start, a_range.end), (b_range.start, b_range.end)];
+            ranges.sort_by(|l, r| {
+                let by_start = l.0.cmp(&r.0);
+                if by_start == Ordering::Equal {
+                    l.1.cmp(&r.1)
+                } else {
+                    by_start
                 }
-                _ => panic!("expected hunk overlap"),
-            }
+            });
+            (path.clone(), distance, ranges[0], ranges[1])
         }
 
         let mut left_keys: Vec<_> = left.iter().map(key).collect();
@@ -631,18 +634,10 @@ mod tests {
         }
 
         fn key(overlap: &Overlap) -> (PathBuf, u8, u8) {
-            match overlap {
-                Overlap::File {
-                    path,
-                    a_change,
-                    b_change,
-                } => {
-                    let left = rank(*a_change);
-                    let right = rank(*b_change);
-                    (path.clone(), left.min(right), left.max(right))
-                }
-                _ => panic!("expected file overlap"),
-            }
+            let (path, a_change, b_change) = expect_file_overlap(overlap);
+            let left = rank(a_change);
+            let right = rank(b_change);
+            (path.clone(), left.min(right), left.max(right))
         }
 
         let mut a_one = make_file("src/shared_a.ts", vec![]);
@@ -670,20 +665,13 @@ mod tests {
     #[test]
     fn hunk_overlap_threshold_is_monotonic() {
         fn key(overlap: &Overlap) -> (PathBuf, (u32, u32), (u32, u32), u32) {
-            match overlap {
-                Overlap::Hunk {
-                    path,
-                    a_range,
-                    b_range,
-                    distance,
-                } => (
-                    path.clone(),
-                    (a_range.start, a_range.end),
-                    (b_range.start, b_range.end),
-                    *distance,
-                ),
-                _ => panic!("expected hunk overlap"),
-            }
+            let (path, a_range, b_range, distance) = expect_hunk_overlap(overlap);
+            (
+                path.clone(),
+                (a_range.start, a_range.end),
+                (b_range.start, b_range.end),
+                distance,
+            )
         }
 
         let a = make_changeset(vec![make_file(
@@ -760,15 +748,9 @@ mod tests {
 
         let overlaps = compute_hunk_overlaps(&a, &b, 0);
         assert_eq!(overlaps.len(), 1);
-        match &overlaps[0] {
-            Overlap::Hunk {
-                path: p, distance, ..
-            } => {
-                assert_eq!(p, &PathBuf::from(path));
-                assert_eq!(*distance, 0);
-            }
-            _ => panic!("expected hunk overlap"),
-        }
+        let (overlap_path, _, _, distance) = expect_hunk_overlap(&overlaps[0]);
+        assert_eq!(overlap_path, &PathBuf::from(path));
+        assert_eq!(distance, 0);
     }
 
     #[test]
