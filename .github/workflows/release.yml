@@ -96,7 +96,7 @@ jobs:
           STEM="${{ steps.archive.outputs.stem }}"
           mkdir -p "dist/${STEM}"
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "dist/${STEM}/"
-          cp README.md LICENSE dist/${STEM}/ 2>/dev/null || true
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/${STEM}/ 2>/dev/null || true
           tar -czf "dist/${{ steps.archive.outputs.filename }}" -C dist "${STEM}"
 
       - name: Package binary (Windows zip)
@@ -107,7 +107,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$Stem"
           Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" "dist/$Stem/"
           if (Test-Path README.md) { Copy-Item README.md "dist/$Stem/" }
-          if (Test-Path LICENSE) { Copy-Item LICENSE "dist/$Stem/" }
+          if (Test-Path LICENSE-MIT) { Copy-Item LICENSE-MIT "dist/$Stem/" }
+          if (Test-Path LICENSE-APACHE) { Copy-Item LICENSE-APACHE "dist/$Stem/" }
           Compress-Archive -Path "dist/$Stem" -DestinationPath "dist/${{ steps.archive.outputs.filename }}"
 
       - name: Generate checksum

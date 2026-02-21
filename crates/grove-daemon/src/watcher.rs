@@ -262,34 +262,34 @@ impl Debouncer {
             }
 
             // Find which worktree this path belongs to.
-            if let Some(ws_id) = find_worktree_state_for_path(path, &self.worktrees) {
-                if let Some(state) = self.worktrees.get_mut(&ws_id) {
-                    // Check ignore patterns
-                    if should_ignore(
-                        path,
-                        &state.root,
-                        state.gitignore.as_ref(),
-                        &self.config.ignore_patterns,
-                    ) {
-                        debug!(path = %path.display(), "ignoring path");
-                        continue;
-                    }
+            if let Some(ws_id) = find_worktree_state_for_path(path, &self.worktrees)
+                && let Some(state) = self.worktrees.get_mut(&ws_id)
+            {
+                // Check ignore patterns
+                if should_ignore(
+                    path,
+                    &state.root,
+                    state.gitignore.as_ref(),
+                    &self.config.ignore_patterns,
+                ) {
+                    debug!(path = %path.display(), "ignoring path");
+                    continue;
+                }
 
-                    state.pending_changes.push(path.clone());
+                state.pending_changes.push(path.clone());
 
-                    // Circuit breaker check
-                    if state.pending_changes.len() >= self.config.circuit_breaker_threshold {
-                        info!(
-                            workspace_id = %ws_id,
-                            count = state.pending_changes.len(),
-                            "circuit breaker tripped, requesting full re-index"
-                        );
-                        state.pending_changes.clear();
-                        state.last_flush = Instant::now();
-                        output.push(WatchEvent::FullReindexNeeded {
-                            workspace_id: ws_id,
-                        });
-                    }
+                // Circuit breaker check
+                if state.pending_changes.len() >= self.config.circuit_breaker_threshold {
+                    info!(
+                        workspace_id = %ws_id,
+                        count = state.pending_changes.len(),
+                        "circuit breaker tripped, requesting full re-index"
+                    );
+                    state.pending_changes.clear();
+                    state.last_flush = Instant::now();
+                    output.push(WatchEvent::FullReindexNeeded {
+                        workspace_id: ws_id,
+                    });
                 }
             }
         }

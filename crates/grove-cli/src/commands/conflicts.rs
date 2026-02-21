@@ -85,10 +85,10 @@ fn resolve_workspace_id(
 /// Strict exact match against workspace name or branch short name.
 fn workspace_matches_exact(ws: &serde_json::Value, query: &str) -> bool {
     // Exact match on workspace name.
-    if let Some(name) = ws.get("name").and_then(|v| v.as_str()) {
-        if name.eq_ignore_ascii_case(query) {
-            return true;
-        }
+    if let Some(name) = ws.get("name").and_then(|v| v.as_str())
+        && name.eq_ignore_ascii_case(query)
+    {
+        return true;
     }
 
     // Exact match on branch short name (strip refs/heads/).

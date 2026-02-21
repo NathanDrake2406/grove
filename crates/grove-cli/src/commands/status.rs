@@ -202,7 +202,7 @@ pub fn format_smart_status(
 }
 
 /// Build a map from workspace ID to workspace name.
-fn build_id_name_map<'a>(workspaces: &'a serde_json::Value) -> HashMap<&'a str, &'a str> {
+fn build_id_name_map(workspaces: &serde_json::Value) -> HashMap<&str, &str> {
     let mut map = HashMap::new();
     if let Some(arr) = workspaces.as_array() {
         for ws in arr {

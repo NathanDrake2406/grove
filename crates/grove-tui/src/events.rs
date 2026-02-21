@@ -27,10 +27,10 @@ impl EventHandler {
             let sender = sender.clone();
             tokio::task::spawn_blocking(move || {
                 loop {
-                    if let Ok(CrosstermEvent::Key(key)) = event::read() {
-                        if sender.send(Event::Input(key)).is_err() {
-                            break;
-                        }
+                    if let Ok(CrosstermEvent::Key(key)) = event::read()
+                        && sender.send(Event::Input(key)).is_err()
+                    {
+                        break;
                     }
                 }
             })
@@ -59,6 +59,6 @@ impl EventHandler {
         self.receiver
             .recv()
             .await
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "Event channel closed"))
+            .ok_or_else(|| std::io::Error::other("Event channel closed"))
     }
 }

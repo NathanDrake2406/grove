@@ -190,18 +190,18 @@ fn extract_field_names(node: tree_sitter::Node<'_>, source: &[u8], symbols: &mut
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "variable_declarator" {
-            if let Some(name) = child.child_by_field_name("name") {
-                symbols.push(Symbol {
-                    name: name.utf8_text(source).unwrap_or("").to_string(),
-                    kind,
-                    range: LineRange {
-                        start: node.start_position().row as u32 + 1,
-                        end: node.end_position().row as u32 + 1,
-                    },
-                    signature: None,
-                });
-            }
+        if child.kind() == "variable_declarator"
+            && let Some(name) = child.child_by_field_name("name")
+        {
+            symbols.push(Symbol {
+                name: name.utf8_text(source).unwrap_or("").to_string(),
+                kind,
+                range: LineRange {
+                    start: node.start_position().row as u32 + 1,
+                    end: node.end_position().row as u32 + 1,
+                },
+                signature: None,
+            });
         }
     }
 }
@@ -226,56 +226,56 @@ fn collect_exports(node: tree_sitter::Node<'_>, source: &[u8], exports: &mut Vec
     for child in node.children(&mut cursor) {
         match child.kind() {
             "class_declaration" | "record_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        exports.push(ExportedSymbol {
-                            name: name.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Class,
-                            signature: None,
-                        });
-                    }
+                if has_public_modifier(child, source)
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    exports.push(ExportedSymbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Class,
+                        signature: None,
+                    });
                 }
                 if let Some(body) = child.child_by_field_name("body") {
                     collect_exports(body, source, exports);
                 }
             }
             "interface_declaration" | "annotation_type_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        exports.push(ExportedSymbol {
-                            name: name.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Interface,
-                            signature: None,
-                        });
-                    }
+                if has_public_modifier(child, source)
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    exports.push(ExportedSymbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Interface,
+                        signature: None,
+                    });
                 }
                 if let Some(body) = child.child_by_field_name("body") {
                     collect_exports(body, source, exports);
                 }
             }
             "enum_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        exports.push(ExportedSymbol {
-                            name: name.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Enum,
-                            signature: None,
-                        });
-                    }
+                if has_public_modifier(child, source)
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    exports.push(ExportedSymbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Enum,
+                        signature: None,
+                    });
                 }
                 if let Some(body) = child.child_by_field_name("body") {
                     collect_exports(body, source, exports);
                 }
             }
             "method_declaration" | "constructor_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name) = child.child_by_field_name("name") {
-                        exports.push(ExportedSymbol {
-                            name: name.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Method,
-                            signature: Some(get_signature_line(source, child.start_byte())),
-                        });
-                    }
+                if has_public_modifier(child, source)
+                    && let Some(name) = child.child_by_field_name("name")
+                {
+                    exports.push(ExportedSymbol {
+                        name: name.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Method,
+                        signature: Some(get_signature_line(source, child.start_byte())),
+                    });
                 }
             }
             "field_declaration" | "constant_declaration" => {
@@ -287,14 +287,14 @@ fn collect_exports(node: tree_sitter::Node<'_>, source: &[u8], exports: &mut Vec
                     };
                     let mut field_cursor = child.walk();
                     for field_child in child.children(&mut field_cursor) {
-                        if field_child.kind() == "variable_declarator" {
-                            if let Some(name) = field_child.child_by_field_name("name") {
-                                exports.push(ExportedSymbol {
-                                    name: name.utf8_text(source).unwrap_or("").to_string(),
-                                    kind,
-                                    signature: None,
-                                });
-                            }
+                        if field_child.kind() == "variable_declarator"
+                            && let Some(name) = field_child.child_by_field_name("name")
+                        {
+                            exports.push(ExportedSymbol {
+                                name: name.utf8_text(source).unwrap_or("").to_string(),
+                                kind,
+                                signature: None,
+                            });
                         }
                     }
                 }
