@@ -8,9 +8,9 @@ pub fn classify_schema_file(path: &Path) -> Option<SchemaCategory> {
     let filename = path.file_name()?.to_string_lossy();
     let ext = path.extension().map(|e| e.to_string_lossy().to_string());
 
-    // Migrations
+    // Migrations — require the directory name as a proper path segment
     for dir in MIGRATION_DIRS {
-        if path_str.contains(dir) {
+        if path_str.starts_with(&format!("{dir}/")) || path_str.contains(&format!("/{dir}/")) {
             return Some(SchemaCategory::Migration);
         }
     }
@@ -46,16 +46,16 @@ pub fn classify_schema_file(path: &Path) -> Option<SchemaCategory> {
         return Some(SchemaCategory::EnvConfig);
     }
 
-    // CI
-    if path_str.contains(".github/workflows")
-        || path_str.contains(".gitlab-ci")
+    // CI — require directory segment for workflow paths
+    if path_str.contains(".github/workflows/")
+        || filename.starts_with(".gitlab-ci")
         || filename == "Jenkinsfile"
     {
         return Some(SchemaCategory::CI);
     }
 
-    // Routes
-    if path_str.contains("routes/") || path_str.contains("router") {
+    // Routes — require directory segment, not just substring
+    if path_str.contains("routes/") || path_str.contains("router/") {
         return Some(SchemaCategory::Route);
     }
 
@@ -193,6 +193,37 @@ mod tests {
     fn returns_none_for_regular_files() {
         assert_eq!(classify_schema_file(Path::new("src/main.ts")), None);
         assert_eq!(classify_schema_file(Path::new("lib/utils.rs")), None);
+    }
+
+    #[test]
+    fn classify_schema_file_rejects_keyword_only_docs_paths() {
+        for path in &[
+            "docs/routes-guide.md",
+            "docs/router-patterns.md",
+            "docs/migrations-playbook.md",
+            "notes/db-migrations-overview.txt",
+        ] {
+            assert_eq!(
+                classify_schema_file(Path::new(path)),
+                None,
+                "{path} should not be treated as schema/config"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_schema_file_rejects_non_ci_paths_with_workflow_tokens() {
+        for path in &[
+            "docs/.github/workflows-overview.md",
+            "docs/reference/gitlab-ci-notes.md",
+            "notes/Jenkinsfile_migration.md",
+        ] {
+            assert_eq!(
+                classify_schema_file(Path::new(path)),
+                None,
+                "{path} should not be treated as CI config"
+            );
+        }
     }
 
     #[test]
@@ -354,5 +385,26 @@ mod tests {
         assert!(categories.contains(&SchemaCategory::PackageDep));
         assert!(categories.contains(&SchemaCategory::CI));
         assert!(categories.contains(&SchemaCategory::Route));
+    }
+
+    #[test]
+    fn schema_overlap_ignores_keyword_only_docs_and_scripts() {
+        let a = make_changeset(&[
+            "docs/routes-guide.md",
+            "docs/migrations-playbook.md",
+            "scripts/router_notes.sh",
+        ]);
+        let b = make_changeset(&[
+            "docs/router-patterns.md",
+            "notes/db-migrations-overview.md",
+            "scripts/migrations_summary.sh",
+        ]);
+
+        let overlaps = compute_schema_overlaps(&a, &b);
+        assert!(
+            overlaps.is_empty(),
+            "keyword-only docs/scripts should not produce schema overlaps: {:?}",
+            overlaps
+        );
     }
 }
