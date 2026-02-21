@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use crate::app::{App, FocusedPanel, ViewState};
@@ -225,7 +225,11 @@ fn render_worktrees_panel(app: &App, frame: &mut Frame, area: Rect) {
             .borders(Borders::ALL)
             .border_style(border_style),
     );
-    frame.render_widget(list, area);
+    let mut state = ListState::default();
+    if !app.workspaces.is_empty() {
+        state.select(Some(app.selected_worktree_index));
+    }
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_pairs_panel(app: &App, frame: &mut Frame, area: Rect) {
@@ -342,7 +346,9 @@ fn render_pairs_panel(app: &App, frame: &mut Frame, area: Rect) {
         .collect();
 
     let list = List::new(pair_items).block(block);
-    frame.render_widget(list, area);
+    let mut state = ListState::default();
+    state.select(Some(app.selected_pair_index));
+    frame.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_detail_panel(app: &App, frame: &mut Frame, area: Rect) {

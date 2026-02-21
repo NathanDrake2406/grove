@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 pub enum Event {
     /// A keyboard event
     Input(KeyEvent),
+    /// A terminal resize event
+    Resize(u16, u16),
     /// A periodic tick event (for polling data)
     Tick,
     /// An error communicating with the daemon polling
@@ -27,10 +29,23 @@ impl EventHandler {
             let sender = sender.clone();
             tokio::task::spawn_blocking(move || {
                 loop {
-                    if let Ok(CrosstermEvent::Key(key)) = event::read()
-                        && sender.send(Event::Input(key)).is_err()
-                    {
-                        break;
+                    match event::read() {
+                        Ok(CrosstermEvent::Key(key)) => {
+                            if sender.send(Event::Input(key)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(CrosstermEvent::Resize(width, height)) => {
+                            if sender.send(Event::Resize(width, height)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            if sender.send(Event::DaemonError(err.to_string())).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
             })

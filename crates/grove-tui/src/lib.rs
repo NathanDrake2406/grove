@@ -13,6 +13,8 @@ use grove_cli::client::DaemonClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+const POLL_TICK_HZ: u64 = 1;
+
 /// Run the TUI dashboard.
 pub async fn run(client: DaemonClient) -> Result<(), Box<dyn Error>> {
     setup_panic_hook();
@@ -20,7 +22,7 @@ pub async fn run(client: DaemonClient) -> Result<(), Box<dyn Error>> {
     let mut terminal = setup_terminal()?;
 
     let mut app = app::App::new(client);
-    let mut events = events::EventHandler::new(2); // 2 ticks per second (500ms)
+    let mut events = events::EventHandler::new(POLL_TICK_HZ);
 
     let res = run_app(&mut terminal, &mut app, &mut events).await;
 
@@ -73,6 +75,9 @@ async fn run_app(
             }
             events::Event::Tick => {
                 app.refresh_data().await?;
+            }
+            events::Event::Resize(_, _) => {
+                app.is_dirty = true;
             }
             events::Event::DaemonError(err) => {
                 app.set_error(err);

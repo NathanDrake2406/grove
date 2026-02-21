@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::client::DaemonClient;
 
@@ -41,10 +41,24 @@ fn repo_to_git_context(repo: &gix::Repository) -> Result<GitContext, String> {
 
 /// Derive the canonical `.grove/` directory from git context.
 pub fn grove_dir_from_context(ctx: &GitContext) -> PathBuf {
-    ctx.common_dir
-        .parent()
-        .unwrap_or(&ctx.toplevel)
+    infer_repo_root_from_common_dir(&ctx.common_dir)
+        .unwrap_or_else(|| ctx.toplevel.clone())
         .join(".grove")
+}
+
+fn infer_repo_root_from_common_dir(common_dir: &Path) -> Option<PathBuf> {
+    // Resolve any .git-related shape to the repo root:
+    //   <repo>/.git
+    //   <repo>/.git/worktrees
+    //   <repo>/.git/worktrees/<name>
+    for ancestor in common_dir.ancestors() {
+        if ancestor.file_name().is_some_and(|name| name == ".git") {
+            return ancestor.parent().map(Path::to_path_buf);
+        }
+    }
+
+    // Fallback for bare-style common dirs (e.g. /path/repo.git).
+    common_dir.parent().map(Path::to_path_buf)
 }
 
 /// Ensure `.grove/` directory exists and is excluded from git tracking.
@@ -256,6 +270,18 @@ mod tests {
         assert_eq!(
             grove_dir_from_context(&ctx),
             PathBuf::from("/home/user/.grove")
+        );
+    }
+
+    #[test]
+    fn grove_dir_works_for_linked_worktree_common_dir() {
+        let ctx = GitContext {
+            toplevel: PathBuf::from("/home/user/myproject/.worktrees/feature-x"),
+            common_dir: PathBuf::from("/home/user/myproject/.git/worktrees/feature-x"),
+        };
+        assert_eq!(
+            grove_dir_from_context(&ctx),
+            PathBuf::from("/home/user/myproject/.grove")
         );
     }
 }
