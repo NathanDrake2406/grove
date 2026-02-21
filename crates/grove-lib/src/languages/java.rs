@@ -209,6 +209,26 @@ fn extract_field_names(
     }
 }
 
+fn flatten_scoped_identifier(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    parts: &mut Vec<String>,
+) {
+    if node.kind() == "identifier" {
+        parts.push(node.utf8_text(source).unwrap_or("").to_string());
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "scoped_identifier" | "identifier" => {
+                flatten_scoped_identifier(child, source, parts);
+            }
+            _ => {}
+        }
+    }
+}
+
 impl LanguageAnalyzer for JavaAnalyzer {
     fn language_id(&self) -> &str {
         "java"
@@ -226,8 +246,45 @@ impl LanguageAnalyzer for JavaAnalyzer {
         Ok(symbols)
     }
 
-    fn extract_imports(&self, _source: &[u8]) -> Result<Vec<Import>, AnalysisError> {
-        Ok(vec![]) // stub — tests will fail
+    fn extract_imports(&self, source: &[u8]) -> Result<Vec<Import>, AnalysisError> {
+        let tree = self.parse(source)?;
+        let root = tree.root_node();
+        let mut imports = Vec::new();
+        let mut cursor = root.walk();
+
+        for child in root.children(&mut cursor) {
+            if child.kind() == "import_declaration" {
+                let mut path_parts = Vec::new();
+                let mut has_wildcard = false;
+
+                let mut inner_cursor = child.walk();
+                for inner in child.children(&mut inner_cursor) {
+                    match inner.kind() {
+                        "scoped_identifier" | "identifier" => {
+                            flatten_scoped_identifier(inner, source, &mut path_parts);
+                        }
+                        "asterisk" => {
+                            has_wildcard = true;
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !path_parts.is_empty() {
+                    let mut path = path_parts.join(".");
+                    if has_wildcard {
+                        path.push_str(".*");
+                    }
+                    imports.push(Import {
+                        source: path,
+                        symbols: vec![],
+                        line: child.start_position().row as u32 + 1,
+                    });
+                }
+            }
+        }
+
+        Ok(imports)
     }
 
     fn extract_exports(&self, _source: &[u8]) -> Result<Vec<ExportedSymbol>, AnalysisError> {
@@ -326,5 +383,59 @@ public class Calc {
         let method = symbols.iter().find(|s| s.name == "add").unwrap();
         assert!(method.signature.as_ref().unwrap().contains("add"));
         assert!(method.signature.as_ref().unwrap().contains("int"));
+    }
+
+    #[test]
+    fn extracts_single_import() {
+        let source = br#"
+import java.util.List;
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "java.util.List");
+    }
+
+    #[test]
+    fn extracts_wildcard_import() {
+        let source = br#"
+import java.util.*;
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "java.util.*");
+    }
+
+    #[test]
+    fn extracts_static_import() {
+        let source = br#"
+import static org.junit.Assert.assertEquals;
+import static java.util.Collections.*;
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "org.junit.Assert.assertEquals");
+        assert_eq!(imports[1].source, "java.util.Collections.*");
+    }
+
+    #[test]
+    fn extracts_multiple_imports() {
+        let source = br#"
+import java.util.List;
+import java.util.Map;
+import java.io.IOException;
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 3);
+        assert_eq!(imports[0].source, "java.util.List");
+        assert_eq!(imports[1].source, "java.util.Map");
+        assert_eq!(imports[2].source, "java.io.IOException");
     }
 }
