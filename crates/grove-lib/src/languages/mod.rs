@@ -1,3 +1,4 @@
+pub mod csharp;
 pub mod go_lang;
 pub mod rust_lang;
 pub mod typescript;
