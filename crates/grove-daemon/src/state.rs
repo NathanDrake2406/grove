@@ -7,7 +7,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use crate::db::Database;
-use crate::worker::{WorkerMessage, canonical_pair};
+use crate::worker::{WorkerMessage, build_base_graph_from_workspace, canonical_pair};
 
 // === Configuration ===
 
@@ -70,6 +70,10 @@ pub enum StateMessage {
     },
     BaseRefChanged {
         new_commit: CommitHash,
+    },
+    BaseGraphReady {
+        graph: ImportGraph,
+        base_commit: CommitHash,
     },
     WorktreeReindexComplete {
         workspace_id: WorkspaceId,
@@ -165,7 +169,6 @@ pub enum DaemonEvent {
 pub struct DaemonState {
     config: GroveConfig,
     workspaces: HashMap<WorkspaceId, Workspace>,
-    #[allow(dead_code)] // Used when worker system is wired up
     base_graph: ImportGraph,
     base_commit: CommitHash,
     workspace_overlays: HashMap<WorkspaceId, GraphOverlay>,
@@ -176,6 +179,9 @@ pub struct DaemonState {
     event_tx: broadcast::Sender<DaemonEvent>,
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
     db: Option<Database>,
+    self_tx: Option<mpsc::Sender<StateMessage>>,
+    base_graph_building: bool,
+    base_graph_build_failed: bool,
 }
 
 impl DaemonState {
@@ -202,6 +208,9 @@ impl DaemonState {
             event_tx,
             worker_tx: None,
             db,
+            self_tx: None,
+            base_graph_building: false,
+            base_graph_build_failed: false,
         }
     }
 
@@ -261,6 +270,11 @@ impl DaemonState {
                 }
                 StateMessage::BaseRefChanged { new_commit } => {
                     self.handle_base_ref_changed(new_commit);
+                    false
+                }
+                StateMessage::BaseGraphReady { graph, base_commit } => {
+                    self.handle_base_graph_ready(graph, base_commit);
+                    self.dispatch_dirty_workspaces().await;
                     false
                 }
                 StateMessage::WorktreeReindexComplete {
@@ -352,6 +366,7 @@ impl DaemonState {
                 StateMessage::FileChanged { .. }
                 | StateMessage::AnalysisComplete { .. }
                 | StateMessage::BaseRefChanged { .. }
+                | StateMessage::BaseGraphReady { .. }
                 | StateMessage::WorktreeReindexComplete { .. } => {
                     debug!("dropping state mutation queued after shutdown");
                 }
@@ -542,10 +557,27 @@ impl DaemonState {
         );
 
         self.base_commit = new_commit;
-        // Full base graph rebuild will be triggered by the watcher/worker.
+        // Full base graph rebuild is deferred until next dispatch; clear stale graph now.
+        self.base_graph = ImportGraph::new();
+        self.base_graph_building = false;
+        self.base_graph_build_failed = false;
         // Clear stale analyses since they reference the old base.
         self.pair_analyses.clear();
         self.workspace_overlays.clear();
+        self.in_flight_pairs.clear();
+        self.drain_analysis_waiters();
+
+        if let Some(ref db) = self.db
+            && let Err(e) = db.delete_all_pair_analyses()
+        {
+            error!(error = %e, "failed to delete stale pair analyses from db");
+        }
+
+        for workspace_id in self.workspaces.keys().copied() {
+            if !self.dirty_workspaces.contains(&workspace_id) {
+                self.dirty_workspaces.push(workspace_id);
+            }
+        }
         self.emit_event(DaemonEvent::BaseRefChanged {
             new_commit: self.base_commit.clone(),
         });
@@ -688,6 +720,24 @@ impl DaemonState {
             return;
         }
 
+        // Kick off an async base graph build if needed. Dispatch is deferred
+        // until the build completes so workers receive the populated graph.
+        // If the build previously failed (e.g. fake paths in tests), proceed
+        // with an empty graph — dependency overlaps will be unavailable but
+        // all other analysis layers still work.
+        if self.base_graph.is_empty()
+            && !self.base_graph_building
+            && !self.base_graph_build_failed
+            && self.self_tx.is_some()
+        {
+            self.spawn_base_graph_build();
+            return;
+        }
+
+        if self.base_graph_building {
+            return;
+        }
+
         let dirty = self.dirty_workspaces.clone();
         let mut still_dirty = Vec::new();
 
@@ -702,6 +752,89 @@ impl DaemonState {
         }
 
         self.dirty_workspaces = still_dirty;
+    }
+
+    fn spawn_base_graph_build(&mut self) {
+        let workspace = self.workspaces.values().next().cloned();
+        let Some(workspace) = workspace else {
+            return;
+        };
+        let Some(ref self_tx) = self.self_tx else {
+            // No self_tx means we're in a direct test context; skip async build.
+            return;
+        };
+
+        self.base_graph_building = true;
+        let config = self.config.clone();
+        let self_tx = self_tx.clone();
+        let workspace_id = workspace.id;
+
+        tokio::task::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                build_base_graph_from_workspace(&config, &workspace)
+            })
+            .await;
+
+            let (graph, base_commit) = match result {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    warn!(
+                        workspace_id = %workspace_id,
+                        error = %e,
+                        "failed to build base import graph; dependency overlaps may be incomplete"
+                    );
+                    (ImportGraph::new(), String::new())
+                }
+                Err(e) => {
+                    error!(
+                        workspace_id = %workspace_id,
+                        error = %e,
+                        "base graph build task panicked"
+                    );
+                    (ImportGraph::new(), String::new())
+                }
+            };
+
+            if let Err(e) = self_tx
+                .send(StateMessage::BaseGraphReady { graph, base_commit })
+                .await
+            {
+                warn!(
+                    workspace_id = %workspace_id,
+                    error = %e,
+                    "failed to send base graph ready message"
+                );
+            }
+        });
+    }
+
+    fn handle_base_graph_ready(&mut self, graph: ImportGraph, base_commit: CommitHash) {
+        self.base_graph_building = false;
+
+        if graph.is_empty() {
+            self.base_graph_build_failed = true;
+            debug!("base graph build returned empty graph; dependency overlaps unavailable");
+            return;
+        }
+
+        let edge_count: usize = graph.imports.values().map(Vec::len).sum();
+        info!(
+            base_commit = %base_commit,
+            files = graph.exports.len(),
+            edges = edge_count,
+            "base import graph ready"
+        );
+
+        self.base_graph = graph;
+        self.base_commit = base_commit;
+
+        // Re-mark all workspaces dirty so they re-analyze with the populated graph,
+        // picking up dependency overlaps that the initial pass missed.
+        for workspace_id in self.workspaces.keys().copied() {
+            if !self.dirty_workspaces.contains(&workspace_id) {
+                self.dirty_workspaces.push(workspace_id);
+            }
+        }
     }
 
     async fn dispatch_pairs_for_workspace(&mut self, workspace_id: WorkspaceId) -> Result<(), ()> {
@@ -809,7 +942,9 @@ pub fn spawn_state_actor(
 ) {
     let (tx, rx) = mpsc::channel(256);
     let (event_tx, _event_rx) = broadcast::channel(256);
-    let state = DaemonState::new_with_event_tx(config, db, event_tx.clone()).with_persisted_state();
+    let mut state =
+        DaemonState::new_with_event_tx(config, db, event_tx.clone()).with_persisted_state();
+    state.self_tx = Some(tx.clone());
     let handle = tokio::spawn(state.run(rx));
     (tx, event_tx, handle)
 }
@@ -820,6 +955,8 @@ mod tests {
     use crate::worker::WorkerMessage;
     use chrono::Utc;
     use grove_lib::{MergeOrder, OrthogonalityScore, WorkspaceMetadata};
+    use std::process::Command;
+    use tempfile::tempdir;
     use tokio::time::{Duration, timeout};
     use uuid::Uuid;
 
@@ -834,6 +971,40 @@ mod tests {
             last_activity: Utc::now(),
             metadata: WorkspaceMetadata::default(),
         }
+    }
+
+    fn make_workspace_at_path(name: &str, branch: &str, path: PathBuf) -> Workspace {
+        Workspace {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            branch: branch.to_string(),
+            path,
+            base_ref: "main".to_string(),
+            created_at: Utc::now(),
+            last_activity: Utc::now(),
+            metadata: WorkspaceMetadata::default(),
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dirs should be created");
+        }
+        std::fs::write(path, content).expect("file should be written");
     }
 
     #[tokio::test]
@@ -1894,6 +2065,84 @@ mod tests {
                 workspace_count, ..
             } => assert_eq!(workspace_count, 2),
             other => panic!("unexpected: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_rebuilds_base_graph_for_worker_messages() {
+        let temp = tempdir().expect("temp dir should be created");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir should be created");
+
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "grove@example.com"]);
+        run_git(&repo, &["config", "user.name", "Grove Tests"]);
+
+        write_file(
+            &repo.join("src/shared.ts"),
+            "export function authenticate(token: string): boolean { return token.length > 0; }\n",
+        );
+        write_file(
+            &repo.join("src/api.ts"),
+            "import { authenticate } from \"./shared\";\nexport function checkout(token: string): boolean { return authenticate(token); }\n",
+        );
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "initial"]);
+
+        run_git(&repo, &["checkout", "-b", "feat/a"]);
+        write_file(
+            &repo.join("src/shared.ts"),
+            "export function authenticate(token: string): boolean { return token.length > 1; }\n",
+        );
+        run_git(&repo, &["commit", "-am", "feat a"]);
+
+        let ws_a = make_workspace_at_path("feat/a", "refs/heads/feat/a", repo.clone());
+        let ws_b = make_workspace_at_path("feat/b", "refs/heads/feat/b", repo.clone());
+        let ws_a_id = ws_a.id;
+
+        let (tx, _event_tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        tx.send(StateMessage::AttachWorker { worker_tx })
+            .await
+            .unwrap();
+
+        for workspace in [ws_a, ws_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(StateMessage::RegisterWorkspace {
+                workspace,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        tx.send(StateMessage::FileChanged {
+            workspace_id: ws_a_id,
+            path: PathBuf::from("src/shared.ts"),
+        })
+        .await
+        .unwrap();
+
+        // The base graph is built asynchronously off the actor thread. Dispatch
+        // is deferred until the build completes, so the first worker message
+        // should carry the populated graph.
+        let msg = timeout(Duration::from_secs(5), worker_rx.recv())
+            .await
+            .expect("worker should receive a pair dispatch")
+            .expect("worker message should be present");
+
+        match msg {
+            WorkerMessage::AnalyzePair { base_graph, .. } => {
+                let dependents = base_graph.get_dependents(&PathBuf::from("src/shared.ts"));
+                assert!(
+                    dependents.contains(&&PathBuf::from("src/api.ts")),
+                    "base graph should include shared.ts -> api.ts dependency edge"
+                );
+            }
         }
 
         tx.send(StateMessage::Shutdown).await.unwrap();

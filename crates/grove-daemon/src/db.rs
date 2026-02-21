@@ -212,6 +212,11 @@ impl Database {
         Ok(())
     }
 
+    pub fn delete_all_pair_analyses(&self) -> Result<(), DbError> {
+        self.conn.execute("DELETE FROM pair_analyses", [])?;
+        Ok(())
+    }
+
     pub fn load_pair_analyses(&self) -> Result<Vec<WorkspacePairAnalysis>, DbError> {
         let mut stmt = self.conn.prepare(
             "SELECT workspace_a, workspace_b, score, overlaps_json, merge_order_hint, computed_at
