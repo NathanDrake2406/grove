@@ -328,11 +328,11 @@ impl Debouncer {
             }
         }
 
-        if let Some(change_time) = self.pending_worktree_change {
-            if now.duration_since(change_time) >= debounce_duration {
-                self.pending_worktree_change = None;
-                output.push(WatchEvent::WorktreesChanged);
-            }
+        if let Some(change_time) = self.pending_worktree_change
+            && now.duration_since(change_time) >= debounce_duration
+        {
+            self.pending_worktree_change = None;
+            output.push(WatchEvent::WorktreesChanged);
         }
 
         output

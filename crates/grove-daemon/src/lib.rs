@@ -298,15 +298,15 @@ async fn run_watcher_loop(
 
                 // Retry watching .git/worktrees/ if it didn't exist at startup
                 // (created by the first `git worktree add`)
-                if !git_worktrees_watched {
-                    if let Some(ref git_dir) = repo_git_dir {
-                        let worktrees_dir = git_dir.join("worktrees");
-                        if worktrees_dir.is_dir() {
-                            if watcher.watch(&worktrees_dir, RecursiveMode::NonRecursive).is_ok() {
-                                info!(path = %worktrees_dir.display(), "watching git worktrees directory (deferred)");
-                                git_worktrees_watched = true;
-                            }
-                        }
+                if !git_worktrees_watched
+                    && let Some(ref git_dir) = repo_git_dir
+                {
+                    let worktrees_dir = git_dir.join("worktrees");
+                    if worktrees_dir.is_dir()
+                        && watcher.watch(&worktrees_dir, RecursiveMode::NonRecursive).is_ok()
+                    {
+                        info!(path = %worktrees_dir.display(), "watching git worktrees directory (deferred)");
+                        git_worktrees_watched = true;
                     }
                 }
             }
