@@ -158,14 +158,6 @@ mod tests {
             ]
         }
 
-        fn arb_file_path() -> impl Strategy<Value = PathBuf> {
-            prop_oneof![
-                Just(PathBuf::from("src/shared.ts")),
-                Just(PathBuf::from("src/auth.ts")),
-                Just(PathBuf::from("src/payment.ts")),
-                Just(PathBuf::from("src/utils.ts")),
-            ]
-        }
 
         fn arb_symbol_name() -> impl Strategy<Value = String> {
             prop_oneof![

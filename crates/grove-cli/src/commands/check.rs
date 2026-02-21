@@ -173,29 +173,29 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
             parts.push(s);
         }
     }
-    if symbol_count > 0 {
-        if let Some(sym) = overlaps.iter().find_map(|o| o.get("Symbol")) {
-            let name = sym
-                .get("symbol_name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let path = sym.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let mut s = format!("{name}() in {path}");
-            if symbol_count > 1 {
-                s.push_str(&format!(" (+{} more)", symbol_count - 1));
-            }
-            parts.push(s);
+    if symbol_count > 0
+        && let Some(sym) = overlaps.iter().find_map(|o| o.get("Symbol"))
+    {
+        let name = sym
+            .get("symbol_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let path = sym.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let mut s = format!("{name}() in {path}");
+        if symbol_count > 1 {
+            s.push_str(&format!(" (+{} more)", symbol_count - 1));
         }
+        parts.push(s);
     }
-    if hunk_count > 0 {
-        if let Some(hunk) = overlaps.iter().find_map(|o| o.get("Hunk")) {
-            let path = hunk.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let mut s = format!("overlapping lines in {path}");
-            if hunk_count > 1 {
-                s.push_str(&format!(" (+{} more)", hunk_count - 1));
-            }
-            parts.push(s);
+    if hunk_count > 0
+        && let Some(hunk) = overlaps.iter().find_map(|o| o.get("Hunk"))
+    {
+        let path = hunk.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+        let mut s = format!("overlapping lines in {path}");
+        if hunk_count > 1 {
+            s.push_str(&format!(" (+{} more)", hunk_count - 1));
         }
+        parts.push(s);
     }
     if file_count > 0 && parts.is_empty() {
         // Only show file overlaps if nothing more specific was found.
