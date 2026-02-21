@@ -15,6 +15,7 @@ daemonize = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
 crossterm = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 grove-lib = { path = "../grove-lib" }

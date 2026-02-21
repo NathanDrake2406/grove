@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::fmt::Display;
 
 fn main() {
     let args = grove_cli::CliArgs::parse();
@@ -63,20 +64,23 @@ fn run_cli(args: grove_cli::CliArgs) -> ! {
             std::process::exit(1);
         }
     };
-    
+
+    let json_output = args.json;
+
     // Check if we requested the TUI explicitly
-    let is_explicit_dashboard = matches!(args.command, Some(grove_cli::Commands::Dashboard));
-    
+    let is_explicit_dashboard = matches!(&args.command, Some(grove_cli::Commands::Dashboard));
+
     // Or if we should fallback to the TUI (no command + interactive TTY)
     use crossterm::tty::IsTty;
-    let is_fallback_dashboard = args.command.is_none() && std::io::stdout().is_tty() && !args.json;
-    let fallback_to_status = args.command.is_none() && (!std::io::stdout().is_tty() || args.json);
+    let is_fallback_dashboard =
+        args.command.is_none() && std::io::stdout().is_tty() && !json_output;
+    let fallback_to_status = args.command.is_none() && (!std::io::stdout().is_tty() || json_output);
 
     // Get the client from the standard CLI run (which handles bootstrap)
     let client = match rt.block_on(grove_cli::run(args)) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e}");
+            emit_cli_error(&e, json_output);
             std::process::exit(1);
         }
     };
@@ -89,12 +93,30 @@ fn run_cli(args: grove_cli::CliArgs) -> ! {
     } else if fallback_to_status {
         // Fallback for non-interactive `grove`
         if let Err(e) = rt.block_on(grove_cli::commands::status::execute(&client, false)) {
-            eprintln!("error executing status fallback: {e}");
+            if json_output {
+                emit_cli_error(&e, true);
+            } else {
+                eprintln!("error executing status fallback: {e}");
+            }
             std::process::exit(1);
         }
     }
-    
+
     std::process::exit(0);
+}
+
+fn emit_cli_error(error: &impl Display, json: bool) {
+    eprintln!("{}", format_cli_error(error, json));
+}
+
+fn format_cli_error(error: &impl Display, json: bool) -> String {
+    if json {
+        let encoded_error = serde_json::to_string(&error.to_string())
+            .unwrap_or_else(|_| "\"failed to serialize error\"".to_string());
+        format!("{{\"ok\":false,\"error\":{encoded_error}}}")
+    } else {
+        format!("error: {error}")
+    }
 }
 
 /// Walk up from the current directory looking for a `.grove/` directory.
@@ -112,5 +134,26 @@ fn find_grove_dir() -> Result<std::path::PathBuf, String> {
         if !dir.pop() {
             return Err("not in a grove workspace (no .grove/ directory found)".to_string());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_cli_error;
+
+    #[test]
+    fn format_cli_error_plain_prefixes_error() {
+        let rendered = format_cli_error(&"workspace not found: feat/foo", false);
+        assert_eq!(rendered, "error: workspace not found: feat/foo");
+    }
+
+    #[test]
+    fn format_cli_error_json_is_structured() {
+        let rendered = format_cli_error(&"workspace not found: feat/foo", true);
+        let value: serde_json::Value =
+            serde_json::from_str(&rendered).expect("json error output should parse");
+
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"], "workspace not found: feat/foo");
     }
 }
