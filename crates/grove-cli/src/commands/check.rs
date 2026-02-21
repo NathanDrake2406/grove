@@ -8,9 +8,8 @@ use std::path::Path;
 /// Silent (exit 0) when clean. Prints terse one-liners and exits non-zero when
 /// the current worktree has non-Green conflicts with other worktrees.
 pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandError> {
-    let cwd = std::env::current_dir().map_err(|e| {
-        CommandError::DaemonError(format!("failed to get current directory: {e}"))
-    })?;
+    let cwd = std::env::current_dir()
+        .map_err(|e| CommandError::DaemonError(format!("failed to get current directory: {e}")))?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
     // Fetch workspaces and analyses in parallel-ish (sequential for now, both fast).
@@ -31,8 +30,7 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
             return false;
         };
         let ws_path = Path::new(ws_path);
-        let ws_canonical =
-            std::fs::canonicalize(ws_path).unwrap_or_else(|_| ws_path.to_path_buf());
+        let ws_canonical = std::fs::canonicalize(ws_path).unwrap_or_else(|_| ws_path.to_path_buf());
         cwd.starts_with(&ws_canonical)
     });
 
@@ -42,10 +40,7 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
         ));
     };
 
-    let current_id = current_ws
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let current_id = current_ws.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let current_name = current_ws
         .get("name")
         .and_then(|v| v.as_str())
@@ -141,14 +136,8 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
         .iter()
         .filter(|o| o.get("Symbol").is_some())
         .count();
-    let hunk_count = overlaps
-        .iter()
-        .filter(|o| o.get("Hunk").is_some())
-        .count();
-    let file_count = overlaps
-        .iter()
-        .filter(|o| o.get("File").is_some())
-        .count();
+    let hunk_count = overlaps.iter().filter(|o| o.get("Hunk").is_some()).count();
+    let file_count = overlaps.iter().filter(|o| o.get("File").is_some()).count();
     let schema_count = overlaps
         .iter()
         .filter(|o| o.get("Schema").is_some())
