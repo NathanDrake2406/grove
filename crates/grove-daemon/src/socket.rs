@@ -8,6 +8,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -21,6 +22,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 const MAX_NDJSON_LINE_BYTES: usize = 1_048_576;
 const DEFAULT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_STATE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECTION_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 // === Error Types ===
 
@@ -289,6 +291,8 @@ impl SocketServer {
 
         info!(path = %self.path.display(), "socket server listening");
 
+        let mut connection_tasks = JoinSet::new();
+
         loop {
             tokio::select! {
                 accept_result = listener.accept() => {
@@ -300,7 +304,7 @@ impl SocketServer {
                             let shutdown_token = self.shutdown_token.clone();
                             let idle_connection_timeout = self.idle_connection_timeout;
                             let state_reply_timeout = self.state_reply_timeout;
-                            tokio::spawn(async move {
+                            connection_tasks.spawn(async move {
                                 if let Err(e) =
                                     handle_connection(
                                         stream,
@@ -322,9 +326,48 @@ impl SocketServer {
                         }
                     }
                 }
+                join_result = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                    if let Some(Err(join_error)) = join_result {
+                        warn!(error = %join_error, "connection task panicked");
+                    }
+                }
                 _ = shutdown.recv() => {
                     info!("socket server received shutdown signal");
                     break;
+                }
+            }
+        }
+
+        if !connection_tasks.is_empty() {
+            let deadline = tokio::time::Instant::now() + CONNECTION_SHUTDOWN_GRACE_PERIOD;
+            while !connection_tasks.is_empty() {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+
+                match timeout(deadline - now, connection_tasks.join_next()).await {
+                    Ok(Some(Ok(()))) => {}
+                    Ok(Some(Err(join_error))) => {
+                        warn!(error = %join_error, "connection task panicked during shutdown");
+                    }
+                    Ok(None) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        if !connection_tasks.is_empty() {
+            debug!(
+                remaining_connections = connection_tasks.len(),
+                "aborting active socket connection tasks"
+            );
+            connection_tasks.abort_all();
+            while let Some(join_result) = connection_tasks.join_next().await {
+                if let Err(join_error) = join_result
+                    && !join_error.is_cancelled()
+                {
+                    warn!(error = %join_error, "connection task panicked after abort");
                 }
             }
         }
@@ -654,7 +697,7 @@ async fn handle_request_with_options(
 mod tests {
     use super::*;
     use crate::state::{GroveConfig, spawn_state_actor};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
     use uuid::Uuid;
 
@@ -1217,6 +1260,51 @@ mod tests {
         state_tx.send(StateMessage::Shutdown).await.unwrap();
         state_handle.await.unwrap();
         assert!(!socket_path.exists(), "socket path should be cleaned up");
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_closes_active_connections() {
+        if !unix_socket_bind_supported() {
+            return;
+        }
+
+        let (_dir, socket_path, state_tx, state_handle, shutdown_tx, server_handle) =
+            start_test_server().await;
+
+        let mut stream = UnixStream::connect(&socket_path).await.unwrap();
+
+        drop(shutdown_tx);
+
+        let join_result = tokio::time::timeout(std::time::Duration::from_secs(1), server_handle)
+            .await
+            .expect("server task should terminate quickly after shutdown");
+        let run_result = join_result.expect("server task join should succeed");
+        assert!(
+            run_result.is_ok(),
+            "server should exit cleanly after shutdown: {run_result:?}"
+        );
+
+        let mut buf = [0_u8; 1];
+        match tokio::time::timeout(std::time::Duration::from_millis(500), stream.read(&mut buf))
+            .await
+        {
+            Ok(Ok(0)) => {}
+            Ok(Ok(bytes_read)) => {
+                panic!("expected connection close after shutdown, got {bytes_read} bytes")
+            }
+            Ok(Err(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::NotConnected
+                ) => {}
+            Ok(Err(e)) => panic!("expected connection close after shutdown, got read error: {e}"),
+            Err(_) => panic!("connection should close promptly after server shutdown"),
+        }
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
     }
 
     #[tokio::test]
