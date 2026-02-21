@@ -181,6 +181,66 @@ impl GitRepo {
     }
 }
 
+/// Enumerate all worktrees (main + linked) using gix.
+/// Returns Workspace structs with deterministic IDs (same as socket.rs sync_worktrees).
+pub(crate) fn enumerate_worktrees(
+    repo_path: &Path,
+) -> Result<Vec<grove_lib::Workspace>, WorkerError> {
+    let repo = gix::open(repo_path).map_err(|e| WorkerError::Gix {
+        context: "enumerate_worktrees",
+        repo_path: repo_path.to_path_buf(),
+        detail: e.to_string(),
+    })?;
+
+    let mut worktrees = Vec::new();
+
+    // Main worktree
+    if let Some(ws) = workspace_from_repo(&repo) {
+        worktrees.push(ws);
+    }
+
+    // Linked worktrees
+    if let Ok(proxies) = repo.worktrees() {
+        for proxy in proxies {
+            if let Ok(linked) = proxy.into_repo_with_possibly_inaccessible_worktree()
+                && let Some(ws) = workspace_from_repo(&linked)
+            {
+                worktrees.push(ws);
+            }
+        }
+    }
+
+    Ok(worktrees)
+}
+
+fn workspace_from_repo(repo: &gix::Repository) -> Option<grove_lib::Workspace> {
+    let path = repo.workdir()?.to_path_buf();
+    let head_ref = repo.head().ok()?;
+    let branch = head_ref
+        .referent_name()
+        .map(|name| name.as_bstr().to_string());
+    let name = match &branch {
+        Some(b) => b.strip_prefix("refs/heads/").unwrap_or(b).to_string(),
+        None => path.file_name()?.to_string_lossy().to_string(),
+    };
+
+    let id = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        path.to_string_lossy().as_bytes(),
+    );
+
+    Some(grove_lib::Workspace {
+        id,
+        name,
+        branch: branch.unwrap_or_default(),
+        path,
+        base_ref: String::new(),
+        created_at: chrono::Utc::now(),
+        last_activity: chrono::Utc::now(),
+        metadata: grove_lib::WorkspaceMetadata::default(),
+    })
+}
+
 /// Compute unified diff hunks from old/new content using the `similar` crate.
 ///
 /// Equivalent to `git diff --unified=0` but computed in-process from blob content
@@ -233,4 +293,93 @@ pub(crate) fn compute_hunks_from_content(old: Option<&[u8]>, new: Option<&[u8]>)
     }
 
     hunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    /// Create a temp git repo with an initial commit.
+    fn init_temp_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .output()
+                .unwrap()
+        };
+        run(&["init", "-b", "main"]);
+        std::fs::write(dir.path().join("README.md"), "# test\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+        dir
+    }
+
+    #[test]
+    fn enumerate_worktrees_finds_main_worktree() {
+        let dir = init_temp_repo();
+        let canon_dir = dir.path().canonicalize().unwrap();
+        let worktrees = enumerate_worktrees(&canon_dir).unwrap();
+
+        assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].path.canonicalize().unwrap(), canon_dir);
+        assert!(worktrees[0].branch.contains("main"));
+    }
+
+    #[test]
+    fn enumerate_worktrees_finds_main_and_linked() {
+        let dir = init_temp_repo();
+        // Canonicalize to handle macOS /var -> /private/var symlinks
+        let canon_dir = dir.path().canonicalize().unwrap();
+        let linked_path = canon_dir.join("linked-wt");
+
+        let output = Command::new("git")
+            .args(["worktree", "add", linked_path.to_str().unwrap(), "-b", "feature"])
+            .current_dir(&canon_dir)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
+
+        let worktrees = enumerate_worktrees(&canon_dir).unwrap();
+
+        assert_eq!(worktrees.len(), 2);
+        let paths: Vec<_> = worktrees.iter().map(|w| w.path.canonicalize().unwrap_or(w.path.clone())).collect();
+        assert!(paths.contains(&canon_dir), "main worktree not found in {paths:?}");
+        assert!(paths.contains(&linked_path), "linked worktree not found in {paths:?}");
+    }
+
+    #[test]
+    fn enumerate_worktrees_ids_are_deterministic() {
+        let dir = init_temp_repo();
+        let canon_dir = dir.path().canonicalize().unwrap();
+        let wt1 = enumerate_worktrees(&canon_dir).unwrap();
+        let wt2 = enumerate_worktrees(&canon_dir).unwrap();
+
+        assert_eq!(wt1.len(), wt2.len());
+        for (a, b) in wt1.iter().zip(wt2.iter()) {
+            assert_eq!(a.id, b.id, "IDs should be deterministic for same path");
+        }
+    }
+
+    #[test]
+    fn enumerate_worktrees_id_matches_uuid_v5_scheme() {
+        let dir = init_temp_repo();
+        let canon_dir = dir.path().canonicalize().unwrap();
+        let worktrees = enumerate_worktrees(&canon_dir).unwrap();
+
+        // The ID is computed from the path that gix returns (which may differ
+        // from canon_dir due to gix's own canonicalization). Verify it matches
+        // the UUID v5 scheme using the actual path gix reported.
+        let expected_id = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            worktrees[0].path.to_string_lossy().as_bytes(),
+        );
+        assert_eq!(worktrees[0].id, expected_id);
+    }
 }

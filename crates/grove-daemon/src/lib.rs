@@ -123,6 +123,14 @@ async fn run_inner(
         respect_gitignore: config.respect_gitignore,
     };
 
+    // .grove/ is always a sibling of .git/ (see bootstrap.rs:grove_dir_from_context)
+    let repo_git_dir = paths
+        .pid_file
+        .parent() // .grove/
+        .and_then(|p| p.parent()) // repo root
+        .map(|p| p.join(".git"))
+        .filter(|p| p.is_dir());
+
     // Create broadcast channel for coordinating shutdown across subsystems
     let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
     let watcher_shutdown_rx = shutdown_tx.subscribe();
@@ -132,6 +140,7 @@ async fn run_inner(
         watcher_config,
         config.base_branch.clone(),
         watcher_shutdown_rx,
+        repo_git_dir,
     ));
 
     // Create and run socket server
@@ -205,6 +214,7 @@ async fn run_watcher_loop(
     watcher_config: WatcherConfig,
     base_branch: String,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    repo_git_dir: Option<std::path::PathBuf>,
 ) -> Result<(), notify::Error> {
     use std::collections::HashMap;
 
@@ -224,6 +234,23 @@ async fn run_watcher_loop(
         &mut watched_workspaces,
     )
     .await;
+
+    // Watch .git/worktrees/ for worktree add/remove events
+    let mut git_worktrees_watched = false;
+    if let Some(ref git_dir) = repo_git_dir {
+        debouncer.set_git_dir(git_dir.clone());
+
+        let worktrees_dir = git_dir.join("worktrees");
+        if worktrees_dir.is_dir() {
+            match watcher.watch(&worktrees_dir, RecursiveMode::NonRecursive) {
+                Ok(()) => {
+                    info!(path = %worktrees_dir.display(), "watching git worktrees directory");
+                    git_worktrees_watched = true;
+                }
+                Err(e) => warn!(path = %worktrees_dir.display(), error = %e, "failed to watch .git/worktrees/"),
+            }
+        }
+    }
 
     let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
     let mut refresh_interval = tokio::time::interval(Duration::from_secs(2));
@@ -247,6 +274,7 @@ async fn run_watcher_loop(
                                 &watch_events,
                                 &watched_workspaces,
                                 &base_branch,
+                                &repo_git_dir,
                             ).await;
                             watch_events.clear();
                         }
@@ -257,7 +285,7 @@ async fn run_watcher_loop(
             _ = flush_interval.tick() => {
                 let watch_events = debouncer.flush_debounced();
                 if !watch_events.is_empty() {
-                    forward_watch_events(&state_tx, &watch_events, &watched_workspaces, &base_branch).await;
+                    forward_watch_events(&state_tx, &watch_events, &watched_workspaces, &base_branch, &repo_git_dir).await;
                 }
             }
             _ = refresh_interval.tick() => {
@@ -267,6 +295,20 @@ async fn run_watcher_loop(
                     &mut debouncer,
                     &mut watched_workspaces,
                 ).await;
+
+                // Retry watching .git/worktrees/ if it didn't exist at startup
+                // (created by the first `git worktree add`)
+                if !git_worktrees_watched
+                    && let Some(ref git_dir) = repo_git_dir
+                {
+                    let worktrees_dir = git_dir.join("worktrees");
+                    if worktrees_dir.is_dir()
+                        && watcher.watch(&worktrees_dir, RecursiveMode::NonRecursive).is_ok()
+                    {
+                        info!(path = %worktrees_dir.display(), "watching git worktrees directory (deferred)");
+                        git_worktrees_watched = true;
+                    }
+                }
             }
         }
     }
@@ -279,6 +321,7 @@ async fn forward_watch_events(
     events: &[WatchEvent],
     watched_workspaces: &std::collections::HashMap<grove_lib::WorkspaceId, std::path::PathBuf>,
     base_branch: &str,
+    repo_git_dir: &Option<std::path::PathBuf>,
 ) {
     for event in events {
         match event {
@@ -323,6 +366,47 @@ async fn forward_watch_events(
                 {
                     warn!(error = %e, "failed to forward BaseRefChanged event");
                     return;
+                }
+            }
+            WatchEvent::WorktreesChanged => {
+                let Some(git_dir) = repo_git_dir else {
+                    warn!("worktree change detected but no repo_git_dir configured");
+                    continue;
+                };
+                let repo_root = git_dir
+                    .parent()
+                    .unwrap_or(git_dir.as_path())
+                    .to_path_buf();
+
+                match tokio::task::spawn_blocking(move || {
+                    crate::git::enumerate_worktrees(&repo_root)
+                })
+                .await
+                {
+                    Ok(Ok(desired)) => {
+                        info!(count = desired.len(), "re-enumerated worktrees after change");
+                        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                        if let Err(e) = state_tx
+                            .send(StateMessage::SyncWorktrees {
+                                desired,
+                                reply: reply_tx,
+                            })
+                            .await
+                        {
+                            warn!(error = %e, "failed to send SyncWorktrees");
+                        } else if let Ok(result) = reply_rx.await {
+                            match result {
+                                Ok(sync) => info!(
+                                    added = sync.added.len(),
+                                    removed = sync.removed.len(),
+                                    "auto-synced worktrees"
+                                ),
+                                Err(e) => warn!(error = %e, "SyncWorktrees failed"),
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => warn!(error = %e, "failed to enumerate worktrees"),
+                    Err(e) => warn!(error = %e, "worktree enumeration task panicked"),
                 }
             }
         }

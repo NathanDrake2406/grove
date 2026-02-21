@@ -71,6 +71,8 @@ pub enum WatchEvent {
     FullReindexNeeded { workspace_id: WorkspaceId },
     /// Base branch ref changed.
     BaseRefChanged { ref_path: PathBuf },
+    /// The set of git worktrees changed (worktree added or removed).
+    WorktreesChanged,
 }
 
 /// Builds a gitignore matcher for a worktree path.
@@ -143,6 +145,21 @@ pub fn is_git_ref_change(path: &Path) -> bool {
     path_str.contains(".git/refs/remotes/") || path_str.ends_with("FETCH_HEAD")
 }
 
+/// Checks if a path represents a worktree directory being added or removed
+/// inside `.git/worktrees/`.
+pub fn is_git_worktree_change(path: &Path, git_dir: Option<&Path>) -> bool {
+    let Some(git_dir) = git_dir else {
+        return false;
+    };
+    let worktrees_dir = git_dir.join("worktrees");
+    if let Ok(relative) = path.strip_prefix(&worktrees_dir) {
+        // Direct child only (the worktree name directory itself)
+        relative.components().count() == 1
+    } else {
+        false
+    }
+}
+
 /// Determines which worktree a path belongs to based on registered worktree roots.
 pub fn find_worktree_for_path<'a>(
     path: &Path,
@@ -170,6 +187,7 @@ pub struct Debouncer {
     config: WatcherConfig,
     worktrees: HashMap<WorkspaceId, WorktreeWatchState>,
     git_dir: Option<PathBuf>,
+    pending_worktree_change: Option<Instant>,
 }
 
 impl Debouncer {
@@ -178,6 +196,7 @@ impl Debouncer {
             config,
             worktrees: HashMap::new(),
             git_dir: None,
+            pending_worktree_change: None,
         }
     }
 
@@ -208,6 +227,21 @@ impl Debouncer {
     /// window has elapsed or the circuit breaker trips.
     pub fn process_event(&mut self, event: &Event) -> Vec<WatchEvent> {
         let mut output = Vec::new();
+
+        // Check for worktree directory create/remove events (must precede the main
+        // filter which drops folder events).
+        match event.kind {
+            EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder) => {
+                for path in &event.paths {
+                    if is_git_worktree_change(path, self.git_dir.as_deref()) {
+                        info!(path = %path.display(), "git worktree change detected");
+                        self.pending_worktree_change = Some(Instant::now());
+                    }
+                }
+                return output; // Don't process folder events through the normal file pipeline
+            }
+            _ => {}
+        }
 
         // Only care about creates, modifies, and removes
         match event.kind {
@@ -292,6 +326,13 @@ impl Debouncer {
                 });
                 state.last_flush = now;
             }
+        }
+
+        if let Some(change_time) = self.pending_worktree_change
+            && now.duration_since(change_time) >= debounce_duration
+        {
+            self.pending_worktree_change = None;
+            output.push(WatchEvent::WorktreesChanged);
         }
 
         output
@@ -680,6 +721,115 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], WatchEvent::BaseRefChanged { .. }));
         assert_eq!(debouncer.pending_count(&ws_id), 1);
+    }
+
+    // --- is_git_worktree_change tests ---
+
+    #[test]
+    fn detects_direct_child_of_git_worktrees() {
+        let git_dir = PathBuf::from("/repo/.git");
+        assert!(is_git_worktree_change(
+            &PathBuf::from("/repo/.git/worktrees/new-branch"),
+            Some(git_dir.as_path()),
+        ));
+    }
+
+    #[test]
+    fn ignores_deeper_paths_inside_git_worktrees() {
+        let git_dir = PathBuf::from("/repo/.git");
+        assert!(!is_git_worktree_change(
+            &PathBuf::from("/repo/.git/worktrees/foo/HEAD"),
+            Some(git_dir.as_path()),
+        ));
+    }
+
+    #[test]
+    fn is_git_worktree_change_returns_false_with_no_git_dir() {
+        assert!(!is_git_worktree_change(
+            &PathBuf::from("/repo/.git/worktrees/new-branch"),
+            None,
+        ));
+    }
+
+    #[test]
+    fn is_git_worktree_change_ignores_unrelated_paths() {
+        let git_dir = PathBuf::from("/repo/.git");
+        assert!(!is_git_worktree_change(
+            &PathBuf::from("/repo/src/new-dir"),
+            Some(git_dir.as_path()),
+        ));
+    }
+
+    // --- WorktreesChanged debounce tests ---
+
+    fn make_folder_create_event(paths: Vec<PathBuf>) -> Event {
+        Event {
+            kind: EventKind::Create(CreateKind::Folder),
+            paths,
+            attrs: Default::default(),
+        }
+    }
+
+    fn make_folder_remove_event(paths: Vec<PathBuf>) -> Event {
+        Event {
+            kind: EventKind::Remove(RemoveKind::Folder),
+            paths,
+            attrs: Default::default(),
+        }
+    }
+
+    #[test]
+    fn folder_create_in_git_worktrees_sets_pending_and_flush_emits_worktrees_changed() {
+        let config = WatcherConfig {
+            debounce_ms: 0, // Flush immediately
+            ..Default::default()
+        };
+        let mut debouncer = Debouncer::new(config);
+        debouncer.set_git_dir(PathBuf::from("/repo/.git"));
+
+        let event = make_folder_create_event(vec![PathBuf::from(
+            "/repo/.git/worktrees/new-branch",
+        )]);
+        let immediate = debouncer.process_event(&event);
+        assert!(immediate.is_empty()); // Debounced, not immediate
+
+        let flushed = debouncer.flush_debounced();
+        assert_eq!(flushed.len(), 1);
+        assert!(matches!(&flushed[0], WatchEvent::WorktreesChanged));
+    }
+
+    #[test]
+    fn folder_remove_in_git_worktrees_emits_worktrees_changed() {
+        let config = WatcherConfig {
+            debounce_ms: 0,
+            ..Default::default()
+        };
+        let mut debouncer = Debouncer::new(config);
+        debouncer.set_git_dir(PathBuf::from("/repo/.git"));
+
+        let event = make_folder_remove_event(vec![PathBuf::from(
+            "/repo/.git/worktrees/old-branch",
+        )]);
+        debouncer.process_event(&event);
+
+        let flushed = debouncer.flush_debounced();
+        assert_eq!(flushed.len(), 1);
+        assert!(matches!(&flushed[0], WatchEvent::WorktreesChanged));
+    }
+
+    #[test]
+    fn non_worktree_folder_events_remain_ignored() {
+        let config = WatcherConfig::default();
+        let mut debouncer = Debouncer::new(config);
+        debouncer.set_git_dir(PathBuf::from("/repo/.git"));
+        let ws_id = Uuid::new_v4();
+        debouncer.register_worktree(ws_id, PathBuf::from("/repo"));
+
+        let event = make_folder_create_event(vec![PathBuf::from("/repo/src/new-dir")]);
+        let events = debouncer.process_event(&event);
+        assert!(events.is_empty());
+        assert_eq!(debouncer.pending_count(&ws_id), 0);
+        assert!(debouncer.pending_worktree_change.is_none());
     }
 
     #[test]
