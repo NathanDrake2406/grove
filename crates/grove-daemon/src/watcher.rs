@@ -154,6 +154,17 @@ pub fn find_worktree_for_path<'a>(
         .max_by_key(|(_, root)| root.components().count())
 }
 
+fn find_worktree_state_for_path(
+    path: &Path,
+    worktrees: &HashMap<WorkspaceId, WorktreeWatchState>,
+) -> Option<WorkspaceId> {
+    worktrees
+        .iter()
+        .filter(|(_, state)| path.starts_with(&state.root))
+        .max_by_key(|(_, state)| state.root.components().count())
+        .map(|(workspace_id, _)| *workspace_id)
+}
+
 /// Debouncer that collects filesystem events and flushes them in batches.
 pub struct Debouncer {
     config: WatcherConfig,
@@ -216,15 +227,8 @@ impl Debouncer {
                 continue;
             }
 
-            // Find which worktree this path belongs to
-            let worktree_roots: HashMap<WorkspaceId, PathBuf> = self
-                .worktrees
-                .iter()
-                .map(|(id, state)| (*id, state.root.clone()))
-                .collect();
-
-            if let Some((ws_id, _root)) = find_worktree_for_path(path, &worktree_roots) {
-                let ws_id = *ws_id;
+            // Find which worktree this path belongs to.
+            if let Some(ws_id) = find_worktree_state_for_path(path, &self.worktrees) {
                 if let Some(state) = self.worktrees.get_mut(&ws_id) {
                     // Check ignore patterns
                     if should_ignore(
@@ -270,9 +274,9 @@ impl Debouncer {
             if !state.pending_changes.is_empty()
                 && now.duration_since(state.last_flush) >= debounce_duration
             {
-                let paths: Vec<PathBuf> = state.pending_changes.drain(..).collect();
-                // Deduplicate
-                let mut unique_paths: Vec<PathBuf> = paths;
+                // Sorting + dedup was measurably faster than hash-based dedup in
+                // the current workload profile and keeps deterministic ordering.
+                let mut unique_paths: Vec<PathBuf> = state.pending_changes.drain(..).collect();
                 unique_paths.sort();
                 unique_paths.dedup();
 

@@ -197,19 +197,18 @@ impl Database {
         let overlaps_json = serde_json::to_string(&analysis.overlaps)?;
         let score_str = score_to_str(analysis.score);
         let merge_order_str = merge_order_to_str(analysis.merge_order_hint);
-
-        self.conn.execute(
+        let mut stmt = self.conn.prepare_cached(
             "INSERT OR REPLACE INTO pair_analyses (workspace_a, workspace_b, score, overlaps_json, merge_order_hint, computed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                analysis.workspace_a.to_string(),
-                analysis.workspace_b.to_string(),
-                score_str,
-                overlaps_json,
-                merge_order_str,
-                analysis.last_computed.to_rfc3339(),
-            ],
         )?;
+        stmt.execute(params![
+            analysis.workspace_a.to_string(),
+            analysis.workspace_b.to_string(),
+            score_str,
+            overlaps_json,
+            merge_order_str,
+            analysis.last_computed.to_rfc3339(),
+        ])?;
         Ok(())
     }
 
