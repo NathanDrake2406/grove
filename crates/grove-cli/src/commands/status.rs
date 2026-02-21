@@ -1,5 +1,7 @@
 use crate::client::DaemonClient;
 use crate::commands::CommandError;
+use std::collections::HashMap;
+use std::fmt::Write as _;
 
 /// Execute the `status` command, showing a workspace overview with conflicts.
 pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandError> {
@@ -33,7 +35,10 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
         .and_then(|v| if v.is_array() { Some(v) } else { None })
         .unwrap_or_else(|| serde_json::json!([]));
 
-    println!("{}", format_smart_status(&status_data, &workspaces, &analyses));
+    println!(
+        "{}",
+        format_smart_status(&status_data, &workspaces, &analyses)
+    );
     Ok(())
 }
 
@@ -56,9 +61,9 @@ pub fn format_status_output(data: &serde_json::Value) -> String {
     out.push_str("Grove Status\n");
     out.push_str(&"─".repeat(40));
     out.push('\n');
-    out.push_str(&format!("  Workspaces:  {workspace_count}\n"));
-    out.push_str(&format!("  Analyses:    {analysis_count}\n"));
-    out.push_str(&format!("  Base commit: {}\n", format_commit(base_commit)));
+    let _ = writeln!(out, "  Workspaces:  {workspace_count}");
+    let _ = writeln!(out, "  Analyses:    {analysis_count}");
+    let _ = writeln!(out, "  Base commit: {}", format_commit(base_commit));
     out
 }
 
@@ -84,11 +89,13 @@ pub fn format_smart_status(
     out.push_str("Grove Status\n");
     out.push_str(&"\u{2500}".repeat(50));
     out.push('\n');
-    out.push_str(&format!(
-        "  {} worktrees  |  base: {}\n\n",
+    let _ = writeln!(
+        out,
+        "  {} worktrees  |  base: {}",
         workspace_count,
         format_commit(base_commit)
-    ));
+    );
+    out.push('\n');
 
     // List worktrees.
     if let Some(ws_array) = workspaces.as_array() {
@@ -101,35 +108,42 @@ pub fn format_smart_status(
                 .strip_prefix("refs/heads/")
                 .unwrap_or("");
             if branch == name || branch.is_empty() {
-                out.push_str(&format!("  {name}\n"));
+                let _ = writeln!(out, "  {name}");
             } else {
-                out.push_str(&format!("  {name}  ({branch})\n"));
+                let _ = writeln!(out, "  {name}  ({branch})");
             }
         }
         out.push('\n');
     }
 
     // Separate conflicts from clean pairs.
-    let conflict_pairs: Vec<_> = analyses
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter(|a| {
-                    let score = a.get("score").and_then(|v| v.as_str()).unwrap_or("Green");
-                    score != "Green"
-                })
-                .collect()
+    let analyses = analyses.as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let conflict_count = analyses
+        .iter()
+        .filter(|analysis| {
+            let score = analysis
+                .get("score")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Green");
+            score != "Green"
         })
-        .unwrap_or_default();
+        .count();
 
-    if conflict_pairs.is_empty() {
+    if conflict_count == 0 {
         out.push_str("  All worktrees clean \u{2014} no conflicts detected.\n");
         return out;
     }
 
-    out.push_str(&format!("  {} conflict(s):\n\n", conflict_pairs.len()));
+    let _ = writeln!(out, "  {} conflict(s):", conflict_count);
+    out.push('\n');
 
-    for analysis in &conflict_pairs {
+    for analysis in analyses.iter().filter(|analysis| {
+        let score = analysis
+            .get("score")
+            .and_then(|value| value.as_str())
+            .unwrap_or("Green");
+        score != "Green"
+    }) {
         let score = analysis
             .get("score")
             .and_then(|v| v.as_str())
@@ -142,22 +156,17 @@ pub fn format_smart_status(
             .get("workspace_b")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        let name_a = id_to_name
-            .get(ws_a_id)
-            .map(|s| s.as_str())
-            .unwrap_or(ws_a_id);
-        let name_b = id_to_name
-            .get(ws_b_id)
-            .map(|s| s.as_str())
-            .unwrap_or(ws_b_id);
+        let name_a = id_to_name.get(ws_a_id).copied().unwrap_or(ws_a_id);
+        let name_b = id_to_name.get(ws_b_id).copied().unwrap_or(ws_b_id);
         let overlaps = analysis
             .get("overlaps")
             .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
 
-        out.push_str(&format!("  [{score}] {name_a} <-> {name_b}\n\n"));
-        out.push_str(&format_overlaps_grouped(&overlaps));
+        let _ = writeln!(out, "  [{score}] {name_a} <-> {name_b}");
+        out.push('\n');
+        out.push_str(&format_overlaps_grouped(overlaps));
         out.push('\n');
     }
 
@@ -165,15 +174,15 @@ pub fn format_smart_status(
 }
 
 /// Build a map from workspace ID to workspace name.
-fn build_id_name_map(workspaces: &serde_json::Value) -> std::collections::HashMap<String, String> {
-    let mut map = std::collections::HashMap::new();
+fn build_id_name_map<'a>(workspaces: &'a serde_json::Value) -> HashMap<&'a str, &'a str> {
+    let mut map = HashMap::new();
     if let Some(arr) = workspaces.as_array() {
         for ws in arr {
             if let (Some(id), Some(name)) = (
                 ws.get("id").and_then(|v| v.as_str()),
                 ws.get("name").and_then(|v| v.as_str()),
             ) {
-                map.insert(id.to_string(), name.to_string());
+                map.insert(id, name);
             }
         }
     }
@@ -182,74 +191,92 @@ fn build_id_name_map(workspaces: &serde_json::Value) -> std::collections::HashMa
 
 /// Group overlaps by type and format with section headers.
 fn format_overlaps_grouped(overlaps: &[serde_json::Value]) -> String {
-    let mut files: Vec<String> = Vec::new();
-    let mut hunks: Vec<String> = Vec::new();
-    let mut symbols: Vec<String> = Vec::new();
-    let mut deps: Vec<String> = Vec::new();
-    let mut schemas: Vec<String> = Vec::new();
-
-    for overlap in overlaps {
-        if let Some(data) = overlap.get("File") {
-            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            files.push(path.to_string());
-        } else if let Some(data) = overlap.get("Hunk") {
-            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let a_start = data.get("a_range").and_then(|v| v.get("start")).and_then(|v| v.as_u64());
-            let a_end = data.get("a_range").and_then(|v| v.get("end")).and_then(|v| v.as_u64());
-            match (a_start, a_end) {
-                (Some(s), Some(e)) => hunks.push(format!("{path}:{s}-{e}")),
-                _ => hunks.push(path.to_string()),
-            }
-        } else if let Some(data) = overlap.get("Symbol") {
-            let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-            let name = data.get("symbol_name").and_then(|v| v.as_str()).unwrap_or("?");
-            symbols.push(format!("{name}() in {path}"));
-        } else if let Some(data) = overlap.get("Dependency") {
-            let changed = data.get("changed_file").and_then(|v| v.as_str()).unwrap_or("?");
-            let affected = data.get("affected_file").and_then(|v| v.as_str()).unwrap_or("?");
-            deps.push(format!("{changed} \u{2192} {affected}"));
-        } else if let Some(data) = overlap.get("Schema") {
-            let cat = data.get("category").and_then(|v| v.as_str()).unwrap_or("?");
-            let a_file = data.get("a_file").and_then(|v| v.as_str()).unwrap_or("?");
-            let b_file = data.get("b_file").and_then(|v| v.as_str()).unwrap_or("?");
-            schemas.push(format!("[{cat}] {a_file} vs {b_file}"));
-        }
-    }
-
     let mut out = String::new();
 
-    if !files.is_empty() {
+    if overlaps.iter().any(|overlap| overlap.get("File").is_some()) {
         out.push_str("    Both branches edit the same files:\n");
-        for f in &files {
-            out.push_str(&format!("      {f}\n"));
+        for overlap in overlaps {
+            if let Some(data) = overlap.get("File") {
+                let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                let _ = writeln!(out, "      {path}");
+            }
         }
     }
 
-    if !hunks.is_empty() {
+    if overlaps.iter().any(|overlap| overlap.get("Hunk").is_some()) {
         out.push_str("    Both branches change the same lines:\n");
-        for h in &hunks {
-            out.push_str(&format!("      {h}\n"));
+        for overlap in overlaps {
+            if let Some(data) = overlap.get("Hunk") {
+                let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                let a_start = data
+                    .get("a_range")
+                    .and_then(|v| v.get("start"))
+                    .and_then(|v| v.as_u64());
+                let a_end = data
+                    .get("a_range")
+                    .and_then(|v| v.get("end"))
+                    .and_then(|v| v.as_u64());
+                match (a_start, a_end) {
+                    (Some(start), Some(end)) => {
+                        let _ = writeln!(out, "      {path}:{start}-{end}");
+                    }
+                    _ => {
+                        let _ = writeln!(out, "      {path}");
+                    }
+                }
+            }
         }
     }
 
-    if !symbols.is_empty() {
+    if overlaps
+        .iter()
+        .any(|overlap| overlap.get("Symbol").is_some())
+    {
         out.push_str("    Both branches modify the same functions:\n");
-        for s in &symbols {
-            out.push_str(&format!("      {s}\n"));
+        for overlap in overlaps {
+            if let Some(data) = overlap.get("Symbol") {
+                let path = data.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+                let name = data
+                    .get("symbol_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let _ = writeln!(out, "      {name}() in {path}");
+            }
         }
     }
 
-    if !deps.is_empty() {
+    if overlaps
+        .iter()
+        .any(|overlap| overlap.get("Dependency").is_some())
+    {
         out.push_str("    One branch's changes affect the other's imports:\n");
-        for d in &deps {
-            out.push_str(&format!("      {d}\n"));
+        for overlap in overlaps {
+            if let Some(data) = overlap.get("Dependency") {
+                let changed = data
+                    .get("changed_file")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let affected = data
+                    .get("affected_file")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let _ = writeln!(out, "      {changed} \u{2192} {affected}");
+            }
         }
     }
 
-    if !schemas.is_empty() {
+    if overlaps
+        .iter()
+        .any(|overlap| overlap.get("Schema").is_some())
+    {
         out.push_str("    Both branches touch shared config/schemas:\n");
-        for s in &schemas {
-            out.push_str(&format!("      {s}\n"));
+        for overlap in overlaps {
+            if let Some(data) = overlap.get("Schema") {
+                let category = data.get("category").and_then(|v| v.as_str()).unwrap_or("?");
+                let a_file = data.get("a_file").and_then(|v| v.as_str()).unwrap_or("?");
+                let b_file = data.get("b_file").and_then(|v| v.as_str()).unwrap_or("?");
+                let _ = writeln!(out, "      [{category}] {a_file} vs {b_file}");
+            }
         }
     }
 

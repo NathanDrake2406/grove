@@ -1,5 +1,6 @@
 use crate::client::DaemonClient;
 use crate::commands::CommandError;
+use std::fmt::Write as _;
 
 /// Execute the `conflicts` command, showing overlaps between two workspaces.
 pub async fn execute(
@@ -8,9 +9,18 @@ pub async fn execute(
     workspace_b: &str,
     json: bool,
 ) -> Result<(), CommandError> {
-    // Resolve human-friendly names to UUIDs.
-    let id_a = resolve_workspace_id(client, workspace_a).await?;
-    let id_b = resolve_workspace_id(client, workspace_b).await?;
+    // Resolve human-friendly names to UUIDs from a single workspace snapshot.
+    let response = client.list_workspaces().await?;
+    if !response.ok {
+        return Err(CommandError::DaemonError(
+            "failed to list workspaces for name resolution".to_string(),
+        ));
+    }
+    let workspace_data = response.data.unwrap_or_default();
+    let workspace_list = workspace_data.as_array().map(Vec::as_slice).unwrap_or(&[]);
+
+    let id_a = resolve_workspace_id(workspace_list, workspace_a)?;
+    let id_b = resolve_workspace_id(workspace_list, workspace_b)?;
 
     let response = client.conflicts(&id_a, &id_b).await?;
 
@@ -42,22 +52,10 @@ pub async fn execute(
 /// - An exact branch short name (e.g. "feature/auth" matches refs/heads/feature/auth)
 ///
 /// Errors if no workspace matches or if multiple workspaces match.
-async fn resolve_workspace_id(
-    client: &DaemonClient,
+fn resolve_workspace_id(
+    workspaces: &[serde_json::Value],
     query: &str,
 ) -> Result<String, CommandError> {
-    let response = client.list_workspaces().await?;
-    if !response.ok {
-        return Err(CommandError::DaemonError(
-            "failed to list workspaces for name resolution".to_string(),
-        ));
-    }
-
-    let workspaces = response
-        .data
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default();
-
     let matches: Vec<_> = workspaces
         .iter()
         .filter(|ws| workspace_matches_exact(ws, query))
@@ -68,10 +66,7 @@ async fn resolve_workspace_id(
             "no workspace matching '{query}'"
         ))),
         1 => {
-            let id = matches[0]
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let id = matches[0].get("id").and_then(|v| v.as_str()).unwrap_or("");
             Ok(id.to_string())
         }
         _ => {
@@ -115,55 +110,51 @@ pub fn format_conflicts_output(data: &serde_json::Value) -> String {
         .get("score")
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown");
-    let overlaps = data
-        .get("overlaps")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let overlaps = data.get("overlaps").and_then(|v| v.as_array());
+    let overlap_count = overlaps.map_or(0, Vec::len);
     let merge_order = data
         .get("merge_order_hint")
         .and_then(|v| v.as_str())
         .unwrap_or("Unknown");
 
-    out.push_str(&format!("Score: {}\n", format_score(score)));
-    out.push_str(&format!(
-        "Merge order: {}\n",
-        format_merge_order(merge_order)
-    ));
-    out.push_str(&format!("Overlaps: {}\n", overlaps.len()));
+    let _ = writeln!(out, "Score: {}", format_score(score));
+    let _ = writeln!(out, "Merge order: {}", format_merge_order(merge_order));
+    let _ = writeln!(out, "Overlaps: {overlap_count}");
     out.push_str(&"─".repeat(60));
     out.push('\n');
 
-    if overlaps.is_empty() {
+    if overlap_count == 0 {
         out.push_str("No conflicts detected.\n");
         return out;
     }
 
-    for overlap in &overlaps {
-        out.push_str(&format_overlap(overlap));
-        out.push('\n');
+    if let Some(overlaps) = overlaps {
+        for overlap in overlaps {
+            out.push_str(&format_overlap(overlap));
+            out.push('\n');
+        }
     }
 
     out
 }
 
-fn format_score(score: &str) -> String {
+fn format_score(score: &str) -> &str {
     match score {
-        "Green" => "GREEN (orthogonal)".to_string(),
-        "Yellow" => "YELLOW (minor overlap)".to_string(),
-        "Red" => "RED (significant conflict)".to_string(),
-        "Black" => "BLACK (critical conflict)".to_string(),
-        other => other.to_string(),
+        "Green" => "GREEN (orthogonal)",
+        "Yellow" => "YELLOW (minor overlap)",
+        "Red" => "RED (significant conflict)",
+        "Black" => "BLACK (critical conflict)",
+        other => other,
     }
 }
 
-fn format_merge_order(order: &str) -> String {
+fn format_merge_order(order: &str) -> &str {
     match order {
-        "AFirst" => "Merge A first".to_string(),
-        "BFirst" => "Merge B first".to_string(),
-        "Either" => "Either order".to_string(),
-        "NeedsCoordination" => "Needs coordination".to_string(),
-        other => other.to_string(),
+        "AFirst" => "Merge A first",
+        "BFirst" => "Merge B first",
+        "Either" => "Either order",
+        "NeedsCoordination" => "Needs coordination",
+        other => other,
     }
 }
 
