@@ -206,25 +206,18 @@ mod tests {
             // Choose how many files to include (subset of pool by index)
             (0usize..=4usize).prop_flat_map(move |count| {
                 let chosen_paths: Vec<PathBuf> = paths[..count].to_vec();
-                let strategies: Vec<_> = chosen_paths
-                    .into_iter()
-                    .map(arb_file_change_for)
-                    .collect();
+                let strategies: Vec<_> =
+                    chosen_paths.into_iter().map(arb_file_change_for).collect();
 
-                (
-                    strategies,
-                    0u32..10u32,
-                    0u32..10u32,
+                (strategies, 0u32..10u32, 0u32..10u32).prop_map(
+                    |(changed_files, commits_ahead, commits_behind)| WorkspaceChangeset {
+                        workspace_id: Uuid::new_v4(),
+                        merge_base: "abc123".into(),
+                        changed_files,
+                        commits_ahead,
+                        commits_behind,
+                    },
                 )
-                    .prop_map(|(changed_files, commits_ahead, commits_behind)| {
-                        WorkspaceChangeset {
-                            workspace_id: Uuid::new_v4(),
-                            merge_base: "abc123".into(),
-                            changed_files,
-                            commits_ahead,
-                            commits_behind,
-                        }
-                    })
             })
         }
 

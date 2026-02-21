@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::app::{App, FocusedPanel, ViewState};
@@ -63,9 +63,12 @@ fn render_error(err: &str, frame: &mut Frame, area: Rect) {
         .title(" Error ")
         .borders(Borders::ALL)
         .style(Style::default().fg(Color::Red));
-    let p = Paragraph::new(format!("Fatal Error: {}\n\nPress 'q' or 'ESC' to exit.", err))
-        .block(block)
-        .style(Style::default().fg(Color::Red));
+    let p = Paragraph::new(format!(
+        "Fatal Error: {}\n\nPress 'q' or 'ESC' to exit.",
+        err
+    ))
+    .block(block)
+    .style(Style::default().fg(Color::Red));
     frame.render_widget(p, area);
 }
 
@@ -75,9 +78,9 @@ fn render_dashboard(app: &App, frame: &mut Frame, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // summary bar
-            Constraint::Fill(1),  // worktrees panel
-            Constraint::Fill(1),  // conflicts panel
-            Constraint::Fill(1),  // detail panel
+            Constraint::Fill(1),   // worktrees panel
+            Constraint::Fill(1),   // conflicts panel
+            Constraint::Fill(1),   // detail panel
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -134,13 +137,33 @@ fn render_summary_bar(app: &App, frame: &mut Frame, area: Rect) {
 fn render_footer(app: &App, frame: &mut Frame, area: Rect) {
     let _ = app; // available for future context-sensitive hints
     let line = Line::from(vec![
-        Span::styled(" \u{2190}\u{2192}", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " \u{2190}\u{2192}",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" panel  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("\u{2191}\u{2193}", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "\u{2191}\u{2193}",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" navigate  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("r", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "r",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" refresh  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "q",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" quit", Style::default().fg(Color::DarkGray)),
     ]);
     let p = Paragraph::new(line);
@@ -191,7 +214,11 @@ fn render_worktrees_panel(app: &App, frame: &mut Frame, area: Rect) {
         })
         .collect();
 
-    let title = if focused { " > Worktrees " } else { " Worktrees " };
+    let title = if focused {
+        " > Worktrees "
+    } else {
+        " Worktrees "
+    };
     let list = List::new(items).block(
         Block::default()
             .title(title)
@@ -208,7 +235,11 @@ fn render_pairs_panel(app: &App, frame: &mut Frame, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let title = if focused { " > Conflicts " } else { " Conflicts " };
+    let title = if focused {
+        " > Conflicts "
+    } else {
+        " Conflicts "
+    };
 
     let block = Block::default()
         .title(title)
@@ -227,11 +258,9 @@ fn render_pairs_panel(app: &App, frame: &mut Frame, area: Rect) {
     let pairs = app.get_pairs_for_worktree(&selected_ws.id);
 
     if pairs.is_empty() {
-        let p = Paragraph::new(
-            "\n  No conflicts \u{2014} this worktree is clean.",
-        )
-        .block(block)
-        .style(Style::default().fg(Color::Green));
+        let p = Paragraph::new("\n  No conflicts \u{2014} this worktree is clean.")
+            .block(block)
+            .style(Style::default().fg(Color::Green));
         frame.render_widget(p, area);
         return;
     }
@@ -355,10 +384,7 @@ fn render_detail_panel(app: &App, frame: &mut Frame, area: Rect) {
                 ]),
                 Line::from(vec![
                     Span::styled("  path        ".to_string(), label_style),
-                    Span::styled(
-                        selected_ws.path.to_string_lossy().into_owned(),
-                        value_style,
-                    ),
+                    Span::styled(selected_ws.path.to_string_lossy().into_owned(), value_style),
                 ]),
                 Line::from(vec![
                     Span::styled("  conflicts   ".to_string(), label_style),
@@ -399,8 +425,7 @@ fn render_detail_panel(app: &App, frame: &mut Frame, area: Rect) {
                     frame.render_widget(p, area);
                 }
                 None => {
-                    let p =
-                        Paragraph::new("Select a conflict pair to view details.").block(block);
+                    let p = Paragraph::new("Select a conflict pair to view details.").block(block);
                     frame.render_widget(p, area);
                 }
             }
@@ -459,10 +484,7 @@ fn build_overlap_lines<'a>(analysis: &'a WorkspacePairAnalysis, app: &'a App) ->
             Overlap::Symbol {
                 path, symbol_name, ..
             } => {
-                symbols.push((
-                    path.to_string_lossy().into_owned(),
-                    symbol_name.clone(),
-                ));
+                symbols.push((path.to_string_lossy().into_owned(), symbol_name.clone()));
             }
             Overlap::Dependency {
                 changed_file,
@@ -508,9 +530,7 @@ fn build_overlap_lines<'a>(analysis: &'a WorkspacePairAnalysis, app: &'a App) ->
     if !hunks.is_empty() {
         lines.push(Line::from(Span::styled(
             "  Both branches change the same lines:",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
         for (path, start, end, distance) in hunks {
             let color = if distance == 0 {
@@ -529,9 +549,7 @@ fn build_overlap_lines<'a>(analysis: &'a WorkspacePairAnalysis, app: &'a App) ->
     if !symbols.is_empty() {
         lines.push(Line::from(Span::styled(
             "  Both branches modify the same functions:",
-            Style::default()
-                .fg(Color::Red)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
         for (path, name) in symbols {
             lines.push(Line::from(format!("    {name}() in {path}")));

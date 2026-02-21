@@ -263,11 +263,7 @@ fn extract_spec_symbols(
 }
 
 /// Collect import specs from an import_declaration or import_spec_list node.
-fn collect_import_specs(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    imports: &mut Vec<Import>,
-) {
+fn collect_import_specs(node: tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<Import>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -328,7 +324,13 @@ func (s *Server) HandleRequest(w http.ResponseWriter, r *http.Request) {
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0].name, "processPayment");
         assert_eq!(symbols[0].kind, SymbolKind::Function);
-        assert!(symbols[0].signature.as_ref().unwrap().contains("func processPayment"));
+        assert!(
+            symbols[0]
+                .signature
+                .as_ref()
+                .unwrap()
+                .contains("func processPayment")
+        );
         assert_eq!(symbols[1].name, "HandleRequest");
         assert_eq!(symbols[1].kind, SymbolKind::Method);
     }
@@ -535,10 +537,26 @@ func (s *Set[T]) Add(item T) {
         let analyzer = GoAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Set" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "Pair" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "Map" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "Add" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Set" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Pair" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Map" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Add" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -705,7 +723,10 @@ func (b *Buffer) Reset() { b.data = b.data[:0] }
         let analyzer = GoAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        let methods: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::Method).collect();
+        let methods: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Method)
+            .collect();
         assert_eq!(methods.len(), 2);
         assert_eq!(methods[0].name, "Len");
         assert_eq!(methods[1].name, "Reset");
@@ -953,7 +974,10 @@ func Second() {}
         assert!(registry.analyzer_for_file(Path::new("server.go")).is_some());
         // Not Go files
         assert_ne!(
-            registry.analyzer_for_file(Path::new("lib.rs")).unwrap().language_id(),
+            registry
+                .analyzer_for_file(Path::new("lib.rs"))
+                .unwrap()
+                .language_id(),
             "go"
         );
     }
@@ -1041,8 +1065,16 @@ type Embedded interface {
         let analyzer = GoAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Outer" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "InnerStruct" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Outer" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "InnerStruct" && s.kind == SymbolKind::Struct)
+        );
         assert!(
             symbols
                 .iter()
@@ -1084,13 +1116,21 @@ func (a *ApiResponse) Format() string {
         let analyzer = GoAnalyzer::new();
 
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "ApiResponse" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ApiResponse" && s.kind == SymbolKind::Struct)
+        );
         assert!(
             symbols
                 .iter()
                 .any(|s| s.name == "HandleHealth" && s.kind == SymbolKind::Function)
         );
-        assert!(symbols.iter().any(|s| s.name == "Format" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Format" && s.kind == SymbolKind::Method)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert_eq!(imports.len(), 3);
@@ -1124,8 +1164,16 @@ func Map[T, U any](slice []T, f func(T) U) []U {
         let analyzer = GoAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Set" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "Map" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Set" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Map" && s.kind == SymbolKind::Function)
+        );
     }
 
     #[test]
@@ -1140,9 +1188,15 @@ func Map[T, U any](slice []T, f func(T) U) []U {
         let symbols = analyzer.extract_symbols(source).unwrap();
 
         assert_eq!(symbols[0].name, "Alpha");
-        assert_eq!(symbols[0].range.start, 3, "Alpha should be on line 3 (1-based)");
+        assert_eq!(
+            symbols[0].range.start, 3,
+            "Alpha should be on line 3 (1-based)"
+        );
         assert_eq!(symbols[1].name, "Beta");
-        assert_eq!(symbols[1].range.start, 5, "Beta should be on line 5 (1-based)");
+        assert_eq!(
+            symbols[1].range.start, 5,
+            "Beta should be on line 5 (1-based)"
+        );
     }
 
     #[test]
@@ -1266,9 +1320,18 @@ func divide(a, b int) (result int, err error) {
         assert_eq!(symbols[0].kind, SymbolKind::Function);
 
         let sig = symbols[0].signature.as_ref().unwrap();
-        assert!(sig.contains("divide"), "signature should contain function name");
-        assert!(sig.contains("result int"), "signature should contain named return 'result int'");
-        assert!(sig.contains("err error"), "signature should contain named return 'err error'");
+        assert!(
+            sig.contains("divide"),
+            "signature should contain function name"
+        );
+        assert!(
+            sig.contains("result int"),
+            "signature should contain named return 'result int'"
+        );
+        assert!(
+            sig.contains("err error"),
+            "signature should contain named return 'err error'"
+        );
     }
 
     #[test]

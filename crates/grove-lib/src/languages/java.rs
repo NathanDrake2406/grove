@@ -420,15 +420,21 @@ interface Repository {
         let analyzer = JavaAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "createUser" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UserService" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "createUser" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface)
+        );
     }
 
     #[test]
@@ -444,12 +450,16 @@ public record Point(int x, int y) {
         let analyzer = JavaAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Color" && s.kind == SymbolKind::Enum));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Point" && s.kind == SymbolKind::Class));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Color" && s.kind == SymbolKind::Enum)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Point" && s.kind == SymbolKind::Class)
+        );
     }
 
     #[test]
@@ -468,18 +478,26 @@ public class User {
         let analyzer = JavaAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "User" && s.kind == SymbolKind::Method)); // constructor
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "name" && s.kind == SymbolKind::Variable));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "age" && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "User" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "User" && s.kind == SymbolKind::Method)
+        ); // constructor
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "name" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "age" && s.kind == SymbolKind::Variable)
+        );
     }
 
     #[test]
@@ -491,9 +509,11 @@ public @interface MyAnnotation {
         let analyzer = JavaAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "MyAnnotation" && s.kind == SymbolKind::Interface));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "MyAnnotation" && s.kind == SymbolKind::Interface)
+        );
     }
 
     #[test]
@@ -709,18 +729,26 @@ public class Outer {
         let analyzer = JavaAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Outer" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Inner" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "innerMethod" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "StaticNested" && s.kind == SymbolKind::Class));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Outer" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Inner" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "innerMethod" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "StaticNested" && s.kind == SymbolKind::Class)
+        );
     }
 
     #[test]
@@ -738,15 +766,21 @@ public interface Comparable<T> {
         let analyzer = JavaAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Box" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "getValue" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Comparable" && s.kind == SymbolKind::Interface));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Box" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "getValue" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Comparable" && s.kind == SymbolKind::Interface)
+        );
     }
 
     #[test]
@@ -785,15 +819,19 @@ public class UserController {
         assert!(symbols.iter().any(|s| s.name == "getUsers"));
         assert!(symbols.iter().any(|s| s.name == "createUser"));
         assert!(symbols.iter().any(|s| s.name == "validateUser"));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "userService" && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "userService" && s.kind == SymbolKind::Variable)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert_eq!(imports.len(), 5);
-        assert!(imports
-            .iter()
-            .any(|i| i.source == "org.springframework.web.bind.annotation.RestController"));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.source == "org.springframework.web.bind.annotation.RestController")
+        );
         assert!(imports.iter().any(|i| i.source == "java.util.List"));
 
         let exports = analyzer.extract_exports(source).unwrap();
@@ -833,9 +871,11 @@ public class Main {
         assert!(analyzer.is_some());
         assert_eq!(analyzer.unwrap().language_id(), "java");
 
-        assert!(registry
-            .analyzer_for_file(Path::new("src/com/example/Service.java"))
-            .is_some());
+        assert!(
+            registry
+                .analyzer_for_file(Path::new("src/com/example/Service.java"))
+                .is_some()
+        );
         assert_ne!(
             registry
                 .analyzer_for_file(Path::new("lib.rs"))

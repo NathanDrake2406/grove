@@ -73,33 +73,48 @@ impl App {
     pub async fn refresh_data(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Fetch status for base_commit
         let status_resp = self.client.status().await?;
-        if let Some(commit) = status_resp.ok
+        if let Some(commit) = status_resp
+            .ok
             .then_some(status_resp.data.as_ref())
             .flatten()
             .and_then(|d| d.get("base_commit"))
             .and_then(|v| v.as_str())
         {
-            let short = if commit.len() > 8 { &commit[..8] } else { commit };
+            let short = if commit.len() > 8 {
+                &commit[..8]
+            } else {
+                commit
+            };
             self.base_commit = short.to_string();
         }
 
         // Fetch workspaces
         let ws_resp = self.client.list_workspaces().await?;
         if !ws_resp.ok {
-            self.set_error(ws_resp.error.unwrap_or_else(|| "Failed to list workspaces".to_string()));
+            self.set_error(
+                ws_resp
+                    .error
+                    .unwrap_or_else(|| "Failed to list workspaces".to_string()),
+            );
             return Ok(());
         }
 
-        let new_workspaces: Vec<Workspace> = serde_json::from_value(ws_resp.data.unwrap_or_default())?;
+        let new_workspaces: Vec<Workspace> =
+            serde_json::from_value(ws_resp.data.unwrap_or_default())?;
 
         // Fetch analyses
         let an_resp = self.client.get_all_analyses().await?;
         if !an_resp.ok {
-            self.set_error(an_resp.error.unwrap_or_else(|| "Failed to get analyses".to_string()));
+            self.set_error(
+                an_resp
+                    .error
+                    .unwrap_or_else(|| "Failed to get analyses".to_string()),
+            );
             return Ok(());
         }
 
-        let new_analyses: Vec<WorkspacePairAnalysis> = serde_json::from_value(an_resp.data.unwrap_or_default())?;
+        let new_analyses: Vec<WorkspacePairAnalysis> =
+            serde_json::from_value(an_resp.data.unwrap_or_default())?;
 
         let changed = self.workspaces.len() != new_workspaces.len()
             || self.analyses.len() != new_analyses.len()
@@ -138,7 +153,11 @@ impl App {
         Ok(())
     }
 
-    fn analyses_are_equal(&self, old: &[WorkspacePairAnalysis], new: &[WorkspacePairAnalysis]) -> bool {
+    fn analyses_are_equal(
+        &self,
+        old: &[WorkspacePairAnalysis],
+        new: &[WorkspacePairAnalysis],
+    ) -> bool {
         if old.len() != new.len() {
             return false;
         }
@@ -269,7 +288,10 @@ impl App {
 
     /// Gets all analyses where the given workspace ID is either workspace_a or workspace_b.
     /// Filters out pairs that have a Green score (no conflicts).
-    pub fn get_pairs_for_worktree(&self, id: &grove_lib::WorkspaceId) -> Vec<&WorkspacePairAnalysis> {
+    pub fn get_pairs_for_worktree(
+        &self,
+        id: &grove_lib::WorkspaceId,
+    ) -> Vec<&WorkspacePairAnalysis> {
         self.analyses
             .iter()
             .filter(|a| {

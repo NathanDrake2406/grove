@@ -76,11 +76,7 @@ fn is_record_struct(node: tree_sitter::Node<'_>) -> bool {
 
 /// Recursively extract declarations from the AST, descending into
 /// namespaces and type bodies.
-fn extract_declarations(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    symbols: &mut Vec<Symbol>,
-) {
+fn extract_declarations(node: tree_sitter::Node<'_>, source: &[u8], symbols: &mut Vec<Symbol>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -231,11 +227,7 @@ fn extract_declarations(
 
 /// Extract variable names from a field_declaration node.
 /// Structure: field_declaration → variable_declaration → variable_declarator → identifier
-fn extract_field_symbols(
-    field: tree_sitter::Node<'_>,
-    source: &[u8],
-    symbols: &mut Vec<Symbol>,
-) {
+fn extract_field_symbols(field: tree_sitter::Node<'_>, source: &[u8], symbols: &mut Vec<Symbol>) {
     let mut cursor = field.walk();
     for child in field.children(&mut cursor) {
         if child.kind() == "variable_declaration" {
@@ -261,11 +253,7 @@ fn extract_field_symbols(
 
 /// Recursively collect using directives from the AST.
 /// Handles top-level usings and usings inside namespace bodies.
-fn collect_using_directives(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    imports: &mut Vec<Import>,
-) {
+fn collect_using_directives(node: tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<Import>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         match child.kind() {
@@ -366,8 +354,7 @@ fn parse_using_directive(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<I
 fn has_public_modifier(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let mut cursor = node.walk();
     node.children(&mut cursor).any(|child| {
-        child.kind() == "modifier"
-            && child.utf8_text(source).unwrap_or("") == "public"
+        child.kind() == "modifier" && child.utf8_text(source).unwrap_or("") == "public"
     })
 }
 
@@ -391,8 +378,11 @@ fn extract_public_declarations(
                     extract_public_declarations(child, source, exports);
                 }
             }
-            "class_declaration" | "struct_declaration" | "interface_declaration"
-            | "enum_declaration" | "record_declaration" => {
+            "class_declaration"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration" => {
                 if has_public_modifier(child, source)
                     && let Some(name_node) = child.child_by_field_name("name")
                 {
@@ -451,14 +441,10 @@ fn extract_public_declarations(
                             let mut vc = fc_child.walk();
                             for vc_child in fc_child.children(&mut vc) {
                                 if vc_child.kind() == "variable_declarator"
-                                    && let Some(name_node) =
-                                        vc_child.child_by_field_name("name")
+                                    && let Some(name_node) = vc_child.child_by_field_name("name")
                                 {
                                     exports.push(ExportedSymbol {
-                                        name: name_node
-                                            .utf8_text(source)
-                                            .unwrap_or("")
-                                            .to_string(),
+                                        name: name_node.utf8_text(source).unwrap_or("").to_string(),
                                         kind: SymbolKind::Variable,
                                         signature: None,
                                     });
@@ -522,10 +508,7 @@ impl LanguageAnalyzer for CSharpAnalyzer {
             .unwrap_or_default();
         matches!(
             filename.as_str(),
-            "Directory.Build.props"
-                | "Directory.Build.targets"
-                | "global.json"
-                | "nuget.config"
+            "Directory.Build.props" | "Directory.Build.targets" | "global.json" | "nuget.config"
         ) || filename.ends_with(".csproj")
             || filename.ends_with(".sln")
     }
@@ -549,8 +532,16 @@ namespace MyApp {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "UserService" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "Point" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UserService" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Point" && s.kind == SymbolKind::Struct)
+        );
     }
 
     #[test]
@@ -568,8 +559,16 @@ public enum Status {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "IRepository" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "Status" && s.kind == SymbolKind::Enum));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "IRepository" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Status" && s.kind == SymbolKind::Enum)
+        );
     }
 
     #[test]
@@ -582,8 +581,16 @@ public record struct Measurement(double Value, string Unit);
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Person" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "Measurement" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Person" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Measurement" && s.kind == SymbolKind::Struct)
+        );
     }
 
     #[test]
@@ -597,7 +604,11 @@ public class Worker {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Worker" && s.kind == SymbolKind::Class));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Worker" && s.kind == SymbolKind::Class)
+        );
     }
 
     #[test]
@@ -612,10 +623,26 @@ public class Service {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Service" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "Service" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "Process" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "Calculate" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Service" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Service" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Process" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Calculate" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -661,9 +688,21 @@ public class Config {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols.iter().any(|s| s.name == "Name" && s.kind == SymbolKind::Variable));
-        assert!(symbols.iter().any(|s| s.name == "_count" && s.kind == SymbolKind::Variable));
-        assert!(symbols.iter().any(|s| s.name == "Version" && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Name" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "_count" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Version" && s.kind == SymbolKind::Variable)
+        );
     }
 
     #[test]
@@ -952,25 +991,45 @@ namespace MyApp.Controllers
         let analyzer = CSharpAnalyzer::new();
 
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "UsersController" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "UsersController" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "GetAll" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "Create" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "ValidateDto" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "_userService" && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UsersController" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UsersController" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "GetAll" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Create" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ValidateDto" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "_userService" && s.kind == SymbolKind::Variable)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert_eq!(imports.len(), 3);
-        assert!(imports
-            .iter()
-            .any(|i| i.source == "Microsoft.AspNetCore.Mvc"));
-        assert!(imports
-            .iter()
-            .any(|i| i.source == "System.Threading.Tasks"));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.source == "Microsoft.AspNetCore.Mvc")
+        );
+        assert!(imports.iter().any(|i| i.source == "System.Threading.Tasks"));
         assert!(imports.iter().any(|i| i.source == "MyApp.Services"));
 
         let exports = analyzer.extract_exports(source).unwrap();
@@ -997,11 +1056,21 @@ public class Repository<T> where T : class, IEntity
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Repository" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name == "FindAsync" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "AddRange" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Repository" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "FindAsync" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "AddRange" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -1080,13 +1149,27 @@ public partial interface IBar {
             .iter()
             .filter(|s| s.name == "Foo" && s.kind == SymbolKind::Class)
             .collect();
-        assert_eq!(foo_classes.len(), 2, "both partial class declarations should be extracted");
+        assert_eq!(
+            foo_classes.len(),
+            2,
+            "both partial class declarations should be extracted"
+        );
 
-        assert!(symbols.iter().any(|s| s.name == "PartA" && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name == "PartB" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "IBar" && s.kind == SymbolKind::Interface));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "PartA" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "PartB" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "IBar" && s.kind == SymbolKind::Interface)
+        );
     }
 
     #[test]
@@ -1101,15 +1184,21 @@ public class Config {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Person" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Config" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Count" && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Person" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Config" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Count" && s.kind == SymbolKind::Variable)
+        );
     }
 
     #[test]
@@ -1126,20 +1215,30 @@ public class NullableExample {
         let analyzer = CSharpAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "NullableExample" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Name" && s.kind == SymbolKind::Variable));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Numbers" && s.kind == SymbolKind::Variable));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "Timestamp" && s.kind == SymbolKind::Variable));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "GetNullable" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "NullableExample" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Name" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Numbers" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Timestamp" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "GetNullable" && s.kind == SymbolKind::Method)
+        );
     }
 }

@@ -607,10 +607,26 @@ impl UserResponse {
         let analyzer = RustAnalyzer::new();
 
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "CreateUserRequest" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "UserResponse" && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name == "create_user" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "UserResponse" && s.kind == SymbolKind::Impl));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "CreateUserRequest" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UserResponse" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "create_user" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UserResponse" && s.kind == SymbolKind::Impl)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert_eq!(imports.len(), 2);
@@ -618,9 +634,21 @@ impl UserResponse {
         assert!(imports.iter().any(|i| i.source.contains("serde")));
 
         let exports = analyzer.extract_exports(source).unwrap();
-        assert!(exports.iter().any(|e| e.name == "CreateUserRequest" && e.kind == SymbolKind::Struct));
-        assert!(exports.iter().any(|e| e.name == "UserResponse" && e.kind == SymbolKind::Struct));
-        assert!(exports.iter().any(|e| e.name == "create_user" && e.kind == SymbolKind::Function));
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.name == "CreateUserRequest" && e.kind == SymbolKind::Struct)
+        );
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.name == "UserResponse" && e.kind == SymbolKind::Struct)
+        );
+        assert!(
+            exports
+                .iter()
+                .any(|e| e.name == "create_user" && e.kind == SymbolKind::Function)
+        );
     }
 
     #[test]
@@ -637,11 +665,15 @@ pub fn get<'a, T: Display>(cache: &'a Cache<'a, String, T>, key: &str) -> Option
         let analyzer = RustAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "Cache" && s.kind == SymbolKind::Struct),
+            symbols
+                .iter()
+                .any(|s| s.name == "Cache" && s.kind == SymbolKind::Struct),
             "generic struct with lifetimes should be extracted"
         );
         assert!(
-            symbols.iter().any(|s| s.name == "get" && s.kind == SymbolKind::Function),
+            symbols
+                .iter()
+                .any(|s| s.name == "get" && s.kind == SymbolKind::Function),
             "generic function with lifetimes should be extracted"
         );
     }
@@ -654,10 +686,16 @@ pub fn get<'a, T: Display>(cache: &'a Cache<'a, String, T>, key: &str) -> Option
         assert_eq!(symbols.len(), 2);
 
         let first = symbols.iter().find(|s| s.name == "first").unwrap();
-        assert_eq!(first.range.start, 1, "first fn should be on line 1 (1-based)");
+        assert_eq!(
+            first.range.start, 1,
+            "first fn should be on line 1 (1-based)"
+        );
 
         let second = symbols.iter().find(|s| s.name == "second").unwrap();
-        assert_eq!(second.range.start, 4, "second fn should be on line 4 (1-based)");
+        assert_eq!(
+            second.range.start, 4,
+            "second fn should be on line 4 (1-based)"
+        );
     }
 
     #[test]
@@ -713,11 +751,15 @@ impl Foo for MyStruct {
         let analyzer = RustAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
         assert!(
-            symbols.iter().any(|s| s.name == "Foo" && s.kind == SymbolKind::Trait),
+            symbols
+                .iter()
+                .any(|s| s.name == "Foo" && s.kind == SymbolKind::Trait),
             "trait definition should be extracted"
         );
         assert!(
-            symbols.iter().any(|s| s.name == "MyStruct" && s.kind == SymbolKind::Struct),
+            symbols
+                .iter()
+                .any(|s| s.name == "MyStruct" && s.kind == SymbolKind::Struct),
             "struct definition should be extracted"
         );
         assert!(
@@ -750,8 +792,16 @@ struct Derived {
         let exports = analyzer.extract_exports(source).unwrap();
 
         // Should not panic and should find the valid items
-        assert!(symbols.iter().any(|s| s.name == "uses_macros" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "Derived" && s.kind == SymbolKind::Struct));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "uses_macros" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Derived" && s.kind == SymbolKind::Struct)
+        );
         // macro_rules definitions are not tracked as symbols
         assert!(!symbols.iter().any(|s| s.name == "my_macro"));
         // No pub items, so exports should be empty
@@ -772,6 +822,10 @@ use std::collections::HashMap;
         assert_eq!(imports.len(), 3);
         assert!(imports.iter().any(|i| i.source.contains("crate::foo::Bar")));
         assert!(imports.iter().any(|i| i.source.contains("super::*")));
-        assert!(imports.iter().any(|i| i.source.contains("std::collections::HashMap")));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.source.contains("std::collections::HashMap"))
+        );
     }
 }

@@ -787,9 +787,8 @@ mod tests {
         let mut debouncer = Debouncer::new(config);
         debouncer.set_git_dir(PathBuf::from("/repo/.git"));
 
-        let event = make_folder_create_event(vec![PathBuf::from(
-            "/repo/.git/worktrees/new-branch",
-        )]);
+        let event =
+            make_folder_create_event(vec![PathBuf::from("/repo/.git/worktrees/new-branch")]);
         let immediate = debouncer.process_event(&event);
         assert!(immediate.is_empty()); // Debounced, not immediate
 
@@ -807,9 +806,8 @@ mod tests {
         let mut debouncer = Debouncer::new(config);
         debouncer.set_git_dir(PathBuf::from("/repo/.git"));
 
-        let event = make_folder_remove_event(vec![PathBuf::from(
-            "/repo/.git/worktrees/old-branch",
-        )]);
+        let event =
+            make_folder_remove_event(vec![PathBuf::from("/repo/.git/worktrees/old-branch")]);
         debouncer.process_event(&event);
 
         let flushed = debouncer.flush_debounced();

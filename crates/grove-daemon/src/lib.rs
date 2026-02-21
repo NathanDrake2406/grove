@@ -250,7 +250,9 @@ async fn run_watcher_loop(
                     info!(path = %worktrees_dir.display(), "watching git worktrees directory");
                     git_worktrees_watched = true;
                 }
-                Err(e) => warn!(path = %worktrees_dir.display(), error = %e, "failed to watch .git/worktrees/"),
+                Err(e) => {
+                    warn!(path = %worktrees_dir.display(), error = %e, "failed to watch .git/worktrees/")
+                }
             }
         }
     }
@@ -388,10 +390,7 @@ async fn forward_watch_events(
                     warn!("worktree change detected but no repo_git_dir configured");
                     continue;
                 };
-                let repo_root = git_dir
-                    .parent()
-                    .unwrap_or(git_dir.as_path())
-                    .to_path_buf();
+                let repo_root = git_dir.parent().unwrap_or(git_dir.as_path()).to_path_buf();
 
                 match tokio::task::spawn_blocking(move || {
                     crate::git::enumerate_worktrees(&repo_root)
@@ -399,7 +398,10 @@ async fn forward_watch_events(
                 .await
                 {
                     Ok(Ok(desired)) => {
-                        info!(count = desired.len(), "re-enumerated worktrees after change");
+                        info!(
+                            count = desired.len(),
+                            "re-enumerated worktrees after change"
+                        );
                         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                         if let Err(e) = state_tx
                             .send(StateMessage::SyncWorktrees {

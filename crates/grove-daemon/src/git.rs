@@ -340,18 +340,37 @@ mod tests {
         let linked_path = canon_dir.join("linked-wt");
 
         let output = Command::new("git")
-            .args(["worktree", "add", linked_path.to_str().unwrap(), "-b", "feature"])
+            .args([
+                "worktree",
+                "add",
+                linked_path.to_str().unwrap(),
+                "-b",
+                "feature",
+            ])
             .current_dir(&canon_dir)
             .output()
             .unwrap();
-        assert!(output.status.success(), "git worktree add failed: {}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         let worktrees = enumerate_worktrees(&canon_dir).unwrap();
 
         assert_eq!(worktrees.len(), 2);
-        let paths: Vec<_> = worktrees.iter().map(|w| w.path.canonicalize().unwrap_or(w.path.clone())).collect();
-        assert!(paths.contains(&canon_dir), "main worktree not found in {paths:?}");
-        assert!(paths.contains(&linked_path), "linked worktree not found in {paths:?}");
+        let paths: Vec<_> = worktrees
+            .iter()
+            .map(|w| w.path.canonicalize().unwrap_or(w.path.clone()))
+            .collect();
+        assert!(
+            paths.contains(&canon_dir),
+            "main worktree not found in {paths:?}"
+        );
+        assert!(
+            paths.contains(&linked_path),
+            "linked worktree not found in {paths:?}"
+        );
     }
 
     #[test]

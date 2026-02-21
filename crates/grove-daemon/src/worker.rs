@@ -697,10 +697,7 @@ mod tests {
             .iter()
             .find(|f| f.path == PathBuf::from("src/lib.rs"))
             .expect("src/lib.rs should be in changeset");
-        assert!(
-            !file.hunks.is_empty(),
-            "dirty file should have diff hunks"
-        );
+        assert!(!file.hunks.is_empty(), "dirty file should have diff hunks");
     }
 
     #[test]

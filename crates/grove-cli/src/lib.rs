@@ -28,7 +28,7 @@ pub struct CliArgs {
 pub enum Commands {
     /// Show workspace status overview
     Status,
-    
+
     /// Open the live interactive dashboard (TUI)
     Dashboard,
 
@@ -133,7 +133,7 @@ pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Erro
             unreachable!("handled above");
         }
     }
-    
+
     Ok(client)
 }
 

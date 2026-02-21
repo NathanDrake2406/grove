@@ -868,10 +868,26 @@ export async function POST(request: NextRequest): Promise<NextResponse<ApiRespon
         let analyzer = TypeScriptAnalyzer::new();
 
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "GET" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "POST" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "UserPayload" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "ApiResponse" && s.kind == SymbolKind::TypeAlias));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "GET" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "POST" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "UserPayload" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ApiResponse" && s.kind == SymbolKind::TypeAlias)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert_eq!(imports.len(), 3);
@@ -912,8 +928,16 @@ export default Button;
 
         // Symbols: tree-sitter TS grammar may recover the interface and function
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "ButtonProps" && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name == "Button" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "ButtonProps" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "Button" && s.kind == SymbolKind::Function)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert!(imports.iter().any(|i| i.source == "react"));
@@ -1002,9 +1026,21 @@ module.exports = { legacyExport: true };
         let analyzer = TypeScriptAnalyzer::new();
 
         let symbols = analyzer.extract_symbols(source).unwrap();
-        assert!(symbols.iter().any(|s| s.name == "legacy" && s.kind == SymbolKind::Variable));
-        assert!(symbols.iter().any(|s| s.name == "destructured" && s.kind == SymbolKind::Variable));
-        assert!(symbols.iter().any(|s| s.name == "modernExport" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "legacy" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "destructured" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "modernExport" && s.kind == SymbolKind::Function)
+        );
 
         let imports = analyzer.extract_imports(source).unwrap();
         assert!(imports.iter().any(|i| i.source == "./es-module"));

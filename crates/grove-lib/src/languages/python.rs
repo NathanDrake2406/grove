@@ -179,11 +179,7 @@ impl LanguageAnalyzer for PythonAnalyzer {
 
 // === Symbol extraction ===
 
-fn extract_top_level_symbol(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    symbols: &mut Vec<Symbol>,
-) {
+fn extract_top_level_symbol(node: tree_sitter::Node<'_>, source: &[u8], symbols: &mut Vec<Symbol>) {
     match node.kind() {
         "function_definition" => {
             if let Some(name_node) = node.child_by_field_name("name") {
@@ -327,11 +323,7 @@ fn extract_method(node: tree_sitter::Node<'_>, source: &[u8], symbols: &mut Vec<
 
 /// Extract imports from `import x, y, z` statements.
 /// One `Import` per name entry.
-fn extract_import_statement(
-    node: tree_sitter::Node<'_>,
-    source: &[u8],
-    imports: &mut Vec<Import>,
-) {
+fn extract_import_statement(node: tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<Import>) {
     let mut cursor = node.walk();
     for child in node.children_by_field_name("name", &mut cursor) {
         match child.kind() {
@@ -499,10 +491,22 @@ async def fetch(url):
         assert_eq!(symbols.len(), 2);
         assert_eq!(symbols[0].name, "process");
         assert_eq!(symbols[0].kind, SymbolKind::Function);
-        assert!(symbols[0].signature.as_ref().unwrap().contains("def process"));
+        assert!(
+            symbols[0]
+                .signature
+                .as_ref()
+                .unwrap()
+                .contains("def process")
+        );
         assert_eq!(symbols[1].name, "fetch");
         assert_eq!(symbols[1].kind, SymbolKind::Function);
-        assert!(symbols[1].signature.as_ref().unwrap().contains("async def fetch"));
+        assert!(
+            symbols[1]
+                .signature
+                .as_ref()
+                .unwrap()
+                .contains("async def fetch")
+        );
     }
 
     #[test]
@@ -516,7 +520,10 @@ class Bar(Base):
         let analyzer = PythonAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        let classes: Vec<&Symbol> = symbols.iter().filter(|s| s.kind == SymbolKind::Class).collect();
+        let classes: Vec<&Symbol> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Class)
+            .collect();
         assert_eq!(classes.len(), 2);
         assert_eq!(classes[0].name, "Foo");
         assert_eq!(classes[1].name, "Bar");
@@ -541,7 +548,13 @@ class Bar(Base):
         assert_eq!(symbols[1].kind, SymbolKind::Method);
         assert_eq!(symbols[2].name, "method_b");
         assert_eq!(symbols[2].kind, SymbolKind::Method);
-        assert!(symbols[2].signature.as_ref().unwrap().contains("def method_b"));
+        assert!(
+            symbols[2]
+                .signature
+                .as_ref()
+                .unwrap()
+                .contains("def method_b")
+        );
     }
 
     #[test]
@@ -555,11 +568,13 @@ class Bar(Base):
 
         let method = symbols.iter().find(|s| s.name == "fetch").unwrap();
         assert_eq!(method.kind, SymbolKind::Method);
-        assert!(method
-            .signature
-            .as_ref()
-            .unwrap()
-            .contains("async def fetch"));
+        assert!(
+            method
+                .signature
+                .as_ref()
+                .unwrap()
+                .contains("async def fetch")
+        );
     }
 
     #[test]
@@ -855,7 +870,10 @@ async def fetch_data(url: str) -> bytes:
 
         let exports = analyzer.extract_exports(source).unwrap();
         let export_names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(export_names, vec!["UserService", "create_user", "MAX_RETRIES"]);
+        assert_eq!(
+            export_names,
+            vec!["UserService", "create_user", "MAX_RETRIES"]
+        );
         assert_eq!(exports[0].kind, SymbolKind::Class);
         assert_eq!(exports[1].kind, SymbolKind::Function);
         assert_eq!(exports[2].kind, SymbolKind::Constant);
@@ -1049,9 +1067,11 @@ def real_func():
         let symbols = analyzer.extract_symbols(source).unwrap();
 
         // Top-level class A is extracted
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "A" && s.kind == SymbolKind::Class));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "A" && s.kind == SymbolKind::Class)
+        );
         // Nested classes are not extracted by the current top-level-only walk,
         // but the analyzer does not crash on deeply nested structures.
     }
@@ -1098,12 +1118,16 @@ async def get_user(user_id: int) -> UserResponse:
         assert!(imports.iter().any(|i| i.source == "fastapi"
             && i.symbols.iter().any(|s| s.name == "FastAPI")
             && i.symbols.iter().any(|s| s.name == "HTTPException")));
-        assert!(imports
-            .iter()
-            .any(|i| i.source == "pydantic" && i.symbols.iter().any(|s| s.name == "BaseModel")));
-        assert!(imports
-            .iter()
-            .any(|i| i.source == "typing" && i.symbols.iter().any(|s| s.name == "Optional")));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.source == "pydantic" && i.symbols.iter().any(|s| s.name == "BaseModel"))
+        );
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.source == "typing" && i.symbols.iter().any(|s| s.name == "Optional"))
+        );
     }
 
     #[test]
@@ -1121,12 +1145,16 @@ def comprehensions():
         let analyzer = PythonAnalyzer::new();
         let symbols = analyzer.extract_symbols(source).unwrap();
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "gen" && s.kind == SymbolKind::Function));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name == "comprehensions" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "gen" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name == "comprehensions" && s.kind == SymbolKind::Function)
+        );
     }
 
     #[test]
@@ -1146,11 +1174,13 @@ def protected_endpoint(request):
         assert_eq!(symbols[0].kind, SymbolKind::Function);
         // Range starts at the first decorator
         assert_eq!(symbols[0].range.start, 1);
-        assert!(symbols[0]
-            .signature
-            .as_ref()
-            .unwrap()
-            .contains("def protected_endpoint"));
+        assert!(
+            symbols[0]
+                .signature
+                .as_ref()
+                .unwrap()
+                .contains("def protected_endpoint")
+        );
     }
 
     #[test]

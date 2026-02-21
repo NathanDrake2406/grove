@@ -5,12 +5,12 @@ pub mod ui;
 use std::error::Error;
 
 use crossterm::{
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
     ExecutableCommand,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use grove_cli::client::DaemonClient;
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 /// Run the TUI dashboard.
 pub async fn run(client: DaemonClient) -> Result<(), Box<dyn Error>> {
