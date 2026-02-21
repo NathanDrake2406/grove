@@ -240,18 +240,18 @@ fn extract_field_symbols(
         if child.kind() == "variable_declaration" {
             let mut var_cursor = child.walk();
             for var_child in child.children(&mut var_cursor) {
-                if var_child.kind() == "variable_declarator" {
-                    if let Some(name_node) = var_child.child_by_field_name("name") {
-                        symbols.push(Symbol {
-                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Variable,
-                            range: LineRange {
-                                start: field.start_position().row as u32 + 1,
-                                end: field.end_position().row as u32 + 1,
-                            },
-                            signature: None,
-                        });
-                    }
+                if var_child.kind() == "variable_declarator"
+                    && let Some(name_node) = var_child.child_by_field_name("name")
+                {
+                    symbols.push(Symbol {
+                        name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Variable,
+                        range: LineRange {
+                            start: field.start_position().row as u32 + 1,
+                            end: field.end_position().row as u32 + 1,
+                        },
+                        signature: None,
+                    });
                 }
             }
         }
@@ -351,15 +351,13 @@ fn parse_using_directive(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<I
             symbols: vec![],
             line,
         })
-    } else if let Some(simple) = alias_name {
+    } else {
         // `using SimpleIdentifier;` (no dots)
-        Some(Import {
+        alias_name.map(|simple| Import {
             source: simple,
             symbols: vec![],
             line,
         })
-    } else {
-        None
     }
 }
 
@@ -394,28 +392,28 @@ fn extract_public_declarations(
             }
             "class_declaration" | "struct_declaration" | "interface_declaration"
             | "enum_declaration" | "record_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        let kind = match child.kind() {
-                            "class_declaration" => SymbolKind::Class,
-                            "struct_declaration" => SymbolKind::Struct,
-                            "interface_declaration" => SymbolKind::Interface,
-                            "enum_declaration" => SymbolKind::Enum,
-                            "record_declaration" => {
-                                if is_record_struct(child) {
-                                    SymbolKind::Struct
-                                } else {
-                                    SymbolKind::Class
-                                }
+                if has_public_modifier(child, source)
+                    && let Some(name_node) = child.child_by_field_name("name")
+                {
+                    let kind = match child.kind() {
+                        "class_declaration" => SymbolKind::Class,
+                        "struct_declaration" => SymbolKind::Struct,
+                        "interface_declaration" => SymbolKind::Interface,
+                        "enum_declaration" => SymbolKind::Enum,
+                        "record_declaration" => {
+                            if is_record_struct(child) {
+                                SymbolKind::Struct
+                            } else {
+                                SymbolKind::Class
                             }
-                            _ => SymbolKind::Class,
-                        };
-                        exports.push(ExportedSymbol {
-                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
-                            kind,
-                            signature: None,
-                        });
-                    }
+                        }
+                        _ => SymbolKind::Class,
+                    };
+                    exports.push(ExportedSymbol {
+                        name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                        kind,
+                        signature: None,
+                    });
                 }
                 // Descend into body for public members
                 if let Some(body) = child.child_by_field_name("body") {
@@ -423,25 +421,25 @@ fn extract_public_declarations(
                 }
             }
             "method_declaration" | "constructor_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        exports.push(ExportedSymbol {
-                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Method,
-                            signature: Some(get_signature_line(source, child.start_byte())),
-                        });
-                    }
+                if has_public_modifier(child, source)
+                    && let Some(name_node) = child.child_by_field_name("name")
+                {
+                    exports.push(ExportedSymbol {
+                        name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Method,
+                        signature: Some(get_signature_line(source, child.start_byte())),
+                    });
                 }
             }
             "property_declaration" => {
-                if has_public_modifier(child, source) {
-                    if let Some(name_node) = child.child_by_field_name("name") {
-                        exports.push(ExportedSymbol {
-                            name: name_node.utf8_text(source).unwrap_or("").to_string(),
-                            kind: SymbolKind::Variable,
-                            signature: None,
-                        });
-                    }
+                if has_public_modifier(child, source)
+                    && let Some(name_node) = child.child_by_field_name("name")
+                {
+                    exports.push(ExportedSymbol {
+                        name: name_node.utf8_text(source).unwrap_or("").to_string(),
+                        kind: SymbolKind::Variable,
+                        signature: None,
+                    });
                 }
             }
             "field_declaration" => {
@@ -451,19 +449,18 @@ fn extract_public_declarations(
                         if fc_child.kind() == "variable_declaration" {
                             let mut vc = fc_child.walk();
                             for vc_child in fc_child.children(&mut vc) {
-                                if vc_child.kind() == "variable_declarator" {
-                                    if let Some(name_node) =
+                                if vc_child.kind() == "variable_declarator"
+                                    && let Some(name_node) =
                                         vc_child.child_by_field_name("name")
-                                    {
-                                        exports.push(ExportedSymbol {
-                                            name: name_node
-                                                .utf8_text(source)
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            kind: SymbolKind::Variable,
-                                            signature: None,
-                                        });
-                                    }
+                                {
+                                    exports.push(ExportedSymbol {
+                                        name: name_node
+                                            .utf8_text(source)
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        kind: SymbolKind::Variable,
+                                        signature: None,
+                                    });
                                 }
                             }
                         }
