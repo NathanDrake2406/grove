@@ -1,0 +1,415 @@
+{
+  "scenarios": [
+    {
+      "name": "same_file_overlapping_hunks_red",
+      "expected_min_score": "Red",
+      "expected_max_score": "Red",
+      "required_overlap_kinds": ["File", "Hunk"],
+      "forbidden_overlap_kinds": ["Symbol", "Schema", "Dependency"],
+      "a": {
+        "workspace_id": "20111111-1111-4111-8111-111111111111",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/cart.ts",
+            "change_type": "Modified",
+            "hunks": [
+              { "old_start": 40, "old_lines": 10, "new_start": 40, "new_lines": 10 }
+            ],
+            "symbols_modified": [],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20222222-2222-4222-8222-222222222222",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/cart.ts",
+            "change_type": "Modified",
+            "hunks": [
+              { "old_start": 44, "old_lines": 8, "new_start": 44, "new_lines": 8 }
+            ],
+            "symbols_modified": [],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      }
+    },
+    {
+      "name": "same_symbol_same_file_red",
+      "expected_min_score": "Red",
+      "expected_max_score": "Red",
+      "expect_no_symbol_overlap": false,
+      "required_overlap_kinds": ["File", "Symbol"],
+      "forbidden_overlap_kinds": ["Schema", "Dependency"],
+      "a": {
+        "workspace_id": "20333333-3333-4333-8333-333333333333",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/payment.ts",
+            "change_type": "Modified",
+            "hunks": [],
+            "symbols_modified": [
+              {
+                "name": "authorizePayment",
+                "kind": "Function",
+                "range": { "start": 70, "end": 105 },
+                "signature": null
+              }
+            ],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20444444-4444-4444-8444-444444444444",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/payment.ts",
+            "change_type": "Modified",
+            "hunks": [],
+            "symbols_modified": [
+              {
+                "name": "authorizePayment",
+                "kind": "Function",
+                "range": { "start": 80, "end": 120 },
+                "signature": null
+              }
+            ],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      }
+    },
+    {
+      "name": "same_symbol_and_hunk_red",
+      "expected_min_score": "Red",
+      "expected_max_score": "Red",
+      "expect_no_symbol_overlap": false,
+      "required_overlap_kinds": ["File", "Hunk", "Symbol"],
+      "forbidden_overlap_kinds": ["Schema", "Dependency"],
+      "a": {
+        "workspace_id": "20555555-5555-4555-8555-555555555555",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/user.ts",
+            "change_type": "Modified",
+            "hunks": [
+              { "old_start": 110, "old_lines": 6, "new_start": 110, "new_lines": 8 }
+            ],
+            "symbols_modified": [
+              {
+                "name": "normalizeUser",
+                "kind": "Function",
+                "range": { "start": 108, "end": 136 },
+                "signature": null
+              }
+            ],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20666666-6666-4666-8666-666666666666",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/user.ts",
+            "change_type": "Modified",
+            "hunks": [
+              { "old_start": 114, "old_lines": 4, "new_start": 114, "new_lines": 5 }
+            ],
+            "symbols_modified": [
+              {
+                "name": "normalizeUser",
+                "kind": "Function",
+                "range": { "start": 112, "end": 142 },
+                "signature": null
+              }
+            ],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      }
+    },
+    {
+      "name": "route_file_hunk_plus_schema_red",
+      "expected_min_score": "Red",
+      "expected_max_score": "Red",
+      "expect_no_schema_overlap": false,
+      "required_overlap_kinds": ["File", "Hunk", "Schema"],
+      "forbidden_overlap_kinds": ["Dependency"],
+      "a": {
+        "workspace_id": "20777777-7777-4777-8777-777777777777",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/routes/users.ts",
+            "change_type": "Modified",
+            "hunks": [
+              { "old_start": 20, "old_lines": 5, "new_start": 20, "new_lines": 5 }
+            ],
+            "symbols_modified": [],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20888888-8888-4888-8888-888888888888",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/routes/users.ts",
+            "change_type": "Modified",
+            "hunks": [
+              { "old_start": 22, "old_lines": 4, "new_start": 22, "new_lines": 4 }
+            ],
+            "symbols_modified": [],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      }
+    },
+    {
+      "name": "dependency_signature_change_black",
+      "expected_min_score": "Black",
+      "expected_max_score": "Black",
+      "required_overlap_kinds": ["Dependency"],
+      "forbidden_overlap_kinds": ["File", "Hunk", "Symbol", "Schema"],
+      "a": {
+        "workspace_id": "20999999-9999-4999-8999-999999999999",
+        "merge_base": "fixture-base",
+        "changed_files": [],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20aaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "merge_base": "fixture-base",
+        "changed_files": [],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      },
+      "dependency_overlaps": [
+        {
+          "Dependency": {
+            "changed_in": "20999999-9999-4999-8999-999999999999",
+            "changed_file": "src/shared/api.ts",
+            "changed_export": {
+              "SignatureChanged": {
+                "symbol_name": "fetchUser",
+                "old": { "text": "fn fetchUser(id: string)" },
+                "new": { "text": "fn fetchUser(id: string, retries: u8)" }
+              }
+            },
+            "affected_file": "src/consumer.ts",
+            "affected_usage": [
+              { "file": "src/consumer.ts", "line": 42, "column": 7 }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "dependency_added_export_black",
+      "expected_min_score": "Black",
+      "expected_max_score": "Black",
+      "required_overlap_kinds": ["Dependency"],
+      "forbidden_overlap_kinds": ["Schema"],
+      "a": {
+        "workspace_id": "20bbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/shared/cache.ts",
+            "change_type": "Modified",
+            "hunks": [],
+            "symbols_modified": [],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20cccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/api/checkout.ts",
+            "change_type": "Modified",
+            "hunks": [],
+            "symbols_modified": [],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 1,
+        "commits_behind": 0
+      },
+      "dependency_overlaps": [
+        {
+          "Dependency": {
+            "changed_in": "20bbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            "changed_file": "src/shared/cache.ts",
+            "changed_export": {
+              "Added": {
+                "name": "buildCacheKey",
+                "kind": "Function",
+                "range": { "start": 1, "end": 12 },
+                "signature": null
+              }
+            },
+            "affected_file": "src/api/checkout.ts",
+            "affected_usage": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "multiple_dependencies_black",
+      "expected_min_score": "Black",
+      "expected_max_score": "Black",
+      "required_overlap_kinds": ["Dependency"],
+      "forbidden_overlap_kinds": ["Schema"],
+      "a": {
+        "workspace_id": "20dddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "merge_base": "fixture-base",
+        "changed_files": [],
+        "commits_ahead": 3,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20eeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+        "merge_base": "fixture-base",
+        "changed_files": [],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      },
+      "dependency_overlaps": [
+        {
+          "Dependency": {
+            "changed_in": "20dddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "changed_file": "src/shared/logger.ts",
+            "changed_export": {
+              "Removed": {
+                "name": "createLogger",
+                "kind": "Function",
+                "range": { "start": 4, "end": 20 },
+                "signature": null
+              }
+            },
+            "affected_file": "src/api/orders.ts",
+            "affected_usage": [
+              { "file": "src/api/orders.ts", "line": 17, "column": 4 }
+            ]
+          }
+        },
+        {
+          "Dependency": {
+            "changed_in": "20dddddd-dddd-4ddd-8ddd-dddddddddddd",
+            "changed_file": "src/shared/logger.ts",
+            "changed_export": {
+              "Added": {
+                "name": "createStructuredLogger",
+                "kind": "Function",
+                "range": { "start": 30, "end": 45 },
+                "signature": null
+              }
+            },
+            "affected_file": "src/worker/jobs.ts",
+            "affected_usage": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "symbol_conflict_plus_dependency_black",
+      "expected_min_score": "Black",
+      "expected_max_score": "Black",
+      "expect_no_symbol_overlap": false,
+      "required_overlap_kinds": ["File", "Symbol", "Dependency"],
+      "a": {
+        "workspace_id": "20ffffff-ffff-4fff-8fff-ffffffffffff",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/order.ts",
+            "change_type": "Modified",
+            "hunks": [],
+            "symbols_modified": [
+              {
+                "name": "submitOrder",
+                "kind": "Function",
+                "range": { "start": 66, "end": 112 },
+                "signature": null
+              }
+            ],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      },
+      "b": {
+        "workspace_id": "20202020-2020-4020-8020-202020202020",
+        "merge_base": "fixture-base",
+        "changed_files": [
+          {
+            "path": "src/order.ts",
+            "change_type": "Modified",
+            "hunks": [],
+            "symbols_modified": [
+              {
+                "name": "submitOrder",
+                "kind": "Function",
+                "range": { "start": 70, "end": 120 },
+                "signature": null
+              }
+            ],
+            "exports_changed": []
+          }
+        ],
+        "commits_ahead": 2,
+        "commits_behind": 0
+      },
+      "dependency_overlaps": [
+        {
+          "Dependency": {
+            "changed_in": "20ffffff-ffff-4fff-8fff-ffffffffffff",
+            "changed_file": "src/order.ts",
+            "changed_export": {
+              "SignatureChanged": {
+                "symbol_name": "submitOrder",
+                "old": { "text": "fn submitOrder(input: OrderInput)" },
+                "new": { "text": "fn submitOrder(input: OrderInput, trace: TraceCtx)" }
+              }
+            },
+            "affected_file": "src/api/orders.ts",
+            "affected_usage": []
+          }
+        }
+      ]
+    }
+  ]
+}
