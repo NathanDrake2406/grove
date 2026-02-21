@@ -562,6 +562,10 @@ fn score_to_str(score: OrthogonalityScore) -> &'static str {
     }
 }
 
+/// Parses persisted orthogonality score strings from SQLite.
+///
+/// Unknown values intentionally fall back to a safe default so rows written by
+/// newer daemons remain readable by older binaries.
 fn score_from_str(s: &str) -> OrthogonalityScore {
     match s {
         "green" => OrthogonalityScore::Green,
@@ -581,6 +585,10 @@ fn merge_order_to_str(order: MergeOrder) -> &'static str {
     }
 }
 
+/// Parses persisted merge-order strings from SQLite.
+///
+/// Unknown values intentionally fall back to a safe default so rows written by
+/// newer daemons remain readable by older binaries.
 fn merge_order_from_str(s: &str) -> MergeOrder {
     match s {
         "a_first" => MergeOrder::AFirst,
@@ -600,6 +608,10 @@ fn change_type_to_str(ct: ChangeType) -> &'static str {
     }
 }
 
+/// Parses persisted change-type strings from SQLite.
+///
+/// Unknown values intentionally fall back to a safe default so rows written by
+/// newer daemons remain readable by older binaries.
 fn change_type_from_str(s: &str) -> ChangeType {
     match s {
         "added" => ChangeType::Added,
@@ -618,6 +630,10 @@ fn delta_type_to_str(dt: DeltaType) -> &'static str {
     }
 }
 
+/// Parses persisted delta-type strings from SQLite.
+///
+/// Unknown values intentionally fall back to a safe default so rows written by
+/// newer daemons remain readable by older binaries.
 fn delta_type_from_str(s: &str) -> DeltaType {
     match s {
         "modified" => DeltaType::Modified,
