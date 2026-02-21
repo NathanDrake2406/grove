@@ -22,6 +22,7 @@ use tokio_util::codec::{Framed, LinesCodec};
 const MAX_NDJSON_LINE_BYTES: usize = 1_048_576;
 const DEFAULT_IDLE_CONNECTION_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_STATE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_AWAIT_ANALYSIS_TIMEOUT_MS: u64 = 30_000;
 const CONNECTION_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_millis(100);
 
 // === Error Types ===
@@ -134,6 +135,17 @@ fn parse_request(request: &SocketRequest) -> Result<ParsedRequest, String> {
             }))
         }
         "get_all_analyses" => Ok(ParsedRequest::Query(QueryRequest::GetAllAnalyses)),
+        "await_analysis" => {
+            let timeout_ms = match request.params.get("timeout_ms") {
+                Some(value) => value
+                    .as_u64()
+                    .ok_or_else(|| "invalid timeout_ms: expected unsigned integer".to_string())?,
+                None => DEFAULT_AWAIT_ANALYSIS_TIMEOUT_MS,
+            };
+            Ok(ParsedRequest::Query(QueryRequest::AwaitAnalysis {
+                timeout_ms,
+            }))
+        }
         "sync_worktrees" => {
             let worktrees = request
                 .params
@@ -214,6 +226,18 @@ fn query_response_to_socket(response: QueryResponse) -> SocketResponse {
                 "workspace_count": workspace_count,
                 "analysis_count": analysis_count,
                 "base_commit": base_commit,
+            });
+            SocketResponse::success(data)
+        }
+        QueryResponse::AwaitAnalysis {
+            completed,
+            in_flight,
+            analysis_count,
+        } => {
+            let data = serde_json::json!({
+                "completed": completed,
+                "in_flight": in_flight,
+                "analysis_count": analysis_count,
             });
             SocketResponse::success(data)
         }
@@ -614,26 +638,56 @@ async fn handle_request_with_options(
     };
 
     let response = match parsed {
-        ParsedRequest::Query(query) => {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let message = StateMessage::Query {
-                request: query,
-                reply: reply_tx,
-            };
-
-            if state_tx.send(message).await.is_err() {
-                return RequestOutcome {
-                    response: SocketResponse::error("daemon state unavailable"),
-                    close_connection: false,
+        ParsedRequest::Query(query) => match query {
+            QueryRequest::AwaitAnalysis { timeout_ms } => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let message = StateMessage::Query {
+                    request: QueryRequest::AwaitAnalysis { timeout_ms },
+                    reply: reply_tx,
                 };
-            }
 
-            match timeout(state_reply_timeout, reply_rx).await {
-                Ok(Ok(response)) => query_response_to_socket(response),
-                Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
-                Err(_) => SocketResponse::error("state actor response timed out"),
+                if state_tx.send(message).await.is_err() {
+                    return RequestOutcome {
+                        response: SocketResponse::error("daemon state unavailable"),
+                        close_connection: false,
+                    };
+                }
+
+                match timeout(Duration::from_millis(timeout_ms), reply_rx).await {
+                    Ok(Ok(response)) => query_response_to_socket(response),
+                    Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
+                    Err(_) => {
+                        let timeout_response =
+                            await_analysis_timeout_response(state_tx, state_reply_timeout).await;
+                        query_response_to_socket(timeout_response)
+                    }
+                }
             }
-        }
+            QueryRequest::ListWorkspaces
+            | QueryRequest::GetWorkspace { .. }
+            | QueryRequest::GetPairAnalysis { .. }
+            | QueryRequest::GetAllAnalyses
+            | QueryRequest::GetStatus => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let message = StateMessage::Query {
+                    request: query,
+                    reply: reply_tx,
+                };
+
+                if state_tx.send(message).await.is_err() {
+                    return RequestOutcome {
+                        response: SocketResponse::error("daemon state unavailable"),
+                        close_connection: false,
+                    };
+                }
+
+                match timeout(state_reply_timeout, reply_rx).await {
+                    Ok(Ok(response)) => query_response_to_socket(response),
+                    Ok(Err(_)) => SocketResponse::error("state actor did not respond"),
+                    Err(_) => SocketResponse::error("state actor response timed out"),
+                }
+            }
+        },
         ParsedRequest::SyncWorktrees { desired } => {
             let (reply_tx, reply_rx) = oneshot::channel();
             let message = StateMessage::SyncWorktrees {
@@ -693,10 +747,55 @@ async fn handle_request_with_options(
     }
 }
 
+async fn await_analysis_timeout_response(
+    state_tx: &mpsc::Sender<StateMessage>,
+    state_reply_timeout: Duration,
+) -> QueryResponse {
+    let fallback = QueryResponse::AwaitAnalysis {
+        completed: false,
+        in_flight: 0,
+        analysis_count: 0,
+    };
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let message = StateMessage::Query {
+        request: QueryRequest::AwaitAnalysis { timeout_ms: 0 },
+        reply: reply_tx,
+    };
+
+    if state_tx.send(message).await.is_err() {
+        return fallback;
+    }
+
+    match timeout(state_reply_timeout, reply_rx).await {
+        Ok(Ok(QueryResponse::AwaitAnalysis {
+            completed: _,
+            in_flight,
+            analysis_count,
+        })) => QueryResponse::AwaitAnalysis {
+            completed: false,
+            in_flight,
+            analysis_count,
+        },
+        Ok(Ok(QueryResponse::Workspaces(_)))
+        | Ok(Ok(QueryResponse::Workspace(_)))
+        | Ok(Ok(QueryResponse::PairAnalysis(_)))
+        | Ok(Ok(QueryResponse::AllAnalyses(_)))
+        | Ok(Ok(QueryResponse::Status { .. }))
+        | Ok(Err(_))
+        | Err(_) => fallback,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::state::{GroveConfig, spawn_state_actor};
+    use crate::worker::WorkerMessage;
+    use chrono::Utc;
+    use grove_lib::{
+        MergeOrder, OrthogonalityScore, Workspace, WorkspaceMetadata, WorkspacePairAnalysis,
+    };
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
     use uuid::Uuid;
@@ -718,6 +817,19 @@ mod tests {
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    fn make_workspace(name: &str) -> Workspace {
+        Workspace {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            branch: format!("feat/{name}"),
+            path: PathBuf::from(format!("/worktrees/{name}")),
+            base_ref: "main".to_string(),
+            created_at: Utc::now(),
+            last_activity: Utc::now(),
+            metadata: WorkspaceMetadata::default(),
         }
     }
 
@@ -901,6 +1013,45 @@ mod tests {
             result,
             Ok(ParsedRequest::Query(QueryRequest::GetAllAnalyses))
         ));
+    }
+
+    #[test]
+    fn parse_await_analysis_request_defaults_timeout() {
+        let req = SocketRequest {
+            method: "await_analysis".to_string(),
+            params: serde_json::json!({}),
+        };
+        match parse_request(&req).unwrap() {
+            ParsedRequest::Query(QueryRequest::AwaitAnalysis { timeout_ms }) => {
+                assert_eq!(timeout_ms, DEFAULT_AWAIT_ANALYSIS_TIMEOUT_MS);
+            }
+            other => panic!("expected AwaitAnalysis, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_await_analysis_request_with_timeout() {
+        let req = SocketRequest {
+            method: "await_analysis".to_string(),
+            params: serde_json::json!({"timeout_ms": 1234}),
+        };
+        match parse_request(&req).unwrap() {
+            ParsedRequest::Query(QueryRequest::AwaitAnalysis { timeout_ms }) => {
+                assert_eq!(timeout_ms, 1234);
+            }
+            other => panic!("expected AwaitAnalysis, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_await_analysis_request_invalid_timeout_returns_error() {
+        let req = SocketRequest {
+            method: "await_analysis".to_string(),
+            params: serde_json::json!({"timeout_ms": "fast"}),
+        };
+        let result = parse_request(&req);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid timeout_ms"));
     }
 
     #[test]
@@ -1821,6 +1972,178 @@ mod tests {
         );
 
         state_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_request_await_analysis_timeout_returns_completed_false_with_counts() {
+        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws_a = make_workspace("await-timeout-a");
+        let ws_b = make_workspace("await-timeout-b");
+        let id_a = ws_a.id;
+
+        for workspace in [ws_a, ws_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            state_tx
+                .send(StateMessage::RegisterWorkspace {
+                    workspace,
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        state_tx
+            .send(StateMessage::AttachWorker { worker_tx })
+            .await
+            .unwrap();
+
+        state_tx
+            .send(StateMessage::FileChanged {
+                workspace_id: id_a,
+                path: PathBuf::from("src/lib.rs"),
+            })
+            .await
+            .unwrap();
+
+        let dispatched = tokio::time::timeout(Duration::from_secs(1), worker_rx.recv())
+            .await
+            .expect("analysis dispatch should happen")
+            .expect("worker should receive dispatched pair");
+        let dispatched_pair = match dispatched {
+            WorkerMessage::AnalyzePair {
+                workspace_a,
+                workspace_b,
+                ..
+            } => (workspace_a.id, workspace_b.id),
+        };
+
+        let outcome = handle_request_with_options(
+            r#"{"method":"await_analysis","params":{"timeout_ms":25}}"#,
+            &state_tx,
+            None,
+            None,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(!outcome.close_connection);
+        assert!(outcome.response.ok);
+        let data = outcome.response.data.expect("response should include data");
+        assert_eq!(data["completed"], false);
+        assert_eq!(data["in_flight"], 1);
+        assert_eq!(data["analysis_count"], 0);
+
+        state_tx
+            .send(StateMessage::AnalysisComplete {
+                pair: dispatched_pair,
+                result: WorkspacePairAnalysis {
+                    workspace_a: dispatched_pair.0,
+                    workspace_b: dispatched_pair.1,
+                    score: OrthogonalityScore::Green,
+                    overlaps: vec![],
+                    merge_order_hint: MergeOrder::Either,
+                    last_computed: Utc::now(),
+                },
+            })
+            .await
+            .unwrap();
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_request_await_analysis_returns_completed_true_after_completion() {
+        let (state_tx, state_handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws_a = make_workspace("await-complete-a");
+        let ws_b = make_workspace("await-complete-b");
+        let id_a = ws_a.id;
+
+        for workspace in [ws_a, ws_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            state_tx
+                .send(StateMessage::RegisterWorkspace {
+                    workspace,
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        state_tx
+            .send(StateMessage::AttachWorker { worker_tx })
+            .await
+            .unwrap();
+
+        state_tx
+            .send(StateMessage::FileChanged {
+                workspace_id: id_a,
+                path: PathBuf::from("src/lib.rs"),
+            })
+            .await
+            .unwrap();
+
+        let pair = match tokio::time::timeout(Duration::from_secs(1), worker_rx.recv())
+            .await
+            .expect("analysis dispatch should happen")
+            .expect("worker should receive dispatched pair")
+        {
+            WorkerMessage::AnalyzePair {
+                workspace_a,
+                workspace_b,
+                ..
+            } => (workspace_a.id, workspace_b.id),
+        };
+
+        let await_task = {
+            let state_tx = state_tx.clone();
+            tokio::spawn(async move {
+                handle_request_with_options(
+                    r#"{"method":"await_analysis","params":{"timeout_ms":1000}}"#,
+                    &state_tx,
+                    None,
+                    None,
+                    Duration::from_millis(100),
+                )
+                .await
+            })
+        };
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        state_tx
+            .send(StateMessage::AnalysisComplete {
+                pair,
+                result: WorkspacePairAnalysis {
+                    workspace_a: pair.0,
+                    workspace_b: pair.1,
+                    score: OrthogonalityScore::Yellow,
+                    overlaps: vec![],
+                    merge_order_hint: MergeOrder::Either,
+                    last_computed: Utc::now(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(1), await_task)
+            .await
+            .expect("await_analysis request should resolve")
+            .unwrap();
+
+        assert!(!outcome.close_connection);
+        assert!(outcome.response.ok);
+        let data = outcome.response.data.expect("response should include data");
+        assert_eq!(data["completed"], true);
+        assert_eq!(data["in_flight"], 0);
+        assert_eq!(data["analysis_count"], 1);
+
+        state_tx.send(StateMessage::Shutdown).await.unwrap();
+        state_handle.await.unwrap();
     }
 
     #[tokio::test]

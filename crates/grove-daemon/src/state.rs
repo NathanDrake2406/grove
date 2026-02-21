@@ -113,6 +113,9 @@ pub enum QueryRequest {
     },
     GetAllAnalyses,
     GetStatus,
+    AwaitAnalysis {
+        timeout_ms: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +128,11 @@ pub enum QueryResponse {
         workspace_count: usize,
         analysis_count: usize,
         base_commit: CommitHash,
+    },
+    AwaitAnalysis {
+        completed: bool,
+        in_flight: usize,
+        analysis_count: usize,
     },
 }
 
@@ -140,6 +148,7 @@ pub struct DaemonState {
     pair_analyses: HashMap<(WorkspaceId, WorkspaceId), WorkspacePairAnalysis>,
     dirty_workspaces: Vec<WorkspaceId>,
     in_flight_pairs: HashSet<(WorkspaceId, WorkspaceId)>,
+    analysis_waiters: Vec<oneshot::Sender<QueryResponse>>,
     worker_tx: Option<mpsc::Sender<WorkerMessage>>,
     db: Option<Database>,
 }
@@ -155,6 +164,7 @@ impl DaemonState {
             pair_analyses: HashMap::new(),
             dirty_workspaces: Vec::new(),
             in_flight_pairs: HashSet::new(),
+            analysis_waiters: Vec::new(),
             worker_tx: None,
             db,
         }
@@ -211,10 +221,7 @@ impl DaemonState {
                     false
                 }
                 StateMessage::Query { request, reply } => {
-                    let response = self.handle_query(request);
-                    if reply.send(response).is_err() {
-                        debug!("query reply channel dropped");
-                    }
+                    self.handle_query(request, reply);
                     false
                 }
                 StateMessage::BaseRefChanged { new_commit } => {
@@ -278,10 +285,7 @@ impl DaemonState {
         while let Some(msg) = rx.recv().await {
             match msg {
                 StateMessage::Query { request, reply } => {
-                    let response = self.handle_query(request);
-                    if reply.send(response).is_err() {
-                        debug!("query reply channel dropped during shutdown drain");
-                    }
+                    self.handle_query_during_shutdown(request, reply);
                 }
                 StateMessage::RegisterWorkspace { reply, .. } => {
                     if reply
@@ -362,6 +366,10 @@ impl DaemonState {
         }
 
         self.pair_analyses.insert(pair, result);
+
+        if self.in_flight_pairs.is_empty() {
+            self.drain_analysis_waiters();
+        }
     }
 
     fn handle_attach_worker(&mut self, worker_tx: mpsc::Sender<WorkerMessage>) {
@@ -369,14 +377,17 @@ impl DaemonState {
         info!("worker channel attached to state actor");
     }
 
-    fn handle_query(&self, request: QueryRequest) -> QueryResponse {
+    fn handle_query(&mut self, request: QueryRequest, reply: oneshot::Sender<QueryResponse>) {
         match request {
             QueryRequest::ListWorkspaces => {
                 let workspaces: Vec<Workspace> = self.workspaces.values().cloned().collect();
-                QueryResponse::Workspaces(workspaces)
+                Self::send_query_reply(reply, QueryResponse::Workspaces(workspaces));
             }
             QueryRequest::GetWorkspace { workspace_id } => {
-                QueryResponse::Workspace(self.workspaces.get(&workspace_id).cloned())
+                Self::send_query_reply(
+                    reply,
+                    QueryResponse::Workspace(self.workspaces.get(&workspace_id).cloned()),
+                );
             }
             QueryRequest::GetPairAnalysis {
                 workspace_a,
@@ -387,18 +398,90 @@ impl DaemonState {
                     .get(&(workspace_a, workspace_b))
                     .or_else(|| self.pair_analyses.get(&(workspace_b, workspace_a)))
                     .cloned();
-                QueryResponse::PairAnalysis(analysis)
+                Self::send_query_reply(reply, QueryResponse::PairAnalysis(analysis));
             }
             QueryRequest::GetAllAnalyses => {
                 let analyses: Vec<WorkspacePairAnalysis> =
                     self.pair_analyses.values().cloned().collect();
-                QueryResponse::AllAnalyses(analyses)
+                Self::send_query_reply(reply, QueryResponse::AllAnalyses(analyses));
             }
-            QueryRequest::GetStatus => QueryResponse::Status {
-                workspace_count: self.workspaces.len(),
+            QueryRequest::GetStatus => Self::send_query_reply(
+                reply,
+                QueryResponse::Status {
+                    workspace_count: self.workspaces.len(),
+                    analysis_count: self.pair_analyses.len(),
+                    base_commit: self.base_commit.clone(),
+                },
+            ),
+            QueryRequest::AwaitAnalysis { timeout_ms } => {
+                self.handle_await_analysis_query(timeout_ms, reply);
+            }
+        }
+    }
+
+    fn handle_query_during_shutdown(
+        &mut self,
+        request: QueryRequest,
+        reply: oneshot::Sender<QueryResponse>,
+    ) {
+        match request {
+            QueryRequest::AwaitAnalysis { .. } => {
+                let response = QueryResponse::AwaitAnalysis {
+                    completed: self.in_flight_pairs.is_empty(),
+                    in_flight: self.in_flight_pairs.len(),
+                    analysis_count: self.pair_analyses.len(),
+                };
+                Self::send_query_reply(reply, response);
+            }
+            QueryRequest::ListWorkspaces
+            | QueryRequest::GetWorkspace { .. }
+            | QueryRequest::GetPairAnalysis { .. }
+            | QueryRequest::GetAllAnalyses
+            | QueryRequest::GetStatus => {
+                self.handle_query(request, reply);
+            }
+        }
+    }
+
+    fn handle_await_analysis_query(
+        &mut self,
+        timeout_ms: u64,
+        reply: oneshot::Sender<QueryResponse>,
+    ) {
+        let in_flight = self.in_flight_pairs.len();
+        if in_flight == 0 || timeout_ms == 0 {
+            let response = QueryResponse::AwaitAnalysis {
+                completed: in_flight == 0,
+                in_flight,
                 analysis_count: self.pair_analyses.len(),
-                base_commit: self.base_commit.clone(),
-            },
+            };
+            Self::send_query_reply(reply, response);
+            return;
+        }
+
+        self.analysis_waiters.push(reply);
+    }
+
+    fn drain_analysis_waiters(&mut self) {
+        if self.analysis_waiters.is_empty() {
+            return;
+        }
+
+        let response = QueryResponse::AwaitAnalysis {
+            completed: true,
+            in_flight: 0,
+            analysis_count: self.pair_analyses.len(),
+        };
+
+        let waiters = std::mem::take(&mut self.analysis_waiters);
+        for waiter in waiters {
+            Self::send_query_reply(waiter, response.clone());
+        }
+    }
+
+    fn send_query_reply(reply: oneshot::Sender<QueryResponse>, response: QueryResponse) {
+        if reply.send(response).is_err() {
+            debug!("query reply channel dropped");
         }
     }
 
@@ -906,6 +989,127 @@ mod tests {
                 assert_eq!(a.score, OrthogonalityScore::Yellow);
             }
             other => panic!("expected analysis, got: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_analysis_returns_completed_immediately_when_idle() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::AwaitAnalysis { timeout_ms: 30_000 },
+            reply: reply_tx,
+        })
+        .await
+        .unwrap();
+
+        match reply_rx.await.unwrap() {
+            QueryResponse::AwaitAnalysis {
+                completed,
+                in_flight,
+                analysis_count,
+            } => {
+                assert!(completed);
+                assert_eq!(in_flight, 0);
+                assert_eq!(analysis_count, 0);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        tx.send(StateMessage::Shutdown).await.unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_analysis_waiter_completes_when_in_flight_pair_finishes() {
+        let (tx, handle) = spawn_state_actor(GroveConfig::default(), None);
+        let ws_a = make_workspace("await-a");
+        let ws_b = make_workspace("await-b");
+        let id_a = ws_a.id;
+
+        for ws in [ws_a, ws_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            tx.send(StateMessage::RegisterWorkspace {
+                workspace: ws,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        let (worker_tx, mut worker_rx) = mpsc::channel(8);
+        tx.send(StateMessage::AttachWorker { worker_tx })
+            .await
+            .unwrap();
+
+        tx.send(StateMessage::FileChanged {
+            workspace_id: id_a,
+            path: PathBuf::from("src/lib.rs"),
+        })
+        .await
+        .unwrap();
+
+        let pair = match timeout(Duration::from_secs(1), worker_rx.recv())
+            .await
+            .expect("analysis dispatch should happen")
+            .expect("worker should receive analysis message")
+        {
+            WorkerMessage::AnalyzePair {
+                workspace_a,
+                workspace_b,
+                ..
+            } => (workspace_a.id, workspace_b.id),
+        };
+
+        let (await_reply_tx, await_reply_rx) = oneshot::channel();
+        tx.send(StateMessage::Query {
+            request: QueryRequest::AwaitAnalysis { timeout_ms: 30_000 },
+            reply: await_reply_tx,
+        })
+        .await
+        .unwrap();
+
+        let mut await_reply_rx = await_reply_rx;
+        assert!(
+            timeout(Duration::from_millis(50), &mut await_reply_rx)
+                .await
+                .is_err()
+        );
+
+        tx.send(StateMessage::AnalysisComplete {
+            pair,
+            result: WorkspacePairAnalysis {
+                workspace_a: pair.0,
+                workspace_b: pair.1,
+                score: OrthogonalityScore::Green,
+                overlaps: vec![],
+                merge_order_hint: MergeOrder::Either,
+                last_computed: Utc::now(),
+            },
+        })
+        .await
+        .unwrap();
+
+        match timeout(Duration::from_secs(1), &mut await_reply_rx)
+            .await
+            .expect("await_analysis reply should arrive")
+            .unwrap()
+        {
+            QueryResponse::AwaitAnalysis {
+                completed,
+                in_flight,
+                analysis_count,
+            } => {
+                assert!(completed);
+                assert_eq!(in_flight, 0);
+                assert_eq!(analysis_count, 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
 
         tx.send(StateMessage::Shutdown).await.unwrap();
