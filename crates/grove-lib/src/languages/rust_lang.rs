@@ -828,4 +828,92 @@ use std::collections::HashMap;
                 .any(|i| i.source.contains("std::collections::HashMap"))
         );
     }
+
+    #[test]
+    fn extract_symbols_includes_enum() {
+        let source = br#"
+enum Direction {
+    North,
+    South,
+    East,
+    West,
+}
+"#;
+        let analyzer = RustAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Direction");
+        assert_eq!(symbols[0].kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn language_id_and_file_extensions() {
+        let analyzer = RustAnalyzer::new();
+        assert_eq!(analyzer.language_id(), "rust");
+        assert_eq!(analyzer.file_extensions(), &["rs"]);
+    }
+
+    #[test]
+    fn function_signature_contains_fn_keyword() {
+        let source = br#"
+fn compute(x: i32, y: i32) -> i32 {
+    x + y
+}
+"#;
+        let analyzer = RustAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        let sig = symbols[0].signature.as_ref().unwrap();
+        assert!(sig.contains("fn compute"));
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn range_start_and_end_for_all_symbol_kinds() {
+        let source = br#"fn top_fn() {
+    1
+}
+
+struct MyStruct {
+    x: i32,
+}
+
+enum MyEnum {
+    A,
+    B,
+}
+
+trait MyTrait {
+    fn required(&self);
+}
+
+impl MyStruct {
+    fn method(&self) {}
+}
+"#;
+        let analyzer = RustAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let top_fn = symbols.iter().find(|s| s.name == "top_fn").unwrap();
+        assert_eq!(top_fn.range.start, 1);
+        assert_eq!(top_fn.range.end, 3);
+
+        let my_struct = symbols
+            .iter()
+            .find(|s| s.name == "MyStruct" && s.kind == SymbolKind::Struct)
+            .unwrap();
+        assert_eq!(my_struct.range.start, 5);
+        assert_eq!(my_struct.range.end, 7);
+
+        let my_enum = symbols.iter().find(|s| s.name == "MyEnum").unwrap();
+        assert_eq!(my_enum.range.start, 9);
+        assert_eq!(my_enum.range.end, 12);
+
+        let my_trait = symbols.iter().find(|s| s.name == "MyTrait").unwrap();
+        assert_eq!(my_trait.range.start, 14);
+        assert_eq!(my_trait.range.end, 16);
+
+        let my_impl = symbols.iter().find(|s| s.kind == SymbolKind::Impl).unwrap();
+        assert_eq!(my_impl.range.start, 18);
+        assert_eq!(my_impl.range.end, 20);
+    }
 }

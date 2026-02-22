@@ -1359,4 +1359,67 @@ func main() {
         let symbols = analyzer.extract_symbols(source).unwrap();
         assert!(symbols.iter().any(|s| s.name == "main"));
     }
+
+    #[test]
+    fn language_id_and_file_extensions() {
+        let analyzer = GoAnalyzer::new();
+        assert_eq!(analyzer.language_id(), "go");
+        assert_eq!(analyzer.file_extensions(), &["go"]);
+    }
+
+    #[test]
+    fn range_start_and_end_for_all_symbol_kinds() {
+        let source = br#"package main
+
+func topFunc() {
+}
+
+func (s *Server) method() {
+}
+
+type MyStruct struct {
+    X int
+}
+
+type MyInterface interface {
+    Do()
+}
+
+type Alias int
+
+const MaxSize = 100
+
+var counter int
+"#;
+        let analyzer = GoAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let top_func = symbols.iter().find(|s| s.name == "topFunc").unwrap();
+        assert_eq!(top_func.range.start, 3);
+        assert_eq!(top_func.range.end, 4);
+
+        let method = symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(method.range.start, 6);
+        assert_eq!(method.range.end, 7);
+
+        let my_struct = symbols.iter().find(|s| s.name == "MyStruct").unwrap();
+        assert_eq!(my_struct.range.start, 9);
+        assert_eq!(my_struct.range.end, 11);
+
+        let my_iface = symbols.iter().find(|s| s.name == "MyInterface").unwrap();
+        assert_eq!(my_iface.range.start, 13);
+        assert_eq!(my_iface.range.end, 15);
+
+        let alias = symbols.iter().find(|s| s.name == "Alias").unwrap();
+        assert_eq!(alias.range.start, 17);
+        assert_eq!(alias.range.end, 17);
+
+        let max_size = symbols.iter().find(|s| s.name == "MaxSize").unwrap();
+        assert_eq!(max_size.range.start, 19);
+        assert_eq!(max_size.range.end, 19);
+
+        let counter = symbols.iter().find(|s| s.name == "counter").unwrap();
+        assert_eq!(counter.range.start, 21);
+        assert_eq!(counter.range.end, 21);
+    }
 }

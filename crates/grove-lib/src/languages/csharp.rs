@@ -1241,4 +1241,146 @@ public class NullableExample {
                 .any(|s| s.name == "GetNullable" && s.kind == SymbolKind::Method)
         );
     }
+
+    #[test]
+    fn extract_public_declarations_all_type_arms() {
+        let source = br#"
+public class MyClass {}
+public struct MyStruct {}
+public interface IMyInterface {}
+public enum MyEnum { A, B }
+public record MyRecord(int X);
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"MyClass"));
+        assert!(names.contains(&"MyStruct"));
+        assert!(names.contains(&"IMyInterface"));
+        assert!(names.contains(&"MyEnum"));
+        assert!(names.contains(&"MyRecord"));
+
+        let class_e = exports.iter().find(|e| e.name == "MyClass").unwrap();
+        assert_eq!(class_e.kind, SymbolKind::Class);
+        let struct_e = exports.iter().find(|e| e.name == "MyStruct").unwrap();
+        assert_eq!(struct_e.kind, SymbolKind::Struct);
+        let iface_e = exports.iter().find(|e| e.name == "IMyInterface").unwrap();
+        assert_eq!(iface_e.kind, SymbolKind::Interface);
+        let enum_e = exports.iter().find(|e| e.name == "MyEnum").unwrap();
+        assert_eq!(enum_e.kind, SymbolKind::Enum);
+        let record_e = exports.iter().find(|e| e.name == "MyRecord").unwrap();
+        assert_eq!(record_e.kind, SymbolKind::Class);
+    }
+
+    #[test]
+    fn extract_public_field_declaration() {
+        let source = br#"
+public class Config {
+    public int MaxSize;
+    private int _secret;
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"MaxSize"));
+        assert!(!names.contains(&"_secret"));
+    }
+
+    #[test]
+    fn language_id_and_file_extensions() {
+        let analyzer = CSharpAnalyzer::new();
+        assert_eq!(analyzer.language_id(), "csharp");
+        assert_eq!(analyzer.file_extensions(), &["cs"]);
+    }
+
+    #[test]
+    fn exports_reject_non_public_types() {
+        let source = br#"
+internal class InternalClass {}
+class DefaultClass {}
+public class PublicClass {}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["PublicClass"]);
+    }
+
+    #[test]
+    fn range_start_and_end_for_all_symbol_kinds() {
+        let source = br#"public class MyClass {
+    public void Method() {
+        return;
+    }
+
+    public MyClass() {
+    }
+
+    public string Name { get; set; }
+
+    private int _count;
+}
+
+public struct MyStruct {
+}
+
+public interface IService {
+}
+
+public enum Status {
+    Active
+}
+
+public record MyRecord(int X) {
+}
+"#;
+        let analyzer = CSharpAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let my_class = symbols
+            .iter()
+            .find(|s| s.name == "MyClass" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert_eq!(my_class.range.start, 1);
+        assert_eq!(my_class.range.end, 12);
+
+        let method = symbols.iter().find(|s| s.name == "Method").unwrap();
+        assert_eq!(method.range.start, 2);
+        assert_eq!(method.range.end, 4);
+
+        let constructor = symbols
+            .iter()
+            .find(|s| s.name == "MyClass" && s.kind == SymbolKind::Method)
+            .unwrap();
+        assert_eq!(constructor.range.start, 6);
+        assert_eq!(constructor.range.end, 7);
+
+        let name_prop = symbols.iter().find(|s| s.name == "Name").unwrap();
+        assert_eq!(name_prop.range.start, 9);
+        assert_eq!(name_prop.range.end, 9);
+
+        let count_field = symbols.iter().find(|s| s.name == "_count").unwrap();
+        assert_eq!(count_field.range.start, 11);
+        assert_eq!(count_field.range.end, 11);
+
+        let my_struct = symbols.iter().find(|s| s.name == "MyStruct").unwrap();
+        assert_eq!(my_struct.range.start, 14);
+        assert_eq!(my_struct.range.end, 15);
+
+        let i_service = symbols.iter().find(|s| s.name == "IService").unwrap();
+        assert_eq!(i_service.range.start, 17);
+        assert_eq!(i_service.range.end, 18);
+
+        let status = symbols.iter().find(|s| s.name == "Status").unwrap();
+        assert_eq!(status.range.start, 20);
+        assert_eq!(status.range.end, 22);
+
+        let my_record = symbols.iter().find(|s| s.name == "MyRecord").unwrap();
+        assert_eq!(my_record.range.start, 24);
+        assert_eq!(my_record.range.end, 25);
+    }
 }

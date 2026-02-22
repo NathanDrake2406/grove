@@ -912,4 +912,110 @@ public class RealClass {}
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "RealClass");
     }
+
+    #[test]
+    fn collect_exports_includes_public_enum() {
+        let source = br#"
+public enum Status {
+    ACTIVE,
+    INACTIVE
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "Status");
+        assert_eq!(exports[0].kind, SymbolKind::Enum);
+    }
+
+    #[test]
+    fn language_id_and_file_extensions() {
+        let analyzer = JavaAnalyzer::new();
+        assert_eq!(analyzer.language_id(), "java");
+        assert_eq!(analyzer.file_extensions(), &["java"]);
+    }
+
+    #[test]
+    fn exports_reject_non_public_classes() {
+        let source = br#"
+class DefaultClass {}
+private class PrivateClass {}
+protected class ProtectedClass {}
+public class PublicClass {}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let names: Vec<&str> = exports.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["PublicClass"]);
+    }
+
+    #[test]
+    fn range_start_and_end_for_all_symbol_kinds() {
+        let source = br#"public class Main {
+    public void method() {
+        return;
+    }
+
+    public Main() {
+    }
+
+    private int count;
+}
+
+public interface Svc {
+    void run();
+}
+
+public enum Color {
+    RED
+}
+
+public record Coord(int x, int y) {
+}
+
+public @interface MyAnno {
+}
+"#;
+        let analyzer = JavaAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let main_class = symbols
+            .iter()
+            .find(|s| s.name == "Main" && s.kind == SymbolKind::Class)
+            .unwrap();
+        assert_eq!(main_class.range.start, 1);
+        assert_eq!(main_class.range.end, 10);
+
+        let method = symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(method.range.start, 2);
+        assert_eq!(method.range.end, 4);
+
+        let constructor = symbols
+            .iter()
+            .find(|s| s.name == "Main" && s.kind == SymbolKind::Method)
+            .unwrap();
+        assert_eq!(constructor.range.start, 6);
+        assert_eq!(constructor.range.end, 7);
+
+        let count = symbols.iter().find(|s| s.name == "count").unwrap();
+        assert_eq!(count.range.start, 9);
+        assert_eq!(count.range.end, 9);
+
+        let svc = symbols.iter().find(|s| s.name == "Svc").unwrap();
+        assert_eq!(svc.range.start, 12);
+        assert_eq!(svc.range.end, 14);
+
+        let color = symbols.iter().find(|s| s.name == "Color").unwrap();
+        assert_eq!(color.range.start, 16);
+        assert_eq!(color.range.end, 18);
+
+        let coord = symbols.iter().find(|s| s.name == "Coord").unwrap();
+        assert_eq!(coord.range.start, 20);
+        assert_eq!(coord.range.end, 21);
+
+        let anno = symbols.iter().find(|s| s.name == "MyAnno").unwrap();
+        assert_eq!(anno.range.start, 23);
+        assert_eq!(anno.range.end, 24);
+    }
 }
