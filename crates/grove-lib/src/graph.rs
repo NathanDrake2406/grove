@@ -909,4 +909,74 @@ mod tests {
         assert!(affected_files.contains(&PathBuf::from("B.ts")));
         assert!(affected_files.contains(&PathBuf::from("C.ts")));
     }
+
+    #[test]
+    fn import_graph_is_empty_edge_cases() {
+        // Completely empty → true
+        let graph = ImportGraph::new();
+        assert!(graph.is_empty());
+
+        // Only imports → false
+        let mut imports_only = ImportGraph::new();
+        imports_only.add_import(
+            PathBuf::from("a.ts"),
+            PathBuf::from("b.ts"),
+            vec![ImportedSymbol {
+                name: "x".into(),
+                alias: None,
+            }],
+        );
+        assert!(!imports_only.is_empty());
+
+        // Only exports → false
+        let mut exports_only = ImportGraph::new();
+        exports_only.set_exports(
+            PathBuf::from("a.ts"),
+            vec![ExportedSymbol {
+                name: "x".into(),
+                kind: SymbolKind::Function,
+                signature: None,
+            }],
+        );
+        assert!(!exports_only.is_empty());
+    }
+
+    #[test]
+    fn has_export_changes_partial_conditions() {
+        let file = PathBuf::from("src/lib.ts");
+        let other = PathBuf::from("src/other.ts");
+
+        // Neither modified_exports nor added_files → false
+        let empty = GraphOverlay::new();
+        assert!(!empty.has_export_changes(&file));
+
+        // Only modified_exports → true
+        let mut modified_only = GraphOverlay::new();
+        modified_only.modified_exports.insert(
+            file.clone(),
+            vec![ExportedSymbol {
+                name: "x".into(),
+                kind: SymbolKind::Function,
+                signature: None,
+            }],
+        );
+        assert!(modified_only.has_export_changes(&file));
+        assert!(!modified_only.has_export_changes(&other));
+
+        // Only added_files → true
+        let mut added_only = GraphOverlay::new();
+        added_only.added_files.insert(
+            file.clone(),
+            (
+                vec![],
+                vec![ExportedSymbol {
+                    name: "y".into(),
+                    kind: SymbolKind::Function,
+                    signature: None,
+                }],
+            ),
+        );
+        assert!(added_only.has_export_changes(&file));
+        assert!(!added_only.has_export_changes(&other));
+    }
 }
