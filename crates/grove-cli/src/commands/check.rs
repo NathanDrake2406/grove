@@ -105,13 +105,22 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
     } else if !conflicts.is_empty() {
         for c in &json_conflicts {
             let score = c.get("score").and_then(|v| v.as_str()).unwrap_or("?");
+            let label = match score {
+                "Yellow" => "minor",
+                "Red" => "conflict",
+                "Black" => "breaking",
+                other => other,
+            };
             let other = c
                 .get("other_workspace")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
             let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            eprintln!("[{score}] {other}: {summary}");
+            eprintln!("[{label}] {other}: {summary}");
         }
+        eprintln!(
+            "\nRun `grove conflicts <this-branch> <other-branch>` for full details."
+        );
     }
 
     if conflicts.is_empty() {
@@ -155,7 +164,7 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
                 .get("affected_file")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            let mut s = format!("{changed} -> {affected}");
+            let mut s = format!("export change in {changed} breaks import in {affected}");
             if dep_count > 1 {
                 s.push_str(&format!(" (+{} more)", dep_count - 1));
             }
@@ -170,7 +179,7 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("?");
         let path = sym.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let mut s = format!("{name}() in {path}");
+        let mut s = format!("both branches modify {name}() in {path}");
         if symbol_count > 1 {
             s.push_str(&format!(" (+{} more)", symbol_count - 1));
         }
@@ -180,7 +189,7 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
         && let Some(hunk) = overlaps.iter().find_map(|o| o.get("Hunk"))
     {
         let path = hunk.get("path").and_then(|v| v.as_str()).unwrap_or("?");
-        let mut s = format!("overlapping lines in {path}");
+        let mut s = format!("overlapping line changes in {path}");
         if hunk_count > 1 {
             s.push_str(&format!(" (+{} more)", hunk_count - 1));
         }
@@ -188,7 +197,7 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
     }
     if file_count > 0 && parts.is_empty() {
         // Only show file overlaps if nothing more specific was found.
-        parts.push(format!("{file_count} shared file(s)"));
+        parts.push(format!("{file_count} file(s) modified by both branches"));
     }
     if schema_count > 0 {
         parts.push(format!("{schema_count} schema conflict(s)"));
@@ -219,7 +228,10 @@ mod tests {
             }
         })];
         let summary = summarize_overlaps(&overlaps);
-        assert_eq!(summary, "src/shared.ts -> src/api.ts");
+        assert_eq!(
+            summary,
+            "export change in src/shared.ts breaks import in src/api.ts"
+        );
     }
 
     #[test]
@@ -239,7 +251,7 @@ mod tests {
             }),
         ];
         let summary = summarize_overlaps(&overlaps);
-        assert!(summary.contains("src/shared.ts -> src/api.ts"));
+        assert!(summary.contains("export change in src/shared.ts breaks import in src/api.ts"));
         assert!(summary.contains("+1 more"));
     }
 
@@ -252,7 +264,10 @@ mod tests {
             }
         })];
         let summary = summarize_overlaps(&overlaps);
-        assert_eq!(summary, "authenticate() in src/auth.ts");
+        assert_eq!(
+            summary,
+            "both branches modify authenticate() in src/auth.ts"
+        );
     }
 
     #[test]
@@ -265,7 +280,7 @@ mod tests {
             }
         })];
         let summary = summarize_overlaps(&overlaps);
-        assert_eq!(summary, "overlapping lines in src/main.ts");
+        assert_eq!(summary, "overlapping line changes in src/main.ts");
     }
 
     #[test]
@@ -275,7 +290,7 @@ mod tests {
             serde_json::json!({"File": {"path": "src/b.ts"}}),
         ];
         let summary = summarize_overlaps(&overlaps);
-        assert_eq!(summary, "2 shared file(s)");
+        assert_eq!(summary, "2 file(s) modified by both branches");
     }
 
     #[test]
@@ -297,8 +312,8 @@ mod tests {
         ];
         let summary = summarize_overlaps(&overlaps);
         // Dependency and symbol shown, file-only suppressed.
-        assert!(summary.contains("src/shared.ts -> src/api.ts"));
-        assert!(summary.contains("login() in src/auth.ts"));
-        assert!(!summary.contains("shared file"));
+        assert!(summary.contains("export change in src/shared.ts breaks import in src/api.ts"));
+        assert!(summary.contains("both branches modify login() in src/auth.ts"));
+        assert!(!summary.contains("file(s) modified"));
     }
 }
