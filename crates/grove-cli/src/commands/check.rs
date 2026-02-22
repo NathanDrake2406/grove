@@ -118,9 +118,7 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
             let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
             eprintln!("[{label}] {other}: {summary}");
         }
-        eprintln!(
-            "\nRun `grove conflicts <this-branch> <other-branch>` for full details."
-        );
+        eprintln!("\nRun `grove conflicts <this-branch> <other-branch>` for full details.");
     }
 
     if conflicts.is_empty() {
