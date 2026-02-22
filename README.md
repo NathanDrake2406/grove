@@ -102,11 +102,21 @@ Add this to your project's `.claude/settings.json`:
 After any file edit, Claude will see output like:
 
 ```
-[Red] feat/payments: processPayment() in src/shared.ts (+2 more)
-[Yellow] feat/auth: 3 shared file(s)
+[conflict] feat/payments: both branches modify processPayment() in src/shared.ts (+2 more)
+[minor] feat/auth: 3 file(s) modified by both branches
+
+Run `grove conflicts <this-branch> <other-branch>` for full details.
 ```
 
 Or silence when clean (exit 0, no output).
+
+Labels are designed to be self-explanatory for AI agents:
+
+| Label | Meaning | Action |
+|-------|---------|--------|
+| `[minor]` | Same files touched, nearby code | Be aware, usually safe |
+| `[conflict]` | Same symbols modified or overlapping lines | Coordinate before merging |
+| `[breaking]` | Export change breaks downstream imports | Must resolve before merging |
 
 ### How it works
 
@@ -207,7 +217,7 @@ Block until all in-flight analyses finish (or timeout), instead of polling:
 cargo build                     # Build all crates
 cargo test                      # Run all tests
 cargo clippy --workspace        # Lint
-cargo fmt --check               # Format check
+cargo fmt                       # Format
 cargo test -p grove-lib         # Test core library only
 cargo test -p grove-daemon      # Test daemon
 ```
