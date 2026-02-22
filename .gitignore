@@ -8,3 +8,16 @@ CLAUDE.md
 docs/PRD.md
 docs/
 tests/stress/
+
+# Coverage artifacts
+*.profraw
+*.profdata
+lcov.info
+cobertura.xml
+codecov.json
+coverage/
+target/llvm-cov-target/
+
+# Mutation testing artifacts
+mutants.out/
+mutants.out.old/
