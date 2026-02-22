@@ -70,6 +70,7 @@ pub fn spawn_worker_pool(config: GroveConfig, state_tx: mpsc::Sender<StateMessag
             });
         }
 
+        in_flight.abort_all();
         while in_flight.join_next().await.is_some() {}
         info!("worker pool stopped");
     });
