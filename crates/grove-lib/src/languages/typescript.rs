@@ -1070,4 +1070,339 @@ export { default as Thing } from './thing';
             "missing aliased default re-export: Thing"
         );
     }
+
+    #[test]
+    fn extract_symbols_includes_enum_and_type_alias() {
+        let source = br#"
+enum Direction {
+    North,
+    South,
+}
+
+type UserId = string;
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let dir = symbols.iter().find(|s| s.name == "Direction").unwrap();
+        assert_eq!(dir.kind, SymbolKind::Enum);
+
+        let uid = symbols.iter().find(|s| s.name == "UserId").unwrap();
+        assert_eq!(uid.kind, SymbolKind::TypeAlias);
+    }
+
+    #[test]
+    fn language_id_and_file_extensions() {
+        let analyzer = TypeScriptAnalyzer::new();
+        assert_eq!(analyzer.language_id(), "typescript");
+        let exts = analyzer.file_extensions();
+        assert!(exts.contains(&"ts"));
+        assert!(exts.contains(&"tsx"));
+        assert!(exts.contains(&"js"));
+        assert!(exts.contains(&"jsx"));
+        assert!(exts.contains(&"mts"));
+        assert!(exts.contains(&"mjs"));
+        assert_eq!(exts.len(), 6);
+    }
+
+    #[test]
+    fn import_with_empty_source_is_skipped() {
+        let source = br#"
+import { foo } from '';
+import { bar } from './valid';
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        // The empty-string import should be filtered out by extract_string_value
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "./valid");
+    }
+
+    #[test]
+    fn function_signature_contains_declaration() {
+        let source = br#"
+function greet(name: string): string {
+    return `Hello, ${name}!`;
+}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+        let sig = symbols[0].signature.as_ref().unwrap();
+        assert!(sig.contains("function greet"));
+        assert!(!sig.is_empty());
+    }
+
+    #[test]
+    fn is_schema_file_rejects_regular_code_files() {
+        let analyzer = TypeScriptAnalyzer::new();
+        assert!(!analyzer.is_schema_file(Path::new("src/index.ts")));
+        assert!(!analyzer.is_schema_file(Path::new("src/utils.js")));
+        assert!(!analyzer.is_schema_file(Path::new("components/App.tsx")));
+    }
+
+    #[test]
+    fn range_start_and_end_for_all_symbol_kinds() {
+        let source = br#"function topFn(): void {
+    return;
+}
+
+class MyClass {
+    myMethod(): void {
+        return;
+    }
+}
+
+interface MyInterface {
+    field: string;
+}
+
+type MyType = string | number;
+
+enum MyEnum {
+    A,
+    B,
+}
+
+const myVar = 42;
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let top_fn = symbols.iter().find(|s| s.name == "topFn").unwrap();
+        assert_eq!(top_fn.range.start, 1);
+        assert_eq!(top_fn.range.end, 3);
+
+        let my_class = symbols.iter().find(|s| s.name == "MyClass").unwrap();
+        assert_eq!(my_class.range.start, 5);
+        assert_eq!(my_class.range.end, 9);
+
+        let my_method = symbols.iter().find(|s| s.name == "myMethod").unwrap();
+        assert_eq!(my_method.range.start, 6);
+        assert_eq!(my_method.range.end, 8);
+
+        let my_iface = symbols.iter().find(|s| s.name == "MyInterface").unwrap();
+        assert_eq!(my_iface.range.start, 11);
+        assert_eq!(my_iface.range.end, 13);
+
+        let my_type = symbols.iter().find(|s| s.name == "MyType").unwrap();
+        assert_eq!(my_type.range.start, 15);
+        assert_eq!(my_type.range.end, 15);
+
+        let my_enum = symbols.iter().find(|s| s.name == "MyEnum").unwrap();
+        assert_eq!(my_enum.range.start, 17);
+        assert_eq!(my_enum.range.end, 20);
+
+        let my_var = symbols.iter().find(|s| s.name == "myVar").unwrap();
+        assert_eq!(my_var.range.start, 22);
+        assert_eq!(my_var.range.end, 22);
+    }
+
+    #[test]
+    fn dynamic_import_line_number() {
+        let source = br#"const x = 1;
+const y = 2;
+const mod = await import("./mod");
+const z = 3;
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "./mod");
+        assert_eq!(imports[0].line, 3);
+    }
+
+    // === Mutant-killing tests ===
+
+    #[test]
+    fn parse_cache_invalidates_when_source_changes() {
+        // Kills mutants on line 50: == with !=, == with !=, && with ||
+        // If the cache equality is inverted, parsing different source would
+        // incorrectly return stale cached results.
+        let analyzer = TypeScriptAnalyzer::new();
+
+        let source_a = b"function alpha(): void {}";
+        let source_b = b"function beta(): void {}";
+
+        let symbols_a = analyzer.extract_symbols(source_a).unwrap();
+        assert_eq!(symbols_a.len(), 1);
+        assert_eq!(symbols_a[0].name, "alpha");
+
+        // Parse different source — cache must NOT return stale "alpha"
+        let symbols_b = analyzer.extract_symbols(source_b).unwrap();
+        assert_eq!(symbols_b.len(), 1);
+        assert_eq!(
+            symbols_b[0].name, "beta",
+            "cache returned stale result from previous parse"
+        );
+    }
+
+    #[test]
+    fn parse_cache_distinguishes_tsx_flag() {
+        // Kills the is_tsx == with != mutant on line 50.
+        // TypeScriptAnalyzer::parse caches by (source, is_tsx). If the is_tsx
+        // check is inverted, the cache would return a TSX tree for TS or vice
+        // versa. We exercise this by calling parse directly for the same source
+        // with different is_tsx flags and verifying both succeed (no parse error
+        // from wrong grammar).
+        let analyzer = TypeScriptAnalyzer::new();
+        let source = b"const x: number = 1;";
+
+        // Parse as TS
+        let tree_ts = analyzer.parse(source, false);
+        assert!(tree_ts.is_ok(), "TS parse should succeed");
+
+        // Parse same source as TSX — must NOT return the cached TS tree
+        // if the is_tsx field matters
+        let tree_tsx = analyzer.parse(source, true);
+        assert!(tree_tsx.is_ok(), "TSX parse should succeed");
+
+        // Parse as TS again — should hit cache correctly
+        let tree_ts2 = analyzer.parse(source, false);
+        assert!(tree_ts2.is_ok(), "second TS parse should succeed");
+    }
+
+    #[test]
+    fn exported_type_alias_is_captured() {
+        // Kills mutant on line 268: delete match arm "type_alias_declaration" in extract_exports
+        let source = br#"export type UserId = string;
+export type Config = { host: string; port: number };
+export function helper(): void {}
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        let type_alias_exports: Vec<_> = exports
+            .iter()
+            .filter(|e| e.kind == SymbolKind::TypeAlias)
+            .collect();
+        assert_eq!(
+            type_alias_exports.len(),
+            2,
+            "expected 2 exported type aliases, got {:?}",
+            exports
+        );
+        assert_eq!(type_alias_exports[0].name, "UserId");
+        assert_eq!(type_alias_exports[1].name, "Config");
+
+        // Also verify the function export is still there
+        assert!(exports.iter().any(|e| e.name == "helper"));
+    }
+
+    #[test]
+    fn import_with_empty_double_quoted_source_is_skipped() {
+        // Kills mutants on line 374: replace match guard source_path.is_empty() with true/false
+        // The match guard on line 374 handles the fallback case where source_path
+        // hasn't been found yet via child_by_field_name("source"). If the guard
+        // is replaced with `true`, it would overwrite valid sources with empty ones.
+        // If replaced with `false`, it would never try the fallback extraction.
+        let source = br#"import { foo } from "";
+import { bar } from "./real-module";
+"#;
+        let analyzer = TypeScriptAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        // Empty-string source should be filtered out
+        assert_eq!(
+            imports.len(),
+            1,
+            "expected only 1 import, got {:?}",
+            imports
+        );
+        assert_eq!(imports[0].source, "./real-module");
+        assert_eq!(imports[0].symbols.len(), 1);
+        assert_eq!(imports[0].symbols[0].name, "bar");
+    }
+
+    #[test]
+    fn parse_cache_tsx_flag_prevents_wrong_grammar_reuse() {
+        // Kills mutant: line 50:48 `cached.is_tsx == is_tsx` → `cached.is_tsx != is_tsx`
+        //
+        // JSX source is valid under the TSX grammar (produces jsx_self_closing_element)
+        // but produces error nodes under the TS grammar (which has no JSX support).
+        // If the cache incorrectly returns a TSX-parsed tree when TS is requested
+        // (or vice versa), the tree structure will be wrong.
+        //
+        // Strategy: parse JSX source with is_tsx=true first (populates cache with TSX tree).
+        // Then parse the SAME source with is_tsx=false. With the mutation (!=), the
+        // second call matches the cache entry (true != false → true, source matches → true)
+        // and returns the cached TSX tree instead of re-parsing with the TS grammar.
+        // We detect this by checking that the TS parse has error nodes (JSX is invalid TS).
+        let analyzer = TypeScriptAnalyzer::new();
+        let jsx_source = b"const el = <div />;";
+
+        // First parse as TSX — should succeed cleanly (JSX is valid TSX)
+        let tsx_tree = analyzer.parse(jsx_source, true).unwrap();
+        assert!(
+            !tsx_tree.root_node().has_error(),
+            "TSX parse of JSX source should have no errors"
+        );
+
+        // Second parse as TS — must NOT return the cached TSX tree.
+        // The TS grammar does not support JSX, so it should produce error nodes.
+        let ts_tree = analyzer.parse(jsx_source, false).unwrap();
+        assert!(
+            ts_tree.root_node().has_error(),
+            "TS parse of JSX source should have errors, but got a clean tree \
+             (cache likely returned the TSX tree due to inverted is_tsx check)"
+        );
+    }
+
+    #[test]
+    fn extract_static_import_fallback_uses_first_string_child() {
+        // Kills mutants: line 374:45
+        //   - `source_path.is_empty()` → `true`  (always overwrite → uses last string)
+        //   - `source_path.is_empty()` → `false` (never fallback → returns None)
+        //
+        // extract_static_import first tries child_by_field_name("source"). If that
+        // fails (returns None), it falls back to the first "string" or "template_string"
+        // direct child, guarded by `source_path.is_empty()`.
+        //
+        // We exercise this by calling extract_static_import on a tree-sitter node that:
+        //   1. Has NO "source" field (child_by_field_name returns None)
+        //   2. Has TWO string direct children with different values
+        //
+        // With the original guard (is_empty):
+        //   - First string sets source_path → guard blocks second → result: first string
+        // With `true` mutation:
+        //   - Both strings fire → second overwrites first → result: second string
+        // With `false` mutation:
+        //   - Neither string fires → source_path stays empty → returns None
+        let analyzer = TypeScriptAnalyzer::new();
+
+        // Parse an array literal: ['./first', './second']
+        // The array node has two string direct children and no "source" field.
+        let src = b"['./first', './second'];";
+        let tree = analyzer.parse(src, false).unwrap();
+        let root = tree.root_node();
+
+        // Navigate to the array node: program > expression_statement > array
+        let expr_stmt = root.child(0).expect("expected expression_statement");
+        let array_node = expr_stmt
+            .child(0)
+            .expect("expected array node inside expression_statement");
+        assert_eq!(
+            array_node.kind(),
+            "array",
+            "expected array node, got {:?}",
+            array_node.kind()
+        );
+        assert!(
+            array_node.child_by_field_name("source").is_none(),
+            "array node should not have a 'source' field"
+        );
+
+        let result = extract_static_import(array_node, src);
+        let import = result.expect(
+            "extract_static_import should return Some when string children \
+             exist (fallback path). If None, the is_empty() guard was \
+             replaced with `false`, preventing fallback extraction.",
+        );
+        assert_eq!(
+            import.source, "./first",
+            "extract_static_import should use the FIRST string child. \
+             If './second', the is_empty() guard was replaced with `true`, \
+             allowing the second string to overwrite the first."
+        );
+    }
 }

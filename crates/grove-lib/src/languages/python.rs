@@ -1242,4 +1242,308 @@ def uses_match(command):
         assert!(analyzer.extract_imports(source).unwrap().is_empty());
         assert_eq!(analyzer.extract_exports(source).unwrap().len(), 2);
     }
+
+    #[test]
+    fn language_id_and_file_extensions() {
+        let analyzer = PythonAnalyzer::new();
+        assert_eq!(analyzer.language_id(), "python");
+        assert_eq!(analyzer.file_extensions(), &["py", "pyi"]);
+    }
+
+    #[test]
+    fn constants_reject_mixed_case() {
+        let source = br#"MixedCase = 42
+VALID_CONST = 1
+lowercase = 2
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let mixed = symbols.iter().find(|s| s.name == "MixedCase").unwrap();
+        assert_eq!(
+            mixed.kind,
+            SymbolKind::Variable,
+            "MixedCase should be Variable, not Constant"
+        );
+
+        let valid = symbols.iter().find(|s| s.name == "VALID_CONST").unwrap();
+        assert_eq!(valid.kind, SymbolKind::Constant);
+
+        let lower = symbols.iter().find(|s| s.name == "lowercase").unwrap();
+        assert_eq!(lower.kind, SymbolKind::Variable);
+    }
+
+    #[test]
+    fn dunder_all_ignores_other_assignments() {
+        let source = br#"ITEMS = ["a", "b"]
+
+__all__ = ["MyClass"]
+
+class MyClass:
+    pass
+
+def helper():
+    pass
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let exports = analyzer.extract_exports(source).unwrap();
+
+        // Only __all__ should control exports, not ITEMS
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].name, "MyClass");
+    }
+
+    #[test]
+    fn import_statement_line_numbers() {
+        let source = br#"import os
+
+x = 1
+
+import sys
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "os");
+        assert_eq!(imports[0].line, 1);
+        assert_eq!(imports[1].source, "sys");
+        assert_eq!(imports[1].line, 5);
+    }
+
+    #[test]
+    fn range_start_and_end_for_all_symbol_kinds() {
+        let source = br#"def top_func():
+    pass
+
+class MyClass:
+    def method(self):
+        pass
+
+MAX_SIZE = 1024
+
+name = "grove"
+
+@decorator
+def decorated():
+    pass
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        let top_func = symbols.iter().find(|s| s.name == "top_func").unwrap();
+        assert_eq!(top_func.range.start, 1);
+        assert_eq!(top_func.range.end, 2);
+
+        let my_class = symbols.iter().find(|s| s.name == "MyClass").unwrap();
+        assert_eq!(my_class.range.start, 4);
+        assert_eq!(my_class.range.end, 6);
+
+        let method = symbols.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(method.range.start, 5);
+        assert_eq!(method.range.end, 6);
+
+        let max_size = symbols.iter().find(|s| s.name == "MAX_SIZE").unwrap();
+        assert_eq!(max_size.range.start, 8);
+        assert_eq!(max_size.range.end, 8);
+
+        let name_var = symbols.iter().find(|s| s.name == "name").unwrap();
+        assert_eq!(name_var.range.start, 10);
+        assert_eq!(name_var.range.end, 10);
+
+        let decorated = symbols.iter().find(|s| s.name == "decorated").unwrap();
+        assert_eq!(decorated.range.start, 12);
+        assert_eq!(decorated.range.end, 14);
+    }
+
+    // === Mutant-killing tests ===
+
+    #[test]
+    fn parse_cache_invalidates_when_source_changes() {
+        // Kills mutant on line 40: replace == with != in PythonAnalyzer::parse
+        // If the cache equality is inverted, parsing different source would
+        // incorrectly return stale cached results.
+        let analyzer = PythonAnalyzer::new();
+
+        let source_a = b"def alpha():\n    pass\n";
+        let source_b = b"def beta():\n    pass\n";
+
+        let symbols_a = analyzer.extract_symbols(source_a).unwrap();
+        assert_eq!(symbols_a.len(), 1);
+        assert_eq!(symbols_a[0].name, "alpha");
+
+        // Parse different source — cache must NOT return stale "alpha"
+        let symbols_b = analyzer.extract_symbols(source_b).unwrap();
+        assert_eq!(symbols_b.len(), 1);
+        assert_eq!(
+            symbols_b[0].name, "beta",
+            "cache returned stale result from previous parse"
+        );
+    }
+
+    #[test]
+    fn decorated_method_exact_range_start_and_end() {
+        // Kills mutants on lines 311-312:
+        //   311: replace + with - in extract_method (end line)
+        //   311: replace + with * in extract_method (end line)
+        //   312: replace + with * in extract_method (start line)
+        // The decorated_definition node spans from the decorator to the end
+        // of the method body. We place the decorated method on rows > 0 so
+        // that row + 1 != row * 1 and row + 1 != row - 1.
+        let source = br#"class Service:
+    pass
+
+class Api:
+    @staticmethod
+    def create(data):
+        validated = True
+        return validated
+
+    @classmethod
+    def from_env(cls):
+        return cls()
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let symbols = analyzer.extract_symbols(source).unwrap();
+
+        // "create" decorated method: decorator @staticmethod is on line 5 (row 4),
+        // method body ends on line 8 (row 7)
+        let create = symbols.iter().find(|s| s.name == "create").unwrap();
+        assert_eq!(create.kind, SymbolKind::Method);
+        assert_eq!(
+            create.range.start, 5,
+            "decorated method start should be line 5 (decorator line)"
+        );
+        assert_eq!(
+            create.range.end, 8,
+            "decorated method end should be line 8 (last line of body)"
+        );
+
+        // "from_env" decorated method: decorator @classmethod is on line 10 (row 9),
+        // method body ends on line 12 (row 11)
+        let from_env = symbols.iter().find(|s| s.name == "from_env").unwrap();
+        assert_eq!(from_env.kind, SymbolKind::Method);
+        assert_eq!(
+            from_env.range.start, 10,
+            "decorated method start should be line 10 (decorator line)"
+        );
+        assert_eq!(
+            from_env.range.end, 12,
+            "decorated method end should be line 12 (last line of body)"
+        );
+    }
+
+    #[test]
+    fn import_statement_line_numbers_on_later_lines() {
+        // Kills mutants on line 354:
+        //   354: replace + with - in extract_import_statement (aliased_import line)
+        //   354: replace + with * in extract_import_statement (aliased_import line)
+        // Place `import X as Y` on a line with row > 1 so row + 1 != row * 1
+        // and row + 1 != row - 1.
+        let source = br#"x = 1
+y = 2
+z = 3
+import os.path as osp
+import json as j
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        // `import os.path as osp` is on line 4 (row 3)
+        assert_eq!(imports[0].source, "os.path");
+        assert_eq!(
+            imports[0].line, 4,
+            "aliased import should be on line 4, got {}",
+            imports[0].line
+        );
+        // `import json as j` is on line 5 (row 4)
+        assert_eq!(imports[1].source, "json");
+        assert_eq!(
+            imports[1].line, 5,
+            "aliased import should be on line 5, got {}",
+            imports[1].line
+        );
+    }
+
+    #[test]
+    fn wildcard_import_line_number_on_later_line() {
+        // Kills mutants on line 385:
+        //   385: replace + with * in extract_import_from_statement (wildcard line)
+        // Place `from X import *` on a line with row > 1 so row + 1 != row * 1.
+        let source = br#"x = 1
+y = 2
+z = 3
+from os import *
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "os");
+        assert_eq!(imports[0].symbols[0].name, "*");
+        assert_eq!(
+            imports[0].line, 4,
+            "wildcard import should be on line 4, got {}",
+            imports[0].line
+        );
+    }
+
+    #[test]
+    fn from_import_line_number_on_later_line() {
+        // Kills mutants on line 419:
+        //   419: replace + with * in extract_import_from_statement (named import line)
+        // Place `from X import Y` on a line with row > 1 so row + 1 != row * 1.
+        let source = br#"x = 1
+y = 2
+z = 3
+from os.path import join, exists
+from typing import List
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        // `from os.path import join, exists` is on line 4 (row 3)
+        assert_eq!(imports[0].source, "os.path");
+        assert_eq!(
+            imports[0].line, 4,
+            "from import should be on line 4, got {}",
+            imports[0].line
+        );
+        // `from typing import List` is on line 5 (row 4)
+        assert_eq!(imports[1].source, "typing");
+        assert_eq!(
+            imports[1].line, 5,
+            "from import should be on line 5, got {}",
+            imports[1].line
+        );
+    }
+
+    #[test]
+    fn dotted_import_line_number_on_later_line() {
+        // Additional coverage for line 334 in extract_import_statement:
+        // `import X` (dotted_name) on a later line ensures row + 1 != row * 1.
+        let source = br#"x = 1
+y = 2
+import collections
+import pathlib
+"#;
+        let analyzer = PythonAnalyzer::new();
+        let imports = analyzer.extract_imports(source).unwrap();
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].source, "collections");
+        assert_eq!(
+            imports[0].line, 3,
+            "dotted import should be on line 3, got {}",
+            imports[0].line
+        );
+        assert_eq!(imports[1].source, "pathlib");
+        assert_eq!(
+            imports[1].line, 4,
+            "dotted import should be on line 4, got {}",
+            imports[1].line
+        );
+    }
 }
