@@ -52,18 +52,34 @@ impl DaemonClient {
     ///
     /// Opens a new Unix socket connection, sends a single NDJSON line,
     /// reads a single NDJSON response line, and returns the parsed response.
+    /// The entire request/response cycle is bounded by a 30-second timeout.
     pub async fn request(
         &self,
         method: &str,
         params: serde_json::Value,
     ) -> Result<DaemonResponse, ClientError> {
-        if !self.socket_path.exists() {
-            return Err(ClientError::DaemonNotRunning(self.socket_path.clone()));
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.request_inner(method, params),
+        )
+        .await
+        .map_err(|_| ClientError::Protocol("request timed out after 30s".to_string()))?
+    }
 
-        let stream = UnixStream::connect(&self.socket_path)
-            .await
-            .map_err(ClientError::Connection)?;
+    async fn request_inner(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<DaemonResponse, ClientError> {
+        let stream = UnixStream::connect(&self.socket_path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound
+                || e.kind() == std::io::ErrorKind::ConnectionRefused
+            {
+                ClientError::DaemonNotRunning(self.socket_path.clone())
+            } else {
+                ClientError::Connection(e)
+            }
+        })?;
 
         let codec = LinesCodec::new_with_max_length(1_048_576);
         let mut framed = Framed::new(stream, codec);
