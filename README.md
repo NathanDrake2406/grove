@@ -28,6 +28,14 @@ The worst overlap determines the pair's **orthogonality score**: Green (safe) < 
 brew install NathanDrake2406/tap/grove
 ```
 
+Or via npm:
+
+```sh
+npm install -g @nathan2406/grove
+# or run directly
+npx @nathan2406/grove check
+```
+
 Or from source:
 
 ```sh

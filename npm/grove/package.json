@@ -1,0 +1,23 @@
+{
+  "name": "@nathan2406/grove",
+  "version": "0.2.1",
+  "description": "Cross-worktree conflict intelligence for git",
+  "license": "MIT OR Apache-2.0",
+  "repository": "https://github.com/NathanDrake2406/grove",
+  "bin": {
+    "grove": "bin/grove.js"
+  },
+  "optionalDependencies": {
+    "@nathan2406/grove-linux-x64": "0.2.1",
+    "@nathan2406/grove-linux-arm64": "0.2.1",
+    "@nathan2406/grove-darwin-x64": "0.2.1",
+    "@nathan2406/grove-darwin-arm64": "0.2.1"
+  },
+  "keywords": [
+    "git",
+    "worktree",
+    "conflict",
+    "merge",
+    "cli"
+  ]
+}

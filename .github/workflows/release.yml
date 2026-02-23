@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -112,7 +113,7 @@ jobs:
             dist/${{ steps.archive.outputs.filename }}
             dist/${{ steps.archive.outputs.filename }}.sha256
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 3
 
   release:
     name: Publish GitHub Release
@@ -147,3 +148,114 @@ jobs:
           files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm-binaries:
+    name: Publish npm ${{ matrix.pkg_name }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            pkg_name: grove-linux-x64
+            node_os: linux
+            node_arch: x64
+
+          - target: aarch64-unknown-linux-gnu
+            pkg_name: grove-linux-arm64
+            node_os: linux
+            node_arch: arm64
+
+          - target: x86_64-apple-darwin
+            pkg_name: grove-darwin-x64
+            node_os: darwin
+            node_arch: x64
+
+          - target: aarch64-apple-darwin
+            pkg_name: grove-darwin-arm64
+            node_os: darwin
+            node_arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Derive version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.BINARY_NAME }}-${{ github.ref_name }}-${{ matrix.target }}
+          path: artifact/
+
+      - name: Build platform package
+        shell: bash
+        env:
+          pkg_name: ${{ matrix.pkg_name }}
+          version: ${{ steps.version.outputs.version }}
+          target: ${{ matrix.target }}
+          node_os: ${{ matrix.node_os }}
+          node_arch: ${{ matrix.node_arch }}
+        run: |
+          mkdir -p pkg/bin
+          envsubst < npm/package.json.tmpl > pkg/package.json
+          STEM="${BINARY_NAME}-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          tar -xzf "artifact/${STEM}.tar.gz" -C pkg/bin --strip-components=1 "${STEM}/grove"
+          chmod +x pkg/bin/grove
+          test -f pkg/bin/grove || { echo "::error::Binary not found after extraction"; exit 1; }
+          cat pkg/package.json
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        working-directory: pkg
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-npm-base:
+    name: Publish npm @nathan2406/grove
+    needs: publish-npm-binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Patch version from tag
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd npm/grove
+          node -e "
+            const ver = process.env.TAG.replace(/^v/, '');
+            const pkg = require('./package.json');
+            pkg.version = ver;
+            for (const dep of Object.keys(pkg.optionalDependencies || {})) {
+              pkg.optionalDependencies[dep] = ver;
+            }
+            require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "Publishing version:"
+          cat package.json
+
+      - name: Publish to npm
+        run: npm publish --access public --provenance
+        working-directory: npm/grove
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
