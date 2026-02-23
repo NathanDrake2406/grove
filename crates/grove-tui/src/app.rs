@@ -301,3 +301,437 @@ impl App {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyCode;
+    use serde_json::json;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    fn make_workspace(id: &str, name: &str, branch: &str, path: &str) -> Workspace {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": name,
+            "branch": branch,
+            "path": path,
+            "base_ref": "refs/heads/main",
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_activity": "2026-01-01T00:00:00Z",
+            "metadata": {}
+        }))
+        .unwrap()
+    }
+
+    fn make_analysis(
+        a: &str,
+        b: &str,
+        score: &str,
+        last_computed: &str,
+        overlaps: Vec<serde_json::Value>,
+    ) -> WorkspacePairAnalysis {
+        serde_json::from_value(json!({
+            "workspace_a": a,
+            "workspace_b": b,
+            "score": score,
+            "overlaps": overlaps,
+            "merge_order_hint": "Either",
+            "last_computed": last_computed
+        }))
+        .unwrap()
+    }
+
+    fn fake_client() -> DaemonClient {
+        DaemonClient::new("/tmp/nonexistent-grove-tui-tests.sock")
+    }
+
+    fn spawn_mock_daemon(
+        socket_path: PathBuf,
+        responses: Vec<serde_json::Value>,
+    ) -> tokio::task::JoinHandle<()> {
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        tokio::spawn(async move {
+            for response in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                let bytes = reader.read_line(&mut line).await.unwrap();
+                assert!(bytes > 0, "expected request line from client");
+
+                let mut stream = reader.into_inner();
+                stream
+                    .write_all(response.to_string().as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(b"\n").await.unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn view_state_partial_eq_handles_error_payloads() {
+        assert_eq!(ViewState::Loading, ViewState::Loading);
+        assert_eq!(ViewState::NoWorktrees, ViewState::NoWorktrees);
+        assert_eq!(ViewState::Dashboard, ViewState::Dashboard);
+        assert_eq!(
+            ViewState::Error("boom".to_string()),
+            ViewState::Error("boom".to_string())
+        );
+        assert_ne!(
+            ViewState::Error("boom".to_string()),
+            ViewState::Error("other".to_string())
+        );
+    }
+
+    #[test]
+    fn summary_stats_and_pair_filtering_ignore_green_pairs() {
+        let ws_a = make_workspace(
+            "00000000-0000-0000-0000-000000000001",
+            "conflict-a",
+            "feature/a",
+            "/tmp/a",
+        );
+        let ws_b = make_workspace(
+            "00000000-0000-0000-0000-000000000002",
+            "conflict-b",
+            "feature/b",
+            "/tmp/b",
+        );
+        let ws_c = make_workspace(
+            "00000000-0000-0000-0000-000000000003",
+            "clean-c",
+            "feature/c",
+            "/tmp/c",
+        );
+
+        let mut app = App::new(fake_client());
+        app.workspaces = vec![ws_a.clone(), ws_b, ws_c];
+        app.base_commit = "12345678".to_string();
+        app.analyses = vec![
+            make_analysis(
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+                "Yellow",
+                "2026-01-01T00:00:00Z",
+                vec![json!({
+                    "File": {
+                        "path": "src/lib.rs",
+                        "a_change": "Modified",
+                        "b_change": "Modified"
+                    }
+                })],
+            ),
+            make_analysis(
+                "00000000-0000-0000-0000-000000000002",
+                "00000000-0000-0000-0000-000000000003",
+                "Green",
+                "2026-01-01T00:00:00Z",
+                vec![],
+            ),
+        ];
+
+        let (worktree_count, base, conflict_count, clean_count) = app.summary_stats();
+        assert_eq!(worktree_count, 3);
+        assert_eq!(base, "12345678");
+        assert_eq!(conflict_count, 1);
+        assert_eq!(clean_count, 1);
+
+        let pairs_for_a = app.get_pairs_for_worktree(&ws_a.id);
+        assert_eq!(pairs_for_a.len(), 1);
+        assert_eq!(pairs_for_a[0].score, OrthogonalityScore::Yellow);
+    }
+
+    #[test]
+    fn last_updated_label_has_expected_buckets() {
+        let mut app = App::new(fake_client());
+
+        app.last_data_change = Instant::now() - Duration::from_secs(2);
+        assert_eq!(app.last_updated_label(), "just now");
+
+        app.last_data_change = Instant::now() - Duration::from_secs(60);
+        assert_eq!(app.last_updated_label(), "< 2m ago");
+
+        app.last_data_change = Instant::now() - Duration::from_secs(180);
+        assert_eq!(app.last_updated_label(), "3m ago");
+    }
+
+    #[test]
+    fn handle_input_non_dashboard_only_exits_on_quit_keys() {
+        let mut app = App::new(fake_client());
+        app.view_state = ViewState::Loading;
+
+        assert!(app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Char('q'))));
+        assert!(app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Esc)));
+        assert!(!app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Char('x'))));
+    }
+
+    #[test]
+    fn dashboard_navigation_updates_focus_and_selection() {
+        let ws_a = make_workspace(
+            "00000000-0000-0000-0000-000000000001",
+            "alpha",
+            "feature/a",
+            "/tmp/a",
+        );
+        let ws_b = make_workspace(
+            "00000000-0000-0000-0000-000000000002",
+            "beta",
+            "feature/b",
+            "/tmp/b",
+        );
+        let ws_c = make_workspace(
+            "00000000-0000-0000-0000-000000000003",
+            "gamma",
+            "feature/c",
+            "/tmp/c",
+        );
+
+        let mut app = App::new(fake_client());
+        app.view_state = ViewState::Dashboard;
+        app.workspaces = vec![ws_a, ws_b, ws_c];
+        app.analyses = vec![
+            make_analysis(
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002",
+                "Yellow",
+                "2026-01-01T00:00:00Z",
+                vec![json!({
+                    "File": {
+                        "path": "src/a.rs",
+                        "a_change": "Modified",
+                        "b_change": "Modified"
+                    }
+                })],
+            ),
+            make_analysis(
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000003",
+                "Red",
+                "2026-01-01T00:01:00Z",
+                vec![json!({
+                    "Symbol": {
+                        "path": "src/a.rs",
+                        "symbol_name": "handle",
+                        "a_modification": "A",
+                        "b_modification": "B"
+                    }
+                })],
+            ),
+        ];
+
+        assert_eq!(app.focused_panel, FocusedPanel::Worktrees);
+        assert_eq!(app.selected_worktree_index, 0);
+        assert_eq!(app.selected_pair_index, 0);
+
+        app.is_dirty = false;
+        assert!(!app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Right)));
+        assert_eq!(app.focused_panel, FocusedPanel::Pairs);
+        assert!(app.is_dirty);
+
+        app.is_dirty = false;
+        assert!(!app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Down)));
+        assert_eq!(app.selected_pair_index, 1);
+        assert!(app.is_dirty);
+
+        app.is_dirty = false;
+        assert!(!app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Up)));
+        assert_eq!(app.selected_pair_index, 0);
+        assert!(app.is_dirty);
+
+        assert!(!app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Left)));
+        assert_eq!(app.focused_panel, FocusedPanel::Worktrees);
+
+        assert!(!app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Down)));
+        assert_eq!(app.selected_worktree_index, 1);
+
+        assert!(app.handle_input(crossterm::event::KeyEvent::from(KeyCode::Char('q'))));
+    }
+
+    #[tokio::test]
+    async fn refresh_data_populates_dashboard_and_sorts_conflicted_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        let responses = vec![
+            json!({"ok": true, "data": {"base_commit": "1234567890abcdef"}}),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000003",
+                        "name": "clean-c",
+                        "branch": "feature/c",
+                        "path": "/tmp/c",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "name": "conflict-a",
+                        "branch": "feature/a",
+                        "path": "/tmp/a",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000002",
+                        "name": "conflict-b",
+                        "branch": "feature/b",
+                        "path": "/tmp/b",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    }
+                ]
+            }),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "workspace_a": "00000000-0000-0000-0000-000000000001",
+                        "workspace_b": "00000000-0000-0000-0000-000000000002",
+                        "score": "Yellow",
+                        "overlaps": [{
+                            "File": {
+                                "path": "src/lib.rs",
+                                "a_change": "Modified",
+                                "b_change": "Modified"
+                            }
+                        }],
+                        "merge_order_hint": "Either",
+                        "last_computed": "2026-01-01T00:00:00Z"
+                    }
+                ]
+            }),
+        ];
+
+        let server = spawn_mock_daemon(socket_path.clone(), responses);
+
+        let client = DaemonClient::new(&socket_path);
+        let mut app = App::new(client);
+
+        app.refresh_data().await.unwrap();
+
+        assert_eq!(app.base_commit, "12345678");
+        assert_eq!(app.view_state, ViewState::Dashboard);
+        assert_eq!(app.selected_worktree_index, 0);
+        assert_eq!(app.selected_pair_index, 0);
+        assert_eq!(app.workspaces.len(), 3);
+        assert_eq!(app.workspaces[2].name, "clean-c");
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_sets_error_when_analysis_request_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        let responses = vec![
+            json!({"ok": true, "data": {"base_commit": "12345678"}}),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "name": "alpha",
+                        "branch": "feature/a",
+                        "path": "/tmp/a",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000002",
+                        "name": "beta",
+                        "branch": "feature/b",
+                        "path": "/tmp/b",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    }
+                ]
+            }),
+            json!({"ok": false, "error": null}),
+        ];
+
+        let server = spawn_mock_daemon(socket_path.clone(), responses);
+
+        let client = DaemonClient::new(&socket_path);
+        let mut app = App::new(client);
+
+        app.refresh_data().await.unwrap();
+
+        assert_eq!(
+            app.view_state,
+            ViewState::Error("Failed to get analyses".to_string())
+        );
+        assert!(app.is_dirty);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_sets_error_when_workspace_list_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        let responses = vec![
+            json!({"ok": true, "data": {"base_commit": "12345678"}}),
+            json!({"ok": false, "error": "list failed"}),
+        ];
+
+        let server = spawn_mock_daemon(socket_path.clone(), responses);
+
+        let client = DaemonClient::new(&socket_path);
+        let mut app = App::new(client);
+
+        app.refresh_data().await.unwrap();
+
+        assert_eq!(app.view_state, ViewState::Error("list failed".to_string()));
+        assert!(app.is_dirty);
+
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn analyses_are_equal_checks_last_computed_only() {
+        let app = App::new(fake_client());
+        let old = vec![make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Yellow",
+            "2026-01-01T00:00:00Z",
+            vec![],
+        )];
+        let same = vec![make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Red",
+            "2026-01-01T00:00:00Z",
+            vec![],
+        )];
+        let changed = vec![make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Yellow",
+            "2026-01-01T00:00:01Z",
+            vec![],
+        )];
+
+        assert!(app.analyses_are_equal(&old, &same));
+        assert!(!app.analyses_are_equal(&old, &changed));
+    }
+}

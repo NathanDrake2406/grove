@@ -215,6 +215,41 @@ fn find_grove_dir(start: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
 mod tests {
     use super::*;
     use clap::Parser;
+    use serde_json::Value;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    fn spawn_shutdown_server(
+        socket_path: PathBuf,
+        expected_token: Option<String>,
+        response: Value,
+    ) -> tokio::task::JoinHandle<()> {
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("socket should bind");
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept should succeed");
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let _ = reader
+                .read_line(&mut line)
+                .await
+                .expect("request line should read");
+            let request: Value = serde_json::from_str(&line).expect("request should be json");
+
+            assert_eq!(request["method"], "shutdown");
+            match expected_token {
+                Some(token) => assert_eq!(request["params"]["token"], token),
+                None => assert_eq!(request["params"], serde_json::json!({})),
+            }
+
+            let mut stream = reader.into_inner();
+            stream
+                .write_all(response.to_string().as_bytes())
+                .await
+                .expect("response should write");
+            stream.write_all(b"\n").await.expect("newline should write");
+        })
+    }
 
     #[test]
     fn parse_no_args_defaults_to_status() {
@@ -354,5 +389,138 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), tmp.path().join(".grove"));
+    }
+
+    #[test]
+    fn read_shutdown_token_file_returns_none_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = read_shutdown_token_file(tmp.path()).unwrap();
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn read_shutdown_token_file_trims_and_returns_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("daemon.shutdown.token"),
+            "  secret-token \n",
+        )
+        .unwrap();
+
+        let token = read_shutdown_token_file(tmp.path()).unwrap();
+        assert_eq!(token.as_deref(), Some("secret-token"));
+    }
+
+    #[test]
+    fn read_shutdown_token_file_treats_blank_as_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("daemon.shutdown.token"), "   \n").unwrap();
+
+        let token = read_shutdown_token_file(tmp.path()).unwrap();
+        assert_eq!(token, None);
+    }
+
+    #[test]
+    fn read_shutdown_token_file_errors_on_non_readable_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("daemon.shutdown.token")).unwrap();
+
+        let err = read_shutdown_token_file(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("failed to read shutdown token"));
+    }
+
+    #[tokio::test]
+    async fn handle_daemon_stop_sends_token_and_accepts_json_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grove_dir = tmp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+        std::fs::write(grove_dir.join("daemon.shutdown.token"), "tok123").unwrap();
+
+        let socket_path = grove_dir.join("daemon.sock");
+        let server = spawn_shutdown_server(
+            socket_path.clone(),
+            Some("tok123".to_string()),
+            serde_json::json!({
+                "ok": true,
+                "data": { "status": "shutdown_requested" }
+            }),
+        );
+
+        let client = DaemonClient::new(&socket_path);
+        handle_daemon_stop(&client, &grove_dir, true)
+            .await
+            .expect("daemon stop should succeed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_daemon_stop_uses_empty_params_without_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grove_dir = tmp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+
+        let socket_path = grove_dir.join("daemon.sock");
+        let server = spawn_shutdown_server(
+            socket_path.clone(),
+            None,
+            serde_json::json!({
+                "ok": true,
+                "data": null
+            }),
+        );
+
+        let client = DaemonClient::new(&socket_path);
+        handle_daemon_stop(&client, &grove_dir, false)
+            .await
+            .expect("daemon stop should succeed");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_daemon_stop_returns_error_when_daemon_rejects_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grove_dir = tmp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+
+        let socket_path = grove_dir.join("daemon.sock");
+        let server = spawn_shutdown_server(
+            socket_path.clone(),
+            None,
+            serde_json::json!({
+                "ok": false,
+                "error": "denied"
+            }),
+        );
+
+        let client = DaemonClient::new(&socket_path);
+        let err = handle_daemon_stop(&client, &grove_dir, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("denied"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_daemon_stop_uses_unknown_error_fallback_when_missing_error_field() {
+        let tmp = tempfile::tempdir().unwrap();
+        let grove_dir = tmp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+
+        let socket_path = grove_dir.join("daemon.sock");
+        let server = spawn_shutdown_server(
+            socket_path.clone(),
+            None,
+            serde_json::json!({
+                "ok": false,
+                "error": null
+            }),
+        );
+
+        let client = DaemonClient::new(&socket_path);
+        let err = handle_daemon_stop(&client, &grove_dir, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown error"));
+        server.await.unwrap();
     }
 }

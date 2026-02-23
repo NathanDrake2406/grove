@@ -698,7 +698,7 @@ pub(crate) fn canonical_pair(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use grove_lib::{MergeOrder, OrthogonalityScore, WorkspaceMetadata};
+    use grove_lib::{MergeOrder, OrthogonalityScore, SymbolKind, WorkspaceMetadata};
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -793,6 +793,220 @@ mod tests {
             "{case_name}: expected no symbol/schema overlaps, got {:?}",
             analysis.overlaps
         );
+    }
+
+    #[test]
+    fn parse_left_right_counts_handles_valid_and_invalid_inputs() {
+        assert_eq!(parse_left_right_counts("3 7"), Some((3, 7)));
+        assert_eq!(parse_left_right_counts("0 0"), Some((0, 0)));
+        assert_eq!(parse_left_right_counts("3"), None);
+        assert_eq!(parse_left_right_counts("a b"), None);
+        assert_eq!(parse_left_right_counts("3 b"), None);
+    }
+
+    #[test]
+    fn normalize_relative_path_collapses_parent_and_cur_components() {
+        let path = PathBuf::from("src/./api/../lib/../main.rs");
+        assert_eq!(normalize_relative_path(path), PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_import_target_handles_relative_files_extensions_and_index_paths() {
+        let importer = Path::new("src/api/handler.ts");
+        let mut files = HashSet::new();
+        files.insert(PathBuf::from("src/shared/util.ts"));
+        files.insert(PathBuf::from("src/shared/index.ts"));
+
+        let ext_match = resolve_import_target(importer, "../shared/util", &files, &["ts"]);
+        assert_eq!(ext_match, Some(PathBuf::from("src/shared/util.ts")));
+
+        let index_match = resolve_import_target(importer, "../shared", &files, &["ts"]);
+        assert_eq!(index_match, Some(PathBuf::from("src/shared/index.ts")));
+
+        let non_relative = resolve_import_target(importer, "react", &files, &["ts"]);
+        assert_eq!(non_relative, None);
+    }
+
+    #[test]
+    fn symbol_in_hunks_detects_overlap_and_respects_zero_length_hunks() {
+        let symbol = Symbol {
+            name: "handler".to_string(),
+            kind: SymbolKind::Function,
+            range: LineRange { start: 10, end: 14 },
+            signature: None,
+        };
+        let overlaps = symbol_in_hunks(
+            &symbol,
+            &[Hunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 12,
+                new_lines: 2,
+            }],
+        );
+        assert!(overlaps);
+
+        let no_overlap = symbol_in_hunks(
+            &symbol,
+            &[Hunk {
+                old_start: 0,
+                old_lines: 0,
+                new_start: 25,
+                new_lines: 0,
+            }],
+        );
+        assert!(!no_overlap);
+    }
+
+    #[test]
+    fn compute_export_deltas_reports_added_removed_and_signature_changes() {
+        let old_exports = vec![
+            ExportedSymbol {
+                name: "keep".to_string(),
+                kind: SymbolKind::Function,
+                signature: Some("fn keep()".to_string()),
+            },
+            ExportedSymbol {
+                name: "remove_me".to_string(),
+                kind: SymbolKind::Function,
+                signature: Some("fn remove_me()".to_string()),
+            },
+        ];
+        let new_exports = vec![
+            ExportedSymbol {
+                name: "keep".to_string(),
+                kind: SymbolKind::Function,
+                signature: Some("fn keep(v: i32)".to_string()),
+            },
+            ExportedSymbol {
+                name: "add_me".to_string(),
+                kind: SymbolKind::Function,
+                signature: Some("fn add_me()".to_string()),
+            },
+        ];
+
+        let deltas = compute_export_deltas(&old_exports, &new_exports);
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, ExportDelta::Added(sym) if sym.name == "add_me"))
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, ExportDelta::Removed(sym) if sym.name == "remove_me"))
+        );
+        assert!(
+            deltas
+                .iter()
+                .any(|d| matches!(d, ExportDelta::SignatureChanged { symbol_name, .. } if symbol_name == "keep"))
+        );
+    }
+
+    #[test]
+    fn signature_text_falls_back_when_signature_is_missing() {
+        let exported = ExportedSymbol {
+            name: "Count".to_string(),
+            kind: SymbolKind::Struct,
+            signature: None,
+        };
+        let text = signature_text(&exported);
+        assert!(text.contains("Struct"));
+        assert!(text.contains("Count"));
+    }
+
+    #[test]
+    fn extract_modified_symbols_handles_added_deleted_and_modified_cases() {
+        let registry = LanguageRegistry::with_defaults();
+        let content = br#"fn alpha() {}
+fn beta() {}
+"#;
+
+        let added = extract_modified_symbols(
+            &registry,
+            Path::new("src/lib.rs"),
+            Some(content),
+            &[],
+            ChangeType::Added,
+            1024 * 1024,
+        );
+        assert!(!added.is_empty());
+
+        let deleted = extract_modified_symbols(
+            &registry,
+            Path::new("src/lib.rs"),
+            Some(content),
+            &[],
+            ChangeType::Deleted,
+            1024 * 1024,
+        );
+        assert!(deleted.is_empty());
+
+        let modified_without_hunks = extract_modified_symbols(
+            &registry,
+            Path::new("src/lib.rs"),
+            Some(content),
+            &[],
+            ChangeType::Modified,
+            1024 * 1024,
+        );
+        assert!(modified_without_hunks.is_empty());
+
+        let modified_with_hunk = extract_modified_symbols(
+            &registry,
+            Path::new("src/lib.rs"),
+            Some(content),
+            &[Hunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+            }],
+            ChangeType::Modified,
+            1024 * 1024,
+        );
+        assert!(!modified_with_hunk.is_empty());
+    }
+
+    #[test]
+    fn extract_exports_returns_empty_for_unknown_or_oversized_files() {
+        let registry = LanguageRegistry::with_defaults();
+        let unknown = extract_exports(
+            &registry,
+            Path::new("assets/data.bin"),
+            Some(b"binary"),
+            1024,
+        );
+        assert!(unknown.is_empty());
+
+        let oversized = extract_exports(
+            &registry,
+            Path::new("src/lib.rs"),
+            Some(b"fn tiny() {}\n"),
+            1,
+        );
+        assert!(oversized.is_empty());
+    }
+
+    #[test]
+    fn git_output_bytes_returns_git_failed_for_invalid_git_command() {
+        let repo = tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        run_git(repo.path(), &["config", "user.email", "grove@example.com"]);
+        run_git(repo.path(), &["config", "user.name", "Grove Tests"]);
+
+        let err =
+            git_output_bytes(repo.path(), ["not-a-git-subcommand"], "invalid git").unwrap_err();
+        assert!(matches!(err, WorkerError::GitFailed { .. }));
+    }
+
+    #[test]
+    fn canonical_pair_orders_workspace_ids() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let pair = canonical_pair(a, b);
+        assert!(pair.0 <= pair.1);
+        assert_eq!(pair, canonical_pair(b, a));
     }
 
     #[test]

@@ -552,6 +552,58 @@ mod tests {
     use crate::lifecycle::DaemonPaths;
     use crate::socket::SocketServer;
     use crate::state::{GroveConfig, QueryRequest, StateMessage, spawn_state_actor};
+    use crate::watcher::WatchEvent;
+    use grove_lib::Workspace;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    use uuid::Uuid;
+
+    fn workspace(id: Uuid, path: PathBuf) -> Workspace {
+        Workspace {
+            id,
+            name: "ws".to_string(),
+            branch: "refs/heads/main".to_string(),
+            path,
+            base_ref: "refs/heads/main".to_string(),
+            created_at: chrono::Utc::now(),
+            last_activity: chrono::Utc::now(),
+            metadata: grove_lib::WorkspaceMetadata::default(),
+        }
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    async fn wait_for_path(path: &Path, timeout_ms: u64) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            if path.exists() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     #[tokio::test]
     async fn daemon_components_wire_up() {
@@ -684,5 +736,423 @@ mod tests {
         let result = list_workspaces(&state_tx, Duration::from_millis(50)).await;
         assert!(result.is_empty());
         close_reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_returns_empty_for_unexpected_query_response() {
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(1);
+        let reply_task = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                let _ = reply.send(QueryResponse::Status {
+                    workspace_count: 0,
+                    analysis_count: 0,
+                    base_commit: "deadbeef".to_string(),
+                });
+            }
+        });
+
+        let result = list_workspaces(&state_tx, Duration::from_millis(50)).await;
+        assert!(result.is_empty());
+        reply_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_returns_empty_when_state_channel_is_closed() {
+        let (state_tx, state_rx) = tokio::sync::mpsc::channel::<StateMessage>(1);
+        drop(state_rx);
+
+        let result = list_workspaces(&state_tx, Duration::from_millis(20)).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn forward_watch_events_sends_file_changed_for_files_and_full_reindex() {
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(8);
+        let workspace_id = Uuid::new_v4();
+        let fallback = PathBuf::from("/tmp/worktree/root");
+
+        let mut watched = HashMap::new();
+        watched.insert(workspace_id, fallback.clone());
+
+        let events = vec![
+            WatchEvent::FilesChanged {
+                workspace_id,
+                paths: vec![PathBuf::from("/tmp/worktree/src/lib.rs")],
+            },
+            WatchEvent::FullReindexNeeded { workspace_id },
+        ];
+
+        forward_watch_events(
+            &state_tx,
+            &events,
+            &watched,
+            "main",
+            &None,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        match state_rx.recv().await.unwrap() {
+            StateMessage::FileChanged {
+                workspace_id: got_id,
+                path,
+            } => {
+                assert_eq!(got_id, workspace_id);
+                assert_eq!(path, PathBuf::from("/tmp/worktree/src/lib.rs"));
+            }
+            _ => panic!("unexpected first message"),
+        }
+
+        match state_rx.recv().await.unwrap() {
+            StateMessage::FileChanged {
+                workspace_id: got_id,
+                path,
+            } => {
+                assert_eq!(got_id, workspace_id);
+                assert_eq!(path, fallback);
+            }
+            _ => panic!("unexpected second message"),
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_watch_events_base_ref_changed_without_workspaces_sends_nothing() {
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(8);
+        let state_task = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                let _ = reply.send(QueryResponse::Workspaces(Vec::new()));
+            }
+            tokio::time::timeout(Duration::from_millis(30), state_rx.recv())
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        });
+
+        let events = vec![WatchEvent::BaseRefChanged {
+            ref_path: PathBuf::from(".git/refs/remotes/origin/main"),
+        }];
+        forward_watch_events(
+            &state_tx,
+            &events,
+            &HashMap::new(),
+            "main",
+            &None,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        // After query reply, no BaseRefChanged message should be emitted.
+        let has_extra = state_task.await.unwrap();
+        assert!(!has_extra);
+    }
+
+    #[tokio::test]
+    async fn forward_watch_events_handles_worktrees_changed_without_git_dir() {
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(2);
+        let events = vec![WatchEvent::WorktreesChanged];
+
+        forward_watch_events(
+            &state_tx,
+            &events,
+            &HashMap::new(),
+            "main",
+            &None,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        let no_message = tokio::time::timeout(Duration::from_millis(20), state_rx.recv()).await;
+        assert!(no_message.is_err(), "unexpected state message forwarded");
+    }
+
+    #[tokio::test]
+    async fn forward_watch_events_worktrees_changed_triggers_sync_worktrees() {
+        let repo = tempfile::tempdir().unwrap();
+        let run_git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@test.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@test.com")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        run_git(&["init", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "x\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "init"]);
+
+        let git_dir = repo.path().join(".git");
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(4);
+
+        let state_task = tokio::spawn(async move {
+            if let Some(StateMessage::SyncWorktrees { desired, reply }) = state_rx.recv().await {
+                let _ = reply.send(Ok(crate::state::SyncResult {
+                    workspaces: desired.clone(),
+                    added: desired.iter().map(|w| w.id).collect(),
+                    removed: Vec::new(),
+                    unchanged: Vec::new(),
+                }));
+                return desired.len();
+            }
+            0usize
+        });
+
+        forward_watch_events(
+            &state_tx,
+            &[WatchEvent::WorktreesChanged],
+            &HashMap::new(),
+            "main",
+            &Some(git_dir),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        let synced_count = state_task.await.unwrap();
+        assert!(synced_count >= 1);
+    }
+
+    #[tokio::test]
+    async fn forward_watch_events_base_ref_changed_sends_resolved_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "x\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init"]);
+
+        let ws_id = Uuid::new_v4();
+        let ws = workspace(ws_id, repo.path().to_path_buf());
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(4);
+        let state_task = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                let _ = reply.send(QueryResponse::Workspaces(vec![ws]));
+            }
+
+            if let Some(StateMessage::BaseRefChanged { new_commit }) = state_rx.recv().await {
+                return Some(new_commit);
+            }
+            None
+        });
+
+        forward_watch_events(
+            &state_tx,
+            &[WatchEvent::BaseRefChanged {
+                ref_path: PathBuf::from(".git/refs/remotes/origin/main"),
+            }],
+            &HashMap::new(),
+            "HEAD",
+            &None,
+            Duration::from_millis(100),
+        )
+        .await;
+
+        let commit = state_task
+            .await
+            .unwrap()
+            .expect("base-ref update should be forwarded");
+        assert_eq!(commit.len(), 40);
+    }
+
+    #[tokio::test]
+    async fn forward_watch_events_worktrees_changed_logs_sync_errors_without_panicking() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "x\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init"]);
+
+        let git_dir = repo.path().join(".git");
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(4);
+        let state_task = tokio::spawn(async move {
+            if let Some(StateMessage::SyncWorktrees { reply, .. }) = state_rx.recv().await {
+                let _ = reply.send(Err("sync failed".to_string()));
+            }
+        });
+
+        forward_watch_events(
+            &state_tx,
+            &[WatchEvent::WorktreesChanged],
+            &HashMap::new(),
+            "main",
+            &Some(git_dir),
+            Duration::from_millis(100),
+        )
+        .await;
+
+        state_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_watched_workspaces_adds_then_removes_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let ws_path = root.path().join("ws-a");
+        std::fs::create_dir_all(&ws_path).unwrap();
+        let ws_id = Uuid::new_v4();
+        let ws = workspace(ws_id, ws_path.clone());
+
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(4);
+        let responder = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                let _ = reply.send(QueryResponse::Workspaces(vec![ws]));
+            }
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                let _ = reply.send(QueryResponse::Workspaces(Vec::new()));
+            }
+        });
+
+        let mut watcher =
+            notify::recommended_watcher(|_: notify::Result<notify::Event>| {}).unwrap();
+        let mut debouncer = Debouncer::new(WatcherConfig::default());
+        let mut watched_workspaces = HashMap::new();
+
+        refresh_watched_workspaces(
+            &state_tx,
+            Duration::from_millis(50),
+            &mut watcher,
+            &mut debouncer,
+            &mut watched_workspaces,
+        )
+        .await;
+        assert_eq!(watched_workspaces.len(), 1);
+        assert_eq!(watched_workspaces.get(&ws_id), Some(&ws_path));
+
+        refresh_watched_workspaces(
+            &state_tx,
+            Duration::from_millis(50),
+            &mut watcher,
+            &mut debouncer,
+            &mut watched_workspaces,
+        )
+        .await;
+        assert!(watched_workspaces.is_empty());
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn shutdown_token_file_roundtrip_and_remove_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("daemon.shutdown.token");
+
+        let token = write_shutdown_token_file(&token_path).unwrap();
+        assert!(!token.is_empty());
+        assert!(token_path.exists());
+
+        remove_shutdown_token_file(&token_path).unwrap();
+        assert!(!token_path.exists());
+
+        // Removing again should be a no-op
+        remove_shutdown_token_file(&token_path).unwrap();
+    }
+
+    #[test]
+    fn remove_shutdown_token_file_errors_on_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remove_shutdown_token_file(dir.path()).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_base_branch_commit_resolves_head_for_workspace_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init", "-b", "main"]);
+        std::fs::write(repo.path().join("README.md"), "init\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init"]);
+
+        let ws = workspace(Uuid::new_v4(), repo.path().to_path_buf());
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::channel::<StateMessage>(2);
+        let responder = tokio::spawn(async move {
+            if let Some(StateMessage::Query { request, reply }) = state_rx.recv().await {
+                assert!(matches!(request, QueryRequest::ListWorkspaces));
+                let _ = reply.send(QueryResponse::Workspaces(vec![ws]));
+            }
+        });
+
+        let commit = resolve_base_branch_commit(&state_tx, "HEAD", Duration::from_millis(100))
+            .await
+            .expect("HEAD should resolve");
+        assert_eq!(commit.len(), 40);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_handles_shutdown_request_and_cleans_runtime_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let grove_dir = temp.path().join(".grove");
+        let paths = DaemonPaths::from_grove_dir(&grove_dir);
+        let config = GroveConfig {
+            watch_interval_ms: 25,
+            socket_idle_timeout_ms: 200,
+            socket_state_reply_timeout_ms: 100,
+            ..GroveConfig::default()
+        };
+
+        let grove_dir_for_task = grove_dir.clone();
+        let run_task = tokio::spawn(async move { run(config, &grove_dir_for_task).await });
+
+        assert!(
+            wait_for_path(&paths.socket_file, 5_000).await,
+            "socket file should appear"
+        );
+        assert!(
+            wait_for_path(&paths.shutdown_token_file, 5_000).await,
+            "shutdown token file should appear"
+        );
+        assert!(paths.pid_file.exists(), "pid file should be created");
+
+        let token = std::fs::read_to_string(&paths.shutdown_token_file)
+            .expect("shutdown token should be readable")
+            .trim()
+            .to_string();
+        assert!(!token.is_empty(), "shutdown token should not be blank");
+
+        let stream = UnixStream::connect(&paths.socket_file)
+            .await
+            .expect("daemon socket should accept connections");
+        let mut reader = BufReader::new(stream);
+        let request = serde_json::json!({
+            "method": "shutdown",
+            "params": { "token": token }
+        });
+        reader
+            .get_mut()
+            .write_all(request.to_string().as_bytes())
+            .await
+            .expect("request should write");
+        reader
+            .get_mut()
+            .write_all(b"\n")
+            .await
+            .expect("newline should write");
+
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("response should read");
+        let response: serde_json::Value =
+            serde_json::from_str(&line).expect("response should be json");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data"]["status"], "shutting_down");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), run_task)
+            .await
+            .expect("daemon run task should terminate")
+            .expect("daemon task should not panic");
+        assert!(result.is_ok(), "daemon run should exit cleanly: {result:?}");
+
+        assert!(!paths.pid_file.exists(), "pid file should be cleaned up");
+        assert!(
+            !paths.shutdown_token_file.exists(),
+            "shutdown token file should be cleaned up"
+        );
     }
 }

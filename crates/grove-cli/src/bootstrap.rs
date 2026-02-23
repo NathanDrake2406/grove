@@ -22,7 +22,12 @@ pub struct DiscoveredWorktree {
 
 /// Resolve the git repository context using `gix::discover`.
 pub fn resolve_git_context() -> Result<GitContext, String> {
-    let repo = gix::discover(".").map_err(|e| format!("failed to discover git repository: {e}"))?;
+    resolve_git_context_from(Path::new("."))
+}
+
+fn resolve_git_context_from(start: &Path) -> Result<GitContext, String> {
+    let repo =
+        gix::discover(start).map_err(|e| format!("failed to discover git repository: {e}"))?;
     repo_to_git_context(&repo)
 }
 
@@ -110,7 +115,12 @@ fn add_to_git_exclude(ctx: &GitContext) -> Result<(), String> {
 
 /// Discover all worktrees via `gix`.
 pub fn discover_worktrees() -> Result<Vec<DiscoveredWorktree>, String> {
-    let repo = gix::discover(".").map_err(|e| format!("failed to discover git repository: {e}"))?;
+    discover_worktrees_from(Path::new("."))
+}
+
+fn discover_worktrees_from(start: &Path) -> Result<Vec<DiscoveredWorktree>, String> {
+    let repo =
+        gix::discover(start).map_err(|e| format!("failed to discover git repository: {e}"))?;
 
     let mut worktrees = Vec::new();
 
@@ -162,6 +172,18 @@ fn worktree_from_repo(repo: &gix::Repository) -> Option<DiscoveredWorktree> {
 /// Check if the daemon is running; start it if not.
 /// Returns a connected `DaemonClient`.
 pub async fn ensure_daemon(grove_dir: &std::path::Path) -> Result<DaemonClient, String> {
+    ensure_daemon_with(grove_dir, 30, 100, spawn_daemon).await
+}
+
+async fn ensure_daemon_with<F>(
+    grove_dir: &std::path::Path,
+    max_attempts: usize,
+    poll_interval_ms: u64,
+    spawn: F,
+) -> Result<DaemonClient, String>
+where
+    F: Fn(&std::path::Path) -> Result<(), String>,
+{
     let socket_path = grove_dir.join("daemon.sock");
     let client = DaemonClient::new(&socket_path);
 
@@ -171,18 +193,17 @@ pub async fn ensure_daemon(grove_dir: &std::path::Path) -> Result<DaemonClient, 
     }
 
     // Daemon not responding -- spawn it
-    spawn_daemon(grove_dir)?;
+    spawn(grove_dir)?;
 
     // Poll for readiness
-    let max_attempts = 30; // 3 seconds with 100ms intervals
     for _ in 0..max_attempts {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
         if client.status().await.is_ok() {
             return Ok(client);
         }
     }
 
-    Err("daemon failed to start within 3 seconds".to_string())
+    Err("daemon failed to start within timeout window".to_string())
 }
 
 fn spawn_daemon(_grove_dir: &std::path::Path) -> Result<(), String> {
@@ -247,6 +268,49 @@ pub async fn bootstrap() -> Result<(DaemonClient, std::path::PathBuf), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn spawn_status_server(socket_path: PathBuf, requests: usize) -> tokio::task::JoinHandle<()> {
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("socket should bind");
+        tokio::spawn(async move {
+            for _ in 0..requests {
+                let (stream, _) = listener.accept().await.expect("accept should succeed");
+                let mut reader = BufReader::new(stream);
+                let mut request_line = String::new();
+                let _ = reader
+                    .read_line(&mut request_line)
+                    .await
+                    .expect("request line should read");
+                let mut stream = reader.into_inner();
+                stream
+                    .write_all(br#"{"ok":true,"data":{"status":"ok"}}"#)
+                    .await
+                    .expect("response should write");
+                stream.write_all(b"\n").await.expect("newline should write");
+            }
+        })
+    }
 
     #[test]
     fn grove_dir_is_sibling_of_common_dir() {
@@ -283,5 +347,217 @@ mod tests {
             grove_dir_from_context(&ctx),
             PathBuf::from("/home/user/myproject/.grove")
         );
+    }
+
+    #[test]
+    fn infer_repo_root_from_common_dir_finds_git_ancestor() {
+        let common = PathBuf::from("/home/user/repo/.git/worktrees/feature-a");
+        assert_eq!(
+            infer_repo_root_from_common_dir(&common),
+            Some(PathBuf::from("/home/user/repo"))
+        );
+    }
+
+    #[test]
+    fn infer_repo_root_from_common_dir_uses_parent_for_bare_style_path() {
+        let common = PathBuf::from("/home/user/repo.git");
+        assert_eq!(
+            infer_repo_root_from_common_dir(&common),
+            Some(PathBuf::from("/home/user"))
+        );
+    }
+
+    #[test]
+    fn derive_name_prefers_branch_and_strips_refs_heads_prefix() {
+        let path = PathBuf::from("/tmp/repo/worktree-a");
+        assert_eq!(
+            derive_name(&path, Some("refs/heads/feature/tight-tests")),
+            "feature/tight-tests"
+        );
+        assert_eq!(
+            derive_name(&path, Some("feature/no-prefix")),
+            "feature/no-prefix"
+        );
+    }
+
+    #[test]
+    fn derive_name_falls_back_to_path_basename_or_unknown() {
+        let path = PathBuf::from("/tmp/repo/worktree-a");
+        assert_eq!(derive_name(&path, None), "worktree-a");
+
+        let root_like = PathBuf::from("/");
+        assert_eq!(derive_name(&root_like, None), "unknown");
+    }
+
+    #[test]
+    fn add_to_git_exclude_appends_entry_once_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common_dir = tmp.path().join(".git");
+        std::fs::create_dir_all(common_dir.join("info")).unwrap();
+
+        let ctx = GitContext {
+            toplevel: tmp.path().to_path_buf(),
+            common_dir: common_dir.clone(),
+        };
+
+        add_to_git_exclude(&ctx).unwrap();
+        add_to_git_exclude(&ctx).unwrap();
+
+        let exclude = std::fs::read_to_string(common_dir.join("info").join("exclude")).unwrap();
+        let grove_entries = exclude
+            .lines()
+            .filter(|line| line.trim() == ".grove/")
+            .count();
+        assert_eq!(grove_entries, 1);
+    }
+
+    #[test]
+    fn add_to_git_exclude_preserves_existing_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common_dir = tmp.path().join(".git");
+        let info_dir = common_dir.join("info");
+        std::fs::create_dir_all(&info_dir).unwrap();
+        let exclude_path = info_dir.join("exclude");
+        std::fs::write(&exclude_path, "target/\nnode_modules/\n").unwrap();
+
+        let ctx = GitContext {
+            toplevel: tmp.path().to_path_buf(),
+            common_dir: common_dir.clone(),
+        };
+
+        add_to_git_exclude(&ctx).unwrap();
+
+        let exclude = std::fs::read_to_string(exclude_path).unwrap();
+        assert!(exclude.contains("target/"));
+        assert!(exclude.contains("node_modules/"));
+        assert!(exclude.lines().any(|line| line.trim() == ".grove/"));
+    }
+
+    #[test]
+    fn ensure_grove_dir_creates_directory_and_updates_exclude() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_root = tmp.path().join("repo");
+        let common_dir = repo_root.join(".git");
+        std::fs::create_dir_all(common_dir.join("info")).unwrap();
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let ctx = GitContext {
+            toplevel: repo_root.clone(),
+            common_dir: common_dir.clone(),
+        };
+
+        let grove_dir = ensure_grove_dir(&ctx).unwrap();
+        assert_eq!(grove_dir, repo_root.join(".grove"));
+        assert!(grove_dir.is_dir());
+
+        let exclude = std::fs::read_to_string(common_dir.join("info").join("exclude")).unwrap();
+        assert!(exclude.lines().any(|line| line.trim() == ".grove/"));
+    }
+
+    #[test]
+    fn resolve_git_context_from_errors_outside_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_git_context_from(dir.path()).unwrap_err();
+        assert!(err.contains("failed to discover git repository"));
+    }
+
+    #[test]
+    fn discover_worktrees_from_finds_main_and_linked_worktrees() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "grove@example.com"]);
+        run_git(&repo, &["config", "user.name", "Grove Tests"]);
+        std::fs::write(repo.join("README.md"), "test\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "init"]);
+
+        let wt_b = temp.path().join("wt-b");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                wt_b.to_str().expect("utf8 path"),
+                "-b",
+                "feat/b",
+                "main",
+            ],
+        );
+
+        let discovered = discover_worktrees_from(&repo).unwrap();
+        assert!(discovered.len() >= 2);
+        assert!(discovered.iter().any(|w| w.path.ends_with("repo")));
+        assert!(discovered.iter().any(|w| w.path.ends_with("wt-b")));
+        assert!(discovered.iter().any(|w| w.name.contains("main")));
+        assert!(discovered.iter().any(|w| w.name.contains("feat/b")));
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_returns_when_socket_already_responding() {
+        let temp = tempfile::tempdir().unwrap();
+        let grove_dir = temp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+        let socket = grove_dir.join("daemon.sock");
+        let server = spawn_status_server(socket.clone(), 1);
+
+        let client = ensure_daemon(&grove_dir).await.unwrap();
+        assert_eq!(client.socket_path(), socket.as_path());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_with_spawns_then_waits_until_ready() {
+        let temp = tempfile::tempdir().unwrap();
+        let grove_dir = temp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+        let socket = grove_dir.join("daemon.sock");
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+
+        let calls = Arc::clone(&spawn_calls);
+        let result = ensure_daemon_with(&grove_dir, 20, 10, move |_dir| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            let socket_path = socket.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Runtime::new().expect("runtime should create");
+                rt.block_on(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    let server = spawn_status_server(socket_path, 1);
+                    server.await.expect("server should finish");
+                });
+            });
+            Ok(())
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(spawn_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_with_propagates_spawn_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let grove_dir = temp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+
+        let err = ensure_daemon_with(&grove_dir, 2, 1, |_dir| Err("spawn failed".to_string()))
+            .await
+            .err()
+            .expect("spawn failure should return an error");
+        assert!(err.contains("spawn failed"));
+    }
+
+    #[tokio::test]
+    async fn ensure_daemon_with_times_out_when_daemon_never_comes_up() {
+        let temp = tempfile::tempdir().unwrap();
+        let grove_dir = temp.path().join(".grove");
+        std::fs::create_dir_all(&grove_dir).unwrap();
+
+        let err = ensure_daemon_with(&grove_dir, 2, 1, |_dir| Ok(()))
+            .await
+            .err()
+            .expect("timeout should return an error");
+        assert!(err.contains("failed to start"));
     }
 }

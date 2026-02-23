@@ -1,7 +1,21 @@
 use crate::client::DaemonClient;
 use crate::commands::CommandError;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConflictRow {
+    score: String,
+    other_workspace: String,
+    summary: String,
+    overlaps: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckEvaluation {
+    workspace_name: String,
+    conflicts: Vec<ConflictRow>,
+}
 
 /// Execute the `check` command — report conflicts for the current worktree.
 ///
@@ -10,7 +24,7 @@ use std::path::Path;
 pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandError> {
     let cwd = std::env::current_dir()
         .map_err(|e| CommandError::DaemonError(format!("failed to get current directory: {e}")))?;
-    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let cwd = canonicalize_or_identity(&cwd);
 
     // Fetch workspaces and analyses in parallel-ish (sequential for now, both fast).
     let ws_resp = client.list_workspaces().await?;
@@ -24,110 +38,153 @@ pub async fn execute(client: &DaemonClient, json: bool) -> Result<(), CommandErr
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
 
-    // Find which workspace matches the current directory.
-    let current_ws = workspaces.iter().find(|ws| {
-        let Some(ws_path) = ws.get("path").and_then(|v| v.as_str()) else {
-            return false;
-        };
-        let ws_path = Path::new(ws_path);
-        let ws_canonical = std::fs::canonicalize(ws_path).unwrap_or_else(|_| ws_path.to_path_buf());
-        cwd.starts_with(&ws_canonical)
-    });
-
-    let Some(current_ws) = current_ws else {
-        return Err(CommandError::DaemonError(
-            "current directory does not match any tracked worktree".to_string(),
-        ));
-    };
-
-    let current_id = current_ws.get("id").and_then(|v| v.as_str()).unwrap_or("");
-    let current_name = current_ws
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-
-    // Build ID → name lookup.
-    let id_to_name: HashMap<&str, &str> = workspaces
-        .iter()
-        .filter_map(|ws| {
-            let id = ws.get("id")?.as_str()?;
-            let name = ws.get("name")?.as_str()?;
-            Some((id, name))
-        })
-        .collect();
-
     // Fetch analyses.
     let analyses_resp = client.get_all_analyses().await?;
     let analyses = analyses_resp
         .data
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
-
-    // Filter: involves this workspace + non-Green score.
-    let conflicts: Vec<_> = analyses
-        .iter()
-        .filter(|a| {
-            let ws_a = a.get("workspace_a").and_then(|v| v.as_str()).unwrap_or("");
-            let ws_b = a.get("workspace_b").and_then(|v| v.as_str()).unwrap_or("");
-            let score = a.get("score").and_then(|v| v.as_str()).unwrap_or("Green");
-            (ws_a == current_id || ws_b == current_id) && score != "Green"
-        })
-        .collect();
-
-    let json_conflicts: Vec<serde_json::Value> = conflicts
-        .iter()
-        .map(|a| {
-            let ws_a = a.get("workspace_a").and_then(|v| v.as_str()).unwrap_or("");
-            let ws_b = a.get("workspace_b").and_then(|v| v.as_str()).unwrap_or("");
-            let other_id = if ws_a == current_id { ws_b } else { ws_a };
-            let other_name = id_to_name.get(other_id).copied().unwrap_or(other_id);
-            let overlaps = a.get("overlaps").and_then(|v| v.as_array());
-            let summary = summarize_overlaps(overlaps.map(Vec::as_slice).unwrap_or(&[]));
-            serde_json::json!({
-                "score": a.get("score"),
-                "other_workspace": other_name,
-                "summary": summary,
-                "overlaps": a.get("overlaps"),
-            })
-        })
-        .collect();
+    let evaluation = evaluate_check_payload(&cwd, &workspaces, &analyses)?;
 
     if json {
-        let output = serde_json::json!({
-            "workspace": current_name,
-            "clean": conflicts.is_empty(),
-            "conflicts": json_conflicts,
-        });
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&output).unwrap_or_default()
-        );
-    } else if !conflicts.is_empty() {
-        for c in &json_conflicts {
-            let score = c.get("score").and_then(|v| v.as_str()).unwrap_or("?");
-            let label = match score {
+        println!("{}", render_json_output(&evaluation));
+    } else if !evaluation.conflicts.is_empty() {
+        for conflict in &evaluation.conflicts {
+            let label = match conflict.score.as_str() {
                 "Yellow" => "minor",
                 "Red" => "conflict",
                 "Black" => "breaking",
                 other => other,
             };
-            let other = c
-                .get("other_workspace")
-                .and_then(|v| v.as_str())
-                .unwrap_or("?");
-            let summary = c.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-            eprintln!("[{label}] {other}: {summary}");
+            eprintln!(
+                "[{label}] {}: {}",
+                conflict.other_workspace, conflict.summary
+            );
         }
         eprintln!("\nRun `grove conflicts <this-branch> <other-branch>` for full details.");
     }
 
-    if conflicts.is_empty() {
+    if evaluation.conflicts.is_empty() {
         Ok(())
     } else {
         // Exit directly — the one-liners on stderr are the output.
         // Returning an error would add a redundant "error: ..." wrapper.
         std::process::exit(1)
     }
+}
+
+fn canonicalize_or_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn find_current_workspace<'a>(
+    workspaces: &'a [serde_json::Value],
+    cwd: &Path,
+) -> Option<&'a serde_json::Value> {
+    workspaces.iter().find(|ws| {
+        let Some(ws_path) = ws.get("path").and_then(|v| v.as_str()) else {
+            return false;
+        };
+        let ws_canonical = canonicalize_or_identity(Path::new(ws_path));
+        cwd.starts_with(&ws_canonical)
+    })
+}
+
+fn build_id_to_name(workspaces: &[serde_json::Value]) -> HashMap<&str, &str> {
+    workspaces
+        .iter()
+        .filter_map(|ws| {
+            let id = ws.get("id")?.as_str()?;
+            let name = ws.get("name")?.as_str()?;
+            Some((id, name))
+        })
+        .collect()
+}
+
+fn evaluate_check_payload(
+    cwd: &Path,
+    workspaces: &[serde_json::Value],
+    analyses: &[serde_json::Value],
+) -> Result<CheckEvaluation, CommandError> {
+    let current_ws = find_current_workspace(workspaces, cwd).ok_or_else(|| {
+        CommandError::DaemonError(
+            "current directory does not match any tracked worktree".to_string(),
+        )
+    })?;
+
+    let current_id = current_ws.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let current_name = current_ws
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let id_to_name = build_id_to_name(workspaces);
+
+    let conflicts = analyses
+        .iter()
+        .filter_map(|analysis| {
+            let ws_a = analysis
+                .get("workspace_a")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let ws_b = analysis
+                .get("workspace_b")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let score = analysis
+                .get("score")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Green");
+            if score == "Green" || (ws_a != current_id && ws_b != current_id) {
+                return None;
+            }
+
+            let other_id = if ws_a == current_id { ws_b } else { ws_a };
+            let other_name = id_to_name
+                .get(other_id)
+                .copied()
+                .unwrap_or(other_id)
+                .to_string();
+            let overlaps_array = analysis
+                .get("overlaps")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            Some(ConflictRow {
+                score: score.to_string(),
+                other_workspace: other_name,
+                summary: summarize_overlaps(&overlaps_array),
+                overlaps: analysis.get("overlaps").cloned(),
+            })
+        })
+        .collect();
+
+    Ok(CheckEvaluation {
+        workspace_name: current_name,
+        conflicts,
+    })
+}
+
+fn render_json_output(evaluation: &CheckEvaluation) -> String {
+    let conflicts: Vec<serde_json::Value> = evaluation
+        .conflicts
+        .iter()
+        .map(|conflict| {
+            serde_json::json!({
+                "score": conflict.score,
+                "other_workspace": conflict.other_workspace,
+                "summary": conflict.summary,
+                "overlaps": conflict.overlaps,
+            })
+        })
+        .collect();
+    let output = serde_json::json!({
+        "workspace": evaluation.workspace_name,
+        "clean": conflicts.is_empty(),
+        "conflicts": conflicts,
+    });
+    serde_json::to_string_pretty(&output).unwrap_or_default()
 }
 
 /// Produce a short one-line summary of the overlaps for a pair.
@@ -211,6 +268,35 @@ fn summarize_overlaps(overlaps: &[serde_json::Value]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    fn ws(id: &str, name: &str, path: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "name": name,
+            "path": path.to_string_lossy()
+        })
+    }
+
+    fn hunk_overlap(path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Hunk": {
+                "path": path,
+                "a_range": {"start": 10, "end": 20},
+                "b_range": {"start": 15, "end": 25},
+                "distance": 0
+            }
+        })
+    }
+
+    fn symbol_overlap(path: &str, symbol: &str) -> serde_json::Value {
+        serde_json::json!({
+            "Symbol": {
+                "path": path,
+                "symbol_name": symbol
+            }
+        })
+    }
 
     #[test]
     fn summarize_empty_overlaps() {
@@ -313,5 +399,103 @@ mod tests {
         assert!(summary.contains("export change in src/shared.ts breaks import in src/api.ts"));
         assert!(summary.contains("both branches modify login() in src/auth.ts"));
         assert!(!summary.contains("file(s) modified"));
+    }
+
+    #[test]
+    fn find_current_workspace_matches_nested_path_using_canonical_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_root = temp.path().join("worktree-a");
+        let nested = ws_root.join("src").join("module");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested = std::fs::canonicalize(&nested).unwrap();
+
+        let workspaces = vec![ws("a", "alpha", &ws_root)];
+        let found = find_current_workspace(&workspaces, &nested).unwrap();
+        assert_eq!(found.get("name").and_then(|v| v.as_str()), Some("alpha"));
+    }
+
+    #[test]
+    fn evaluate_check_payload_returns_error_for_untracked_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let workspaces = vec![ws("a", "alpha", &temp.path().join("tracked"))];
+        let err = evaluate_check_payload(&other, &workspaces, &[]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("current directory does not match any tracked worktree")
+        );
+    }
+
+    #[test]
+    fn evaluate_check_payload_filters_green_and_unrelated_pairs() {
+        let temp = tempfile::tempdir().unwrap();
+        let ws_a = temp.path().join("a");
+        let ws_b = temp.path().join("b");
+        let ws_c = temp.path().join("c");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+        std::fs::create_dir_all(&ws_c).unwrap();
+
+        let workspaces = vec![
+            ws("a", "alpha", &ws_a),
+            ws("b", "beta", &ws_b),
+            ws("c", "gamma", &ws_c),
+        ];
+        let analyses = vec![
+            serde_json::json!({
+                "workspace_a": "a",
+                "workspace_b": "b",
+                "score": "Red",
+                "overlaps": [symbol_overlap("src/auth.ts", "login")]
+            }),
+            serde_json::json!({
+                "workspace_a": "a",
+                "workspace_b": "c",
+                "score": "Green",
+                "overlaps": []
+            }),
+            serde_json::json!({
+                "workspace_a": "x",
+                "workspace_b": "y",
+                "score": "Black",
+                "overlaps": [hunk_overlap("src/main.ts")]
+            }),
+        ];
+
+        let cwd = std::fs::canonicalize(&ws_a).unwrap();
+        let eval = evaluate_check_payload(&cwd, &workspaces, &analyses).unwrap();
+        assert_eq!(eval.workspace_name, "alpha");
+        assert_eq!(eval.conflicts.len(), 1);
+        assert_eq!(eval.conflicts[0].other_workspace, "beta");
+        assert_eq!(eval.conflicts[0].score, "Red");
+        assert!(eval.conflicts[0].summary.contains("login"));
+    }
+
+    #[test]
+    fn render_json_output_has_expected_shape() {
+        let evaluation = CheckEvaluation {
+            workspace_name: "alpha".to_string(),
+            conflicts: vec![ConflictRow {
+                score: "Yellow".to_string(),
+                other_workspace: "beta".to_string(),
+                summary: "overlapping line changes in src/main.ts".to_string(),
+                overlaps: Some(serde_json::json!([hunk_overlap("src/main.ts")])),
+            }],
+        };
+
+        let rendered = render_json_output(&evaluation);
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(value["workspace"], "alpha");
+        assert_eq!(value["clean"], false);
+        assert_eq!(value["conflicts"][0]["score"], "Yellow");
+        assert_eq!(value["conflicts"][0]["other_workspace"], "beta");
+    }
+
+    #[test]
+    fn canonicalize_or_identity_keeps_path_when_missing() {
+        let missing = PathBuf::from("/definitely/nonexistent/path/for/grove");
+        let value = canonicalize_or_identity(&missing);
+        assert_eq!(value, missing);
     }
 }

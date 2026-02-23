@@ -593,3 +593,322 @@ fn build_overlap_lines<'a>(analysis: &'a WorkspacePairAnalysis, app: &'a App) ->
 
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grove_cli::client::DaemonClient;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serde_json::json;
+
+    fn make_workspace(id: &str, name: &str, branch: &str, path: &str) -> grove_lib::Workspace {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": name,
+            "branch": branch,
+            "path": path,
+            "base_ref": "refs/heads/main",
+            "created_at": "2026-01-01T00:00:00Z",
+            "last_activity": "2026-01-01T00:00:00Z",
+            "metadata": {}
+        }))
+        .unwrap()
+    }
+
+    fn make_analysis(
+        workspace_a: &str,
+        workspace_b: &str,
+        score: &str,
+        overlaps: Vec<serde_json::Value>,
+    ) -> WorkspacePairAnalysis {
+        serde_json::from_value(json!({
+            "workspace_a": workspace_a,
+            "workspace_b": workspace_b,
+            "score": score,
+            "overlaps": overlaps,
+            "merge_order_hint": "Either",
+            "last_computed": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap()
+    }
+
+    fn app_with_defaults() -> App {
+        App::new(DaemonClient::new(
+            "/tmp/nonexistent-grove-tui-ui-tests.sock",
+        ))
+    }
+
+    fn render_to_text(app: &App, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(app, frame)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let idx = (y as usize * buffer.area.width as usize) + x as usize;
+                out.push_str(buffer.content[idx].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_handles_boundaries() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 0), "");
+        assert_eq!(truncate_with_ellipsis("abcdef", 1), "…");
+        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+        assert_eq!(truncate_with_ellipsis("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn build_overlap_lines_empty_overlaps_is_clean_message() {
+        let ws_a = make_workspace(
+            "00000000-0000-0000-0000-000000000001",
+            "alpha",
+            "feature/a",
+            "/tmp/a",
+        );
+        let ws_b = make_workspace(
+            "00000000-0000-0000-0000-000000000002",
+            "beta",
+            "feature/b",
+            "/tmp/b",
+        );
+
+        let mut app = app_with_defaults();
+        app.workspaces = vec![ws_a, ws_b];
+
+        let analysis = make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Green",
+            vec![],
+        );
+
+        let lines = build_overlap_lines(&analysis, &app);
+        let rendered = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("No overlaps between alpha and beta."));
+    }
+
+    #[test]
+    fn build_overlap_lines_groups_all_overlap_kinds() {
+        let ws_a = make_workspace(
+            "00000000-0000-0000-0000-000000000001",
+            "alpha",
+            "feature/a",
+            "/tmp/a",
+        );
+        let ws_b = make_workspace(
+            "00000000-0000-0000-0000-000000000002",
+            "beta",
+            "feature/b",
+            "/tmp/b",
+        );
+
+        let mut app = app_with_defaults();
+        app.workspaces = vec![ws_a, ws_b];
+
+        let analysis = make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Black",
+            vec![
+                json!({
+                    "File": {
+                        "path": "src/lib.rs",
+                        "a_change": "Modified",
+                        "b_change": "Modified"
+                    }
+                }),
+                json!({
+                    "Hunk": {
+                        "path": "src/lib.rs",
+                        "a_range": {"start": 10, "end": 20},
+                        "b_range": {"start": 15, "end": 25},
+                        "distance": 0
+                    }
+                }),
+                json!({
+                    "Symbol": {
+                        "path": "src/lib.rs",
+                        "symbol_name": "process",
+                        "a_modification": "branch-a",
+                        "b_modification": "branch-b"
+                    }
+                }),
+                json!({
+                    "Dependency": {
+                        "changed_in": "00000000-0000-0000-0000-000000000001",
+                        "changed_file": "src/api.rs",
+                        "changed_export": {
+                            "Added": {
+                                "name": "new_fn",
+                                "kind": "Function",
+                                "range": {"start": 1, "end": 1},
+                                "signature": null
+                            }
+                        },
+                        "affected_file": "src/use_api.rs",
+                        "affected_usage": [{
+                            "file": "src/use_api.rs",
+                            "line": 10,
+                            "column": 5
+                        }]
+                    }
+                }),
+                json!({
+                    "Schema": {
+                        "category": "Route",
+                        "a_file": "routes/api.yaml",
+                        "b_file": "routes/internal.yaml",
+                        "detail": "route files touched"
+                    }
+                }),
+            ],
+        );
+
+        let lines = build_overlap_lines(&analysis, &app);
+        let rendered = lines
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Both branches edit the same files"));
+        assert!(rendered.contains("Both branches change the same lines"));
+        assert!(rendered.contains("Both branches modify the same functions"));
+        assert!(rendered.contains("affect the other's imports"));
+        assert!(rendered.contains("touch shared config/schemas"));
+    }
+
+    #[test]
+    fn render_loading_view_includes_loading_copy() {
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::Loading;
+        let rendered = render_to_text(&app, 90, 20);
+
+        assert!(rendered.contains("Grove Dashboard"));
+        assert!(rendered.contains("Connecting to daemon and loading worktrees"));
+    }
+
+    #[test]
+    fn render_no_worktrees_view_includes_guidance() {
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::NoWorktrees;
+        let rendered = render_to_text(&app, 90, 20);
+
+        assert!(rendered.contains("Not enough worktrees detected"));
+        assert!(rendered.contains("requires at least two worktrees"));
+    }
+
+    #[test]
+    fn render_error_view_includes_error_and_exit_hint() {
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::Error("socket timeout".to_string());
+        let rendered = render_to_text(&app, 90, 20);
+
+        assert!(rendered.contains("Fatal Error: socket timeout"));
+        assert!(rendered.contains("Press 'q' or 'ESC' to exit"));
+    }
+
+    #[test]
+    fn render_dashboard_includes_sections_and_pair_details() {
+        let ws_a = make_workspace(
+            "00000000-0000-0000-0000-000000000001",
+            "alpha",
+            "feature/a",
+            "/tmp/a",
+        );
+        let ws_b = make_workspace(
+            "00000000-0000-0000-0000-000000000002",
+            "beta",
+            "feature/b",
+            "/tmp/b",
+        );
+
+        let analysis = make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Red",
+            vec![json!({
+                "Symbol": {
+                    "path": "src/lib.rs",
+                    "symbol_name": "process",
+                    "a_modification": "A",
+                    "b_modification": "B"
+                }
+            })],
+        );
+
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::Dashboard;
+        app.base_commit = "12345678".to_string();
+        app.workspaces = vec![ws_a, ws_b];
+        app.analyses = vec![analysis];
+        app.focused_panel = FocusedPanel::Pairs;
+
+        let rendered = render_to_text(&app, 120, 34);
+
+        assert!(rendered.contains("Grove Status"));
+        assert!(rendered.contains("Worktrees"));
+        assert!(rendered.contains("Conflicts"));
+        assert!(rendered.contains("Details"));
+        assert!(rendered.contains("RED"));
+        assert!(rendered.contains("Both branches modify the same functions"));
+    }
+
+    #[test]
+    fn render_dashboard_shows_clean_message_for_selected_workspace_with_no_pairs() {
+        let ws_a = make_workspace(
+            "00000000-0000-0000-0000-000000000001",
+            "alpha",
+            "feature/a",
+            "/tmp/a",
+        );
+        let ws_b = make_workspace(
+            "00000000-0000-0000-0000-000000000002",
+            "beta",
+            "feature/b",
+            "/tmp/b",
+        );
+        let ws_c = make_workspace(
+            "00000000-0000-0000-0000-000000000003",
+            "clean",
+            "feature/c",
+            "/tmp/c",
+        );
+
+        let analysis = make_analysis(
+            "00000000-0000-0000-0000-000000000001",
+            "00000000-0000-0000-0000-000000000002",
+            "Yellow",
+            vec![json!({
+                "File": {
+                    "path": "src/lib.rs",
+                    "a_change": "Modified",
+                    "b_change": "Modified"
+                }
+            })],
+        );
+
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::Dashboard;
+        app.workspaces = vec![ws_a, ws_b, ws_c];
+        app.analyses = vec![analysis];
+        app.selected_worktree_index = 2;
+        app.focused_panel = FocusedPanel::Pairs;
+
+        let rendered = render_to_text(&app, 120, 34);
+        assert!(rendered.contains("No conflicts"));
+        assert!(rendered.contains("this worktree is clean"));
+    }
+}
