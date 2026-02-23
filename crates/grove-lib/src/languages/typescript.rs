@@ -44,7 +44,10 @@ impl TypeScriptAnalyzer {
 
     fn parse(&self, source: &[u8], is_tsx: bool) -> Result<tree_sitter::Tree, AnalysisError> {
         {
-            let cache = self.parse_cache.lock().unwrap();
+            let cache = self
+                .parse_cache
+                .lock()
+                .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?;
             if let Some(cached) = cache
                 .as_ref()
                 .filter(|cached| cached.is_tsx == is_tsx && cached.source.as_slice() == source)
@@ -55,16 +58,23 @@ impl TypeScriptAnalyzer {
 
         let tree = {
             let mut parser = if is_tsx {
-                self.parser_tsx.lock().unwrap()
+                self.parser_tsx
+                    .lock()
+                    .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?
             } else {
-                self.parser_ts.lock().unwrap()
+                self.parser_ts
+                    .lock()
+                    .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?
             };
             parser
                 .parse(source, None)
                 .ok_or_else(|| AnalysisError::ParseError("tree-sitter parse failed".into()))?
         };
 
-        let mut cache = self.parse_cache.lock().unwrap();
+        let mut cache = self
+            .parse_cache
+            .lock()
+            .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?;
         *cache = Some(ParseCache {
             source: source.to_vec(),
             is_tsx,

@@ -34,7 +34,10 @@ impl GoAnalyzer {
 
     fn parse(&self, source: &[u8]) -> Result<tree_sitter::Tree, AnalysisError> {
         {
-            let cache = self.parse_cache.lock().unwrap();
+            let cache = self
+                .parse_cache
+                .lock()
+                .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?;
             if let Some(cached) = cache
                 .as_ref()
                 .filter(|cached| cached.source.as_slice() == source)
@@ -44,13 +47,19 @@ impl GoAnalyzer {
         }
 
         let tree = {
-            let mut parser = self.parser.lock().unwrap();
+            let mut parser = self
+                .parser
+                .lock()
+                .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?;
             parser
                 .parse(source, None)
                 .ok_or_else(|| AnalysisError::ParseError("go parse failed".into()))?
         };
 
-        let mut cache = self.parse_cache.lock().unwrap();
+        let mut cache = self
+            .parse_cache
+            .lock()
+            .map_err(|_| AnalysisError::ParseError("mutex poisoned".to_string()))?;
         *cache = Some(ParseCache {
             source: source.to_vec(),
             tree: tree.clone(),
