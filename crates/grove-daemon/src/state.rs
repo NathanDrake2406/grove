@@ -2,6 +2,7 @@ use grove_lib::graph::{GraphOverlay, ImportGraph};
 use grove_lib::{CommitHash, OrthogonalityScore, Workspace, WorkspaceId, WorkspacePairAnalysis};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -63,6 +64,9 @@ pub enum StateMessage {
     AnalysisComplete {
         pair: (WorkspaceId, WorkspaceId),
         result: WorkspacePairAnalysis,
+    },
+    AnalysisFailure {
+        pair: (WorkspaceId, WorkspaceId),
     },
     Query {
         request: QueryRequest,
@@ -169,7 +173,7 @@ pub enum DaemonEvent {
 pub struct DaemonState {
     config: GroveConfig,
     workspaces: HashMap<WorkspaceId, Workspace>,
-    base_graph: ImportGraph,
+    base_graph: Arc<ImportGraph>,
     base_commit: CommitHash,
     workspace_overlays: HashMap<WorkspaceId, GraphOverlay>,
     pair_analyses: HashMap<(WorkspaceId, WorkspaceId), WorkspacePairAnalysis>,
@@ -198,7 +202,7 @@ impl DaemonState {
         Self {
             config,
             workspaces: HashMap::new(),
-            base_graph: ImportGraph::new(),
+            base_graph: Arc::new(ImportGraph::new()),
             base_commit: String::new(),
             workspace_overlays: HashMap::new(),
             pair_analyses: HashMap::new(),
@@ -256,7 +260,7 @@ impl DaemonState {
                         edges = edge_count,
                         "restored base import graph from cache"
                     );
-                    self.base_graph = graph;
+                    self.base_graph = Arc::new(graph);
                     self.base_commit = base_commit;
                 }
                 Ok(None) => {
@@ -295,6 +299,10 @@ impl DaemonState {
                 }
                 StateMessage::AnalysisComplete { pair, result } => {
                     self.handle_analysis_complete(pair, result);
+                    false
+                }
+                StateMessage::AnalysisFailure { pair } => {
+                    self.handle_analysis_failure(pair);
                     false
                 }
                 StateMessage::Query { request, reply } => {
@@ -398,6 +406,7 @@ impl DaemonState {
                 }
                 StateMessage::FileChanged { .. }
                 | StateMessage::AnalysisComplete { .. }
+                | StateMessage::AnalysisFailure { .. }
                 | StateMessage::BaseRefChanged { .. }
                 | StateMessage::BaseGraphReady { .. }
                 | StateMessage::WorktreeReindexComplete { .. } => {
@@ -455,6 +464,20 @@ impl DaemonState {
             workspace_b: pair.1,
             score,
         });
+
+        if self.in_flight_pairs.is_empty() {
+            self.drain_analysis_waiters();
+        }
+    }
+
+    fn handle_analysis_failure(&mut self, pair: (WorkspaceId, WorkspaceId)) {
+        self.in_flight_pairs.remove(&canonical_pair(pair.0, pair.1));
+
+        warn!(
+            workspace_a = %pair.0,
+            workspace_b = %pair.1,
+            "analysis failed; pair removed from in-flight set"
+        );
 
         if self.in_flight_pairs.is_empty() {
             self.drain_analysis_waiters();
@@ -591,7 +614,7 @@ impl DaemonState {
 
         self.base_commit = new_commit;
         // Full base graph rebuild is deferred until next dispatch; clear stale graph now.
-        self.base_graph = ImportGraph::new();
+        self.base_graph = Arc::new(ImportGraph::new());
         self.base_graph_building = false;
         self.base_graph_build_failed = false;
         // Clear stale analyses since they reference the old base.
@@ -861,7 +884,7 @@ impl DaemonState {
             "base import graph ready"
         );
 
-        self.base_graph = graph;
+        self.base_graph = Arc::new(graph);
         self.base_commit = base_commit.clone();
 
         if let Some(ref db) = self.db
@@ -1761,7 +1784,7 @@ mod tests {
             .try_send(WorkerMessage::AnalyzePair {
                 workspace_a: ws_a,
                 workspace_b: ws_b,
-                base_graph: ImportGraph::new(),
+                base_graph: Arc::new(ImportGraph::new()),
             })
             .unwrap();
         state.handle_attach_worker(worker_tx);

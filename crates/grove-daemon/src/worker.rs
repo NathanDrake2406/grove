@@ -21,7 +21,7 @@ pub enum WorkerMessage {
     AnalyzePair {
         workspace_a: Workspace,
         workspace_b: Workspace,
-        base_graph: ImportGraph,
+        base_graph: Arc<ImportGraph>,
     },
 }
 
@@ -133,6 +133,8 @@ async fn process_message(
                             error = %e,
                             "pair analysis failed"
                         );
+                        notify_analysis_failure(&state_tx, a_id, b_id, "pair analysis failed")
+                            .await;
                     }
                     Err(e) => {
                         error!(
@@ -141,6 +143,8 @@ async fn process_message(
                             error = %e,
                             "worker task panicked"
                         );
+                        notify_analysis_failure(&state_tx, a_id, b_id, "worker task panicked")
+                            .await;
                     }
                 },
                 Err(_) => {
@@ -150,6 +154,7 @@ async fn process_message(
                         timeout_ms,
                         "pair analysis timed out"
                     );
+                    notify_analysis_failure(&state_tx, a_id, b_id, "pair analysis timed out").await;
                 }
             }
         }
@@ -162,8 +167,9 @@ pub(crate) fn analyze_workspace_pair(
     workspace_b: &Workspace,
     base_graph: &ImportGraph,
 ) -> Result<WorkspacePairAnalysis, WorkerError> {
-    let changes_a = extract_changeset(config, workspace_a)?;
-    let changes_b = extract_changeset(config, workspace_b)?;
+    let registry = LanguageRegistry::with_defaults();
+    let changes_a = extract_changeset(config, &registry, workspace_a)?;
+    let changes_b = extract_changeset(config, &registry, workspace_b)?;
 
     let dependency_overlaps = compute_dependency_overlaps(&changes_a, &changes_b, base_graph);
     let analysis = scorer::score_pair(&changes_a, &changes_b, dependency_overlaps, Utc::now());
@@ -333,6 +339,7 @@ fn normalize_relative_path(path: PathBuf) -> PathBuf {
 
 fn extract_changeset(
     config: &GroveConfig,
+    registry: &LanguageRegistry,
     workspace: &Workspace,
 ) -> Result<WorkspaceChangeset, WorkerError> {
     use crate::git::{GitRepo, compute_hunks_from_content};
@@ -385,7 +392,6 @@ fn extract_changeset(
     let mut head_tree_mut = git.resolve_tree("HEAD")?;
 
     let mut files = Vec::new();
-    let registry = LanguageRegistry::with_defaults();
     let max_file_size_bytes = config.max_file_size_kb * 1024;
 
     for status in statuses {
@@ -416,7 +422,7 @@ fn extract_changeset(
         let hunks = compute_hunks_from_content(old_content.as_deref(), new_content.as_deref());
 
         let symbols_modified = extract_modified_symbols(
-            &registry,
+            registry,
             new_path,
             new_content.as_deref(),
             &hunks,
@@ -425,13 +431,13 @@ fn extract_changeset(
         );
 
         let old_exports = extract_exports(
-            &registry,
+            registry,
             old_path,
             old_content.as_deref(),
             max_file_size_bytes,
         );
         let new_exports = extract_exports(
-            &registry,
+            registry,
             new_path,
             new_content.as_deref(),
             max_file_size_bytes,
@@ -685,6 +691,30 @@ pub enum WorkerError {
         repo_path: PathBuf,
         detail: String,
     },
+}
+
+/// Notify the state actor that a pair analysis failed so it can clean up
+/// the `in_flight_pairs` entry and unblock any `AwaitAnalysis` waiters.
+async fn notify_analysis_failure(
+    state_tx: &mpsc::Sender<StateMessage>,
+    a_id: grove_lib::WorkspaceId,
+    b_id: grove_lib::WorkspaceId,
+    reason: &str,
+) {
+    if let Err(e) = state_tx
+        .send(StateMessage::AnalysisFailure {
+            pair: canonical_pair(a_id, b_id),
+        })
+        .await
+    {
+        warn!(
+            workspace_a = %a_id,
+            workspace_b = %b_id,
+            error = %e,
+            reason,
+            "failed to notify state actor of analysis failure"
+        );
+    }
 }
 
 pub(crate) fn canonical_pair(
@@ -1314,7 +1344,8 @@ impl Billing {
             ..GroveConfig::default()
         };
 
-        let changeset = extract_changeset(&config, &ws).expect("extract should succeed");
+        let registry = LanguageRegistry::with_defaults();
+        let changeset = extract_changeset(&config, &registry, &ws).expect("extract should succeed");
 
         // The uncommitted file should appear in changed_files.
         assert!(
@@ -1373,7 +1404,8 @@ impl Billing {
             ..GroveConfig::default()
         };
 
-        let changeset = extract_changeset(&config, &ws).expect("extract should succeed");
+        let registry = LanguageRegistry::with_defaults();
+        let changeset = extract_changeset(&config, &registry, &ws).expect("extract should succeed");
 
         let file = changeset
             .changed_files
