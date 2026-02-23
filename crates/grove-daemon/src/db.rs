@@ -30,6 +30,7 @@ pub struct Database {
 impl Database {
     pub fn open(path: &Path) -> Result<Self, DbError> {
         let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")?;
         let db = Self { conn };
         db.run_migrations()?;
         Ok(db)
@@ -181,20 +182,21 @@ impl Database {
 
     pub fn delete_workspace(&self, id: WorkspaceId) -> Result<(), DbError> {
         let id_str = id.to_string();
-        self.conn
-            .execute("DELETE FROM workspaces WHERE id = ?1", params![id_str])?;
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM workspaces WHERE id = ?1", params![id_str])?;
+        tx.execute(
             "DELETE FROM workspace_graph_deltas WHERE workspace_id = ?1",
             params![id_str],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM workspace_files WHERE workspace_id = ?1",
             params![id_str],
         )?;
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM pair_analyses WHERE workspace_a = ?1 OR workspace_b = ?1",
             params![id_str],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
