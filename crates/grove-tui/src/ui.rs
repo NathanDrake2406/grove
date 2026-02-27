@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
+use std::path::Path;
 
 use crate::app::{App, FocusedPanel, ViewState};
 use grove_lib::{OrthogonalityScore, Overlap, WorkspacePairAnalysis};
@@ -23,6 +24,64 @@ fn truncate_with_ellipsis(s: &str, max_width: usize) -> String {
     let mut truncated = s[..max_width - 1].to_string();
     truncated.push('…');
     truncated
+}
+
+/// Truncate a path from the left, keeping the most meaningful trailing components.
+/// E.g. "~/Projects/movies-ranking/.claude/worktrees/foo" → "…/.claude/worktrees/foo"
+fn truncate_path_left(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if s.len() <= max_width {
+        return s.to_string();
+    }
+    // Walk backward through '/' separators to find the longest suffix that fits.
+    // Reserve 1 char for the "…" prefix.
+    let budget = max_width.saturating_sub(1);
+    for (i, _) in s.match_indices('/').rev() {
+        let suffix = &s[i..]; // includes the leading '/'
+        if suffix.len() <= budget {
+            return format!("…{suffix}");
+        }
+    }
+    // No '/' boundary fits — fall back to right-truncation.
+    truncate_with_ellipsis(s, max_width)
+}
+
+/// Render a workspace path for display: repo-relative when possible, tilde-shortened otherwise.
+fn display_path(path: &Path) -> String {
+    let absolute = if path.is_absolute() {
+        path.to_string_lossy().into_owned()
+    } else if path.as_os_str().is_empty() {
+        return "(path unavailable)".to_string();
+    } else {
+        // Already relative — use as-is (e.g. "." for the main worktree).
+        return path.to_string_lossy().into_owned();
+    };
+
+    // Strip the project root (CWD) to show a repo-relative path.
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_str = cwd.to_string_lossy();
+        if let Some(relative) = absolute.strip_prefix(cwd_str.as_ref()) {
+            let relative = relative.strip_prefix('/').unwrap_or(relative);
+            if relative.is_empty() {
+                return ".".to_string();
+            }
+            return relative.to_string();
+        }
+    }
+
+    // Outside the project — tilde-shorten the absolute path.
+    tilde_shorten(&absolute)
+}
+
+fn tilde_shorten(path: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() && path.starts_with(&home) => {
+            format!("~{}", &path[home.len()..])
+        }
+        _ => path.to_owned(),
+    }
 }
 
 pub fn render(app: &App, frame: &mut Frame) {
@@ -379,6 +438,9 @@ fn render_detail_panel(app: &App, frame: &mut Frame, area: Rect) {
             let label_style = Style::default().fg(Color::DarkGray);
             let value_style = Style::default();
 
+            // 2 for borders, 14 for label width ("  path        ")
+            let max_value_width = area.width.saturating_sub(2 + 14) as usize;
+
             let lines: Vec<Line<'static>> = vec![
                 Line::from(vec![
                     Span::styled("  name        ".to_string(), label_style),
@@ -390,7 +452,10 @@ fn render_detail_panel(app: &App, frame: &mut Frame, area: Rect) {
                 ]),
                 Line::from(vec![
                     Span::styled("  path        ".to_string(), label_style),
-                    Span::styled(selected_ws.path.to_string_lossy().into_owned(), value_style),
+                    Span::styled(
+                        truncate_path_left(&display_path(&selected_ws.path), max_value_width),
+                        value_style,
+                    ),
                 ]),
                 Line::from(vec![
                     Span::styled("  conflicts   ".to_string(), label_style),
@@ -601,6 +666,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
+    use std::path::PathBuf;
 
     fn make_workspace(id: &str, name: &str, branch: &str, path: &str) -> grove_lib::Workspace {
         serde_json::from_value(json!({
@@ -910,5 +976,118 @@ mod tests {
         let rendered = render_to_text(&app, 120, 34);
         assert!(rendered.contains("No conflicts"));
         assert!(rendered.contains("this worktree is clean"));
+    }
+
+    #[test]
+    fn render_dashboard_details_shows_hidden_folder_absolute_path() {
+        let ws = make_workspace(
+            "00000000-0000-0000-0000-000000000009",
+            "worktree-peaceful-humming-whistle",
+            "refs/heads/worktree-peaceful-humming-whistle",
+            ".claude/worktrees/worktree-peaceful-humming-whistle",
+        );
+
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::Dashboard;
+        app.workspaces = vec![ws];
+        app.focused_panel = FocusedPanel::Worktrees;
+
+        let rendered = render_to_text(&app, 160, 34);
+        assert!(rendered.contains("path"));
+        // Relative paths are kept as-is (no leading '/')
+        assert!(rendered.contains(".claude/worktrees/worktree-peaceful-humming-whistle"));
+    }
+
+    #[test]
+    fn display_path_never_returns_empty_string() {
+        assert!(!display_path(Path::new("")).trim().is_empty());
+    }
+
+    #[test]
+    fn tilde_shorten_replaces_home_prefix() {
+        let home = std::env::var("HOME").unwrap();
+        let long_path =
+            format!("{home}/Projects/movies-ranking/.claude/worktrees/peaceful-humming-whistle");
+        let shortened = tilde_shorten(&long_path);
+        assert!(shortened.starts_with("~/"));
+        assert!(shortened.contains(".claude/worktrees/peaceful-humming-whistle"));
+        assert!(shortened.len() < long_path.len());
+    }
+
+    #[test]
+    fn tilde_shorten_leaves_non_home_paths_unchanged() {
+        assert_eq!(tilde_shorten("/tmp/foo"), "/tmp/foo");
+    }
+
+    #[test]
+    fn display_path_tilde_shortens_paths_outside_cwd() {
+        let home = std::env::var("HOME").unwrap();
+        // Use a path that's definitely NOT under CWD
+        let p = PathBuf::from(format!("{home}/some-nonexistent-project-xyz"));
+        let result = display_path(&p);
+        assert!(result.starts_with("~/"));
+        assert!(!result.contains(&home));
+    }
+
+    #[test]
+    fn display_path_returns_repo_relative_for_cwd_children() {
+        let cwd = std::env::current_dir().unwrap();
+        let p = cwd.join(".claude/worktrees/my-worktree");
+        let result = display_path(&p);
+        assert_eq!(result, ".claude/worktrees/my-worktree");
+    }
+
+    #[test]
+    fn display_path_returns_dot_for_cwd_itself() {
+        let cwd = std::env::current_dir().unwrap();
+        let result = display_path(&cwd);
+        assert_eq!(result, ".");
+    }
+
+    #[test]
+    fn truncate_path_left_keeps_trailing_components() {
+        let path = "~/Projects/movies-ranking/.claude/worktrees/peaceful-humming-whistle";
+        // Budget of 50 should keep the meaningful end
+        let result = truncate_path_left(path, 50);
+        assert!(result.starts_with('…'));
+        assert!(result.ends_with("peaceful-humming-whistle"));
+        assert!(result.len() <= 50);
+    }
+
+    #[test]
+    fn truncate_path_left_returns_full_path_when_fits() {
+        let path = "~/short/path";
+        assert_eq!(truncate_path_left(path, 80), "~/short/path");
+    }
+
+    #[test]
+    fn truncate_path_left_falls_back_to_right_truncation() {
+        // Single component longer than budget — no '/' boundary fits
+        let path = "/very-long-single-component-name";
+        let result = truncate_path_left(path, 10);
+        assert!(result.ends_with('…'));
+        // truncate_with_ellipsis counts display columns, not bytes;
+        // '…' is 1 column but 3 UTF-8 bytes.
+        assert_eq!(result, "/very-lon…");
+    }
+
+    #[test]
+    fn render_dashboard_path_visible_at_narrow_width() {
+        let ws = make_workspace(
+            "00000000-0000-0000-0000-000000000009",
+            "worktree-peaceful-humming-whistle",
+            "refs/heads/worktree-peaceful-humming-whistle",
+            "/Users/test/Projects/movies-ranking/.claude/worktrees/peaceful-humming-whistle",
+        );
+
+        let mut app = app_with_defaults();
+        app.view_state = ViewState::Dashboard;
+        app.workspaces = vec![ws];
+        app.focused_panel = FocusedPanel::Worktrees;
+
+        // 80 columns — the scenario that was failing
+        let rendered = render_to_text(&app, 80, 30);
+        assert!(rendered.contains("path"));
+        assert!(rendered.contains("peaceful-humming-whistle"));
     }
 }
