@@ -121,6 +121,13 @@ impl App {
             || !self.analyses_are_equal(&self.analyses, &new_analyses);
 
         if changed || self.view_state == ViewState::Loading {
+            let previous_selected_workspace_id = self
+                .workspaces
+                .get(self.selected_worktree_index)
+                .map(|w| w.id);
+            let previous_selected_worktree_index = self.selected_worktree_index;
+            let previous_selected_pair_index = self.selected_pair_index;
+
             self.analyses = new_analyses;
             self.last_data_change = Instant::now();
             self.is_dirty = true;
@@ -137,8 +144,30 @@ impl App {
             });
             self.workspaces = sorted;
 
-            self.selected_worktree_index = 0;
-            self.selected_pair_index = 0;
+            self.selected_worktree_index = if self.workspaces.is_empty() {
+                0
+            } else if let Some(selected_id) = previous_selected_workspace_id {
+                self.workspaces
+                    .iter()
+                    .position(|w| w.id == selected_id)
+                    .unwrap_or_else(|| {
+                        previous_selected_worktree_index.min(self.workspaces.len() - 1)
+                    })
+            } else {
+                0
+            };
+
+            self.selected_pair_index =
+                if let Some(ws) = self.workspaces.get(self.selected_worktree_index) {
+                    let pair_count = self.get_pairs_for_worktree(&ws.id).len();
+                    if pair_count == 0 {
+                        0
+                    } else {
+                        previous_selected_pair_index.min(pair_count - 1)
+                    }
+                } else {
+                    0
+                };
 
             // Automatically transition state
             if self.view_state == ViewState::Loading || self.view_state == ViewState::NoWorktrees {
@@ -702,6 +731,140 @@ mod tests {
 
         assert_eq!(app.view_state, ViewState::Error("list failed".to_string()));
         assert!(app.is_dirty);
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn refresh_data_preserves_selected_worktree_across_updates() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("daemon.sock");
+
+        let responses = vec![
+            json!({"ok": true, "data": {"base_commit": "1234567890abcdef"}}),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000003",
+                        "name": "clean-c",
+                        "branch": "feature/c",
+                        "path": "/tmp/c",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "name": "conflict-a",
+                        "branch": "feature/a",
+                        "path": "/tmp/a",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000002",
+                        "name": "conflict-b",
+                        "branch": "feature/b",
+                        "path": "/tmp/b",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    }
+                ]
+            }),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "workspace_a": "00000000-0000-0000-0000-000000000001",
+                        "workspace_b": "00000000-0000-0000-0000-000000000002",
+                        "score": "Yellow",
+                        "overlaps": [{
+                            "File": {
+                                "path": "src/lib.rs",
+                                "a_change": "Modified",
+                                "b_change": "Modified"
+                            }
+                        }],
+                        "merge_order_hint": "Either",
+                        "last_computed": "2026-01-01T00:00:00Z"
+                    }
+                ]
+            }),
+            json!({"ok": true, "data": {"base_commit": "1234567890abcdef"}}),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "id": "00000000-0000-0000-0000-000000000003",
+                        "name": "clean-c",
+                        "branch": "feature/c",
+                        "path": "/tmp/c",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "name": "conflict-a",
+                        "branch": "feature/a",
+                        "path": "/tmp/a",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    },
+                    {
+                        "id": "00000000-0000-0000-0000-000000000002",
+                        "name": "conflict-b",
+                        "branch": "feature/b",
+                        "path": "/tmp/b",
+                        "base_ref": "refs/heads/main",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "last_activity": "2026-01-01T00:00:00Z",
+                        "metadata": {}
+                    }
+                ]
+            }),
+            json!({
+                "ok": true,
+                "data": [
+                    {
+                        "workspace_a": "00000000-0000-0000-0000-000000000001",
+                        "workspace_b": "00000000-0000-0000-0000-000000000002",
+                        "score": "Yellow",
+                        "overlaps": [{
+                            "File": {
+                                "path": "src/lib.rs",
+                                "a_change": "Modified",
+                                "b_change": "Modified"
+                            }
+                        }],
+                        "merge_order_hint": "Either",
+                        "last_computed": "2026-01-01T00:00:01Z"
+                    }
+                ]
+            }),
+        ];
+
+        let server = spawn_mock_daemon(socket_path.clone(), responses);
+        let client = DaemonClient::new(&socket_path);
+        let mut app = App::new(client);
+
+        app.refresh_data().await.unwrap();
+        assert_eq!(app.workspaces[2].name, "clean-c");
+        app.selected_worktree_index = 2;
+
+        app.refresh_data().await.unwrap();
+
+        assert_eq!(app.selected_worktree_index, 2);
+        assert_eq!(app.workspaces[app.selected_worktree_index].name, "clean-c");
 
         server.await.unwrap();
     }
