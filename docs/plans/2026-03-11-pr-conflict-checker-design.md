@@ -39,32 +39,38 @@ New subcommand in `grove-cli`. Stateless, one-shot analysis — no daemon, no fi
 **Interface:**
 
 ```
-grove ci analyze [--base main] [--timeout 30] [--disable-layer dependency] --branches-from-stdin
-grove ci analyze [--base main] branch1 branch2 ... branchN
+grove ci analyze [--base main] [--timeout 30] [--disable-layer dependency] --refs-from-stdin
+grove ci analyze [--base main] ref1 ref2 ... refN
 ```
 
-`--branches-from-stdin` is the primary interface. The Action pipes branch names (one per line) to stdin. Positional branch args exist for local debugging.
+`--refs-from-stdin` is the primary interface. The Action pipes ref specs (one per line) to stdin. Each line is either:
+- A bare ref: `refs/remotes/origin/pr/42` — used as both the analysis identity and display label
+- A labeled ref: `refs/remotes/origin/pr/42=PR #42 (feature/auth)` — ref before `=` is the analysis identity, text after `=` is the display label in output
+
+Positional ref args exist for local debugging.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--base` | `main` | Base branch to compute merge bases against |
-| `--branches-from-stdin` | — | Read branch names from stdin, one per line |
+| `--refs-from-stdin` | — | Read ref specs from stdin, one per line |
 | `--timeout` | `30` | Per-pair analysis timeout in seconds |
 | `--disable-layer` | — | Repeatable. Disable a specific layer (e.g. `--disable-layer dependency`) |
 
 **Behavior:**
 
-1. Read branch list from stdin (or args)
-2. For each branch, compute merge base against `--base` (default: `main`)
-3. Extract changeset from git object store via ref-based diff (branch tip vs merge base)
+1. Read ref specs from stdin (or args), parsing optional `=label` suffix
+2. For each ref, compute merge base against `--base` (default: `main`)
+3. Extract changeset from git object store via ref-based diff (ref tip vs merge base)
 4. Build base import graph once (enumerate all source files in the base branch tree via `gix` tree walking, filter by language extensions, parse with tree-sitter, extract imports/exports)
 5. Build a `WorkspaceChangeset` per branch (changed files, hunks, symbols, export deltas)
 6. Run pairwise scoring via `scorer::score_pair` + `compute_dependency_overlaps` across all branch combinations (all 5 layers by default)
 7. Output full conflict matrix as JSON to stdout
 
-**Identity mapping:** The analysis pipeline uses `WorkspaceId` (UUID) internally. The CI command generates deterministic synthetic UUIDs from branch names (UUID v5, namespace = repo path). This keeps the `grove-lib` analysis types unchanged.
+**Identity model:** The canonical identity for each analysis unit is the **git ref**, not the branch name. Branch names are not unique across forks (two PRs can both be named `feature/auth`), but refs like `refs/remotes/origin/pr/42` are unique by construction. The analysis pipeline uses `WorkspaceId` (UUID) internally; the CI command generates deterministic synthetic UUIDs from the ref string (UUID v5, namespace = repo path). This keeps `grove-lib` types unchanged.
 
-**CI output DTOs:** The JSON output format differs structurally from the internal types (`WorkspacePairAnalysis`, `Overlap`). Internal types use PascalCase scores, UUIDs, and serde's default tagged enum serialization. The CI output uses lowercase scores, branch name strings, and flat `{"type": "...", ...}` objects. A dedicated set of CI output structs handles the translation — they are *not* the same types with custom serialization. The CI command converts `Vec<WorkspacePairAnalysis>` into the output DTOs, replacing UUIDs with branch names (including nested fields like `changed_in` in dependency overlaps) via a `HashMap<WorkspaceId, String>` built at startup.
+Display labels (human-readable names like `PR #42 (feature/auth)`) are provided separately via the `ref=label` input format and carried through to the output. If no label is provided, the ref string is used as the display label.
+
+**CI output DTOs:** The JSON output format differs structurally from the internal types (`WorkspacePairAnalysis`, `Overlap`). Internal types use PascalCase scores, UUIDs, and serde's default tagged enum serialization. The CI output uses lowercase scores, display labels, and flat `{"type": "...", ...}` objects. A dedicated set of CI output structs handles the translation — they are *not* the same types with custom serialization. The CI command converts `Vec<WorkspacePairAnalysis>` into the output DTOs, replacing UUIDs with display labels (including nested fields like `changed_in` in dependency overlaps) via a `HashMap<WorkspaceId, String>` built at startup.
 
 **Pairwise scaling:** For N branches, N*(N-1)/2 pairs are analyzed. The CLI itself does not cap branch count — it analyzes whatever it's given. The Action layer caps input at 50 branches by default (most recently updated first) via its `max-branches` input. This separation means the CLI is a correct tool for any input size, while the Action provides a sensible default for CI resource constraints.
 
@@ -73,11 +79,15 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
 ```json
 {
   "base": "main",
-  "branches": ["feature/auth", "fix/payment", "feature/onboard"],
+  "refs": [
+    {"ref": "refs/remotes/origin/pr/1", "label": "PR #1 (feature/auth)"},
+    {"ref": "refs/remotes/origin/pr/2", "label": "PR #2 (fix/payment)"},
+    {"ref": "refs/remotes/origin/pr/3", "label": "PR #3 (feature/onboard)"}
+  ],
   "pairs": [
     {
-      "a": "feature/auth",
-      "b": "fix/payment",
+      "a": "PR #1 (feature/auth)",
+      "b": "PR #2 (fix/payment)",
       "score": "red",
       "overlaps": [
         {
@@ -102,7 +112,7 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
         },
         {
           "type": "dependency",
-          "changed_in": "fix/payment",
+          "changed_in": "PR #2 (fix/payment)",
           "changed_file": "payment/checkout.ts",
           "changed_export": "processPayment (signature changed)",
           "affected_file": "onboard/payment-step.ts",
@@ -118,21 +128,21 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
       ]
     },
     {
-      "a": "feature/auth",
-      "b": "feature/onboard",
+      "a": "PR #1 (feature/auth)",
+      "b": "PR #3 (feature/onboard)",
       "score": "yellow",
       "overlaps": []
     },
     {
-      "a": "fix/payment",
-      "b": "feature/onboard",
+      "a": "PR #2 (fix/payment)",
+      "b": "PR #3 (feature/onboard)",
       "score": "black",
       "overlaps": []
     }
   ],
   "merge_order": {
     "status": "complete",
-    "sequenced": ["feature/onboard", "feature/auth", "fix/payment"],
+    "sequenced": ["PR #3 (feature/onboard)", "PR #1 (feature/auth)", "PR #2 (fix/payment)"],
     "independent": []
   },
   "skipped": []
@@ -162,9 +172,9 @@ Lives in the Grove repo (e.g. `action/` directory). Published for use as `uses: 
 1. Install Grove binary from GitHub Releases
 2. Checkout repo with full history (`fetch-depth: 0`)
 3. Query GitHub API for all open PRs targeting the same base branch
-4. **Fetch all PR head refs locally.** `grove ci analyze` can only diff refs that exist in the local checkout. The Action runs `git fetch origin <ref>` for each PR head ref (GitHub exposes PR heads as `refs/pull/<number>/head`). This ensures all branch tips are available as local refs before analysis.
-5. Pipe branch ref names to `grove ci analyze --branches-from-stdin`
-6. Parse JSON, find pairs involving the triggering PR
+4. **Fetch all PR head refs into stable local refs.** For each PR, run `git fetch origin refs/pull/<n>/head:refs/remotes/origin/pr/<n>`. This creates a stable local ref that `grove ci analyze` can diff against. A bare `git fetch origin <ref>` only updates `FETCH_HEAD` and would be overwritten by subsequent fetches.
+5. Pipe labeled ref specs to `grove ci analyze --refs-from-stdin`, one per line: `refs/remotes/origin/pr/<n>=PR #<n> (<branch_name>)`
+6. Parse JSON, find pairs involving the triggering PR's label
 7. Post/update a bot comment on the triggering PR:
    - Which other open PRs it conflicts with (with PR numbers, links, authors)
    - Conflict severity and overlap details
@@ -175,8 +185,8 @@ Lives in the Grove repo (e.g. `action/` directory). Published for use as `uses: 
 
 1. Same install + full checkout
 2. Query all open PRs targeting the base branch
-3. **Fetch all PR head refs** (same as PR-triggered step 4)
-4. Run full matrix via `grove ci analyze`
+3. **Fetch all PR head refs into stable local refs** (same as PR-triggered step 4)
+4. Pipe labeled ref specs and run full matrix via `grove ci analyze`
 5. Post/update a dedicated issue (identified by a `grove-ci-matrix` label) with the complete conflict matrix
 6. Optionally comment on individual PRs whose conflict status changed since last run
 
@@ -290,7 +300,7 @@ Existing behavior is preserved. No user-visible changes to worktree management, 
 - Create a temporary git repo with multiple branches programmatically
 - Run `grove ci analyze` against the branches
 - Assert JSON output contains correct scores and overlaps
-- Test `--branches-from-stdin` path
+- Test `--refs-from-stdin` path (bare refs and labeled `ref=label` format)
 - Test with branches that have no overlap (all green)
 - Test with branches that have dependency-level conflicts (black)
 
