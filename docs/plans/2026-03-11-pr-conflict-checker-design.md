@@ -8,7 +8,7 @@ This is an addition to Grove, not a replacement. Existing worktree, daemon, and 
 
 ## Architecture
 
-Two new components. One change to `grove-lib`.
+Two new components. Meaningful refactoring of `grove-lib` and `grove-daemon`.
 
 ```
 GitHub Action (JS/composite)            grove binary
@@ -22,14 +22,19 @@ GitHub Action (JS/composite)            grove binary
 │ Posts/updates PR comments    │                   │
 └──────────────────────────────┘                   ▼
                                         ┌──────────────────────────┐
-                                        │ grove-lib (minimal delta)│
-                                        │ + ref-based diff extract │
+                                        │ grove-lib (refactored)   │
+                                        │ + GitObjectFileSystem    │
+                                        │ + shared graph builder   │
+                                        │ + shared changeset build │
+                                        │ + CI output DTOs         │
                                         └──────────────────────────┘
 ```
 
 ### Component 1: `grove ci analyze` command
 
 New subcommand in `grove-cli`. Stateless, one-shot analysis — no daemon, no filesystem watching. Operates on the git repository in the current working directory.
+
+**Bootstrap bypass:** The `grove ci` subcommand must be handled *before* the bootstrap fallthrough in `grove-cli/src/lib.rs`. Currently, every non-exempt command triggers `bootstrap::bootstrap()` which creates `.grove/`, updates git exclude, and spawns the daemon. The CI command must be carved out at the same level as `Init` and `Daemon Start` — it operates directly on the repo with no side effects on the checkout.
 
 **Interface:**
 
@@ -53,11 +58,13 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
 2. For each branch, compute merge base against `--base` (default: `main`)
 3. Extract changeset from git object store via ref-based diff (branch tip vs merge base)
 4. Build base import graph once (enumerate all source files in the base branch tree via `gix` tree walking, filter by language extensions, parse with tree-sitter, extract imports/exports)
-5. Build a `GraphOverlay` per branch
-6. Run pairwise scoring across all branch combinations (all 5 layers by default)
+5. Build a `WorkspaceChangeset` per branch (changed files, hunks, symbols, export deltas)
+6. Run pairwise scoring via `scorer::score_pair` + `compute_dependency_overlaps` across all branch combinations (all 5 layers by default)
 7. Output full conflict matrix as JSON to stdout
 
-**Identity mapping:** The analysis pipeline uses `WorkspaceId` (UUID) internally. The CI command generates deterministic synthetic UUIDs from branch names (UUID v5, namespace = repo path). The JSON output maps back to branch name strings — UUIDs never leak into the output, including nested fields like `changed_in` inside dependency overlaps. The CI command builds a `HashMap<WorkspaceId, String>` (UUID -> branch name) at startup and uses it to translate all output. This keeps the `grove-lib` analysis types unchanged.
+**Identity mapping:** The analysis pipeline uses `WorkspaceId` (UUID) internally. The CI command generates deterministic synthetic UUIDs from branch names (UUID v5, namespace = repo path). This keeps the `grove-lib` analysis types unchanged.
+
+**CI output DTOs:** The JSON output format differs structurally from the internal types (`WorkspacePairAnalysis`, `Overlap`). Internal types use PascalCase scores, UUIDs, and serde's default tagged enum serialization. The CI output uses lowercase scores, branch name strings, and flat `{"type": "...", ...}` objects. A dedicated set of CI output structs handles the translation — they are *not* the same types with custom serialization. The CI command converts `Vec<WorkspacePairAnalysis>` into the output DTOs, replacing UUIDs with branch names (including nested fields like `changed_in` in dependency overlaps) via a `HashMap<WorkspaceId, String>` built at startup.
 
 **Pairwise scaling:** For N branches, N*(N-1)/2 pairs are analyzed. For large PR counts, this grows quadratically. v1 does not cap this — repos with 50+ open PRs against the same base branch are an edge case. If needed, a `--max-branches` flag can be added later.
 
@@ -226,12 +233,24 @@ This is the same logic the daemon performs on startup, extracted into a reusable
 
 **Required `gix` features:** `gix-object`, `gix-traverse`, `gix-diff` (for tree-to-tree diff). These are already transitively available through the existing `gix` dependency.
 
-**These are the only changes to `grove-lib`.**
+**Changeset extraction refactor:**
 
-## What stays unchanged
+The current `extract_changeset` in `grove-daemon/src/worker.rs:340` is tightly coupled to the daemon's context: it reads from the working tree via `std::fs::read`, uses `GitRepo` for blob access, and assumes a live worktree exists. For CI, changesets must be extracted purely from git objects (both old and new side from the object store, no disk reads).
 
-- `grove-lib` analysis pipeline (scorer, graph, overlays, languages)
-- `grove-daemon` (watcher, state actor, socket, db)
+The shared logic — computing hunks from old/new content, extracting modified symbols, computing export deltas — is pure and reusable. This needs to be extracted into `grove-lib` as a `FileSystem`-based changeset builder that both the daemon and CI command can call. The daemon's `extract_changeset` then becomes a thin wrapper that provides disk-based file reading, while the CI command provides `GitObjectFileSystem`.
+
+This is the largest refactoring task — it moves the core of `grove-daemon/src/worker.rs` (changeset extraction, base graph construction, symbol extraction, export delta computation) into `grove-lib` behind the `FileSystem` abstraction.
+
+## What stays unchanged (behavior)
+
+Existing behavior is preserved. No user-visible changes to worktree management, daemon, TUI, or CLI commands.
+
+**Internally refactored** (same behavior, new location):
+- `build_base_graph_from_workspace` moves from `grove-daemon/src/worker.rs` to `grove-lib` as a `FileSystem`-generic function. The daemon calls the new shared function.
+- `extract_changeset` core logic (hunk computation, symbol extraction, export deltas) moves to `grove-lib`. The daemon's version becomes a thin wrapper providing disk-based file access.
+
+**Unchanged:**
+- `grove-daemon` (watcher, state actor, socket, db) — behavior preserved, calls refactored functions
 - `grove-cli` existing commands (status, conflicts, create, retire, etc.)
 - `grove-tui` (terminal dashboard)
 - Worktree management functionality
