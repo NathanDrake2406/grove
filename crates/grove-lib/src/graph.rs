@@ -1,6 +1,8 @@
+use crate::fs::FileSystem;
+use crate::languages::LanguageRegistry;
 use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The canonical import graph for the base branch.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -61,6 +63,50 @@ impl ImportGraph {
             .map(|imports| imports.iter().map(|(path, _)| path).collect())
             .unwrap_or_default()
     }
+}
+
+pub fn build_import_graph_from_paths<F: FileSystem>(
+    file_system: &F,
+    registry: &LanguageRegistry,
+    file_paths: &[PathBuf],
+    max_file_size_bytes: u64,
+) -> ImportGraph {
+    let mut graph = ImportGraph::new();
+    let file_set: HashSet<PathBuf> = file_paths.iter().cloned().collect();
+
+    for file_path in file_paths {
+        let Some(analyzer) = registry.analyzer_for_file(file_path.as_path()) else {
+            continue;
+        };
+
+        let Ok(content) = file_system.read_file(file_path) else {
+            continue;
+        };
+        if content.len() as u64 > max_file_size_bytes {
+            continue;
+        }
+
+        let exports = analyzer
+            .extract_exports(content.as_ref())
+            .unwrap_or_default();
+        graph.set_exports(file_path.clone(), exports);
+
+        let imports = analyzer
+            .extract_imports(content.as_ref())
+            .unwrap_or_default();
+        for import in imports {
+            if let Some(target_path) = resolve_import_target(
+                file_path.as_path(),
+                &import.source,
+                &file_set,
+                analyzer.file_extensions(),
+            ) {
+                graph.add_import(file_path.clone(), target_path, import.symbols);
+            }
+        }
+    }
+
+    graph
 }
 
 /// Per-worktree overlay on the base graph.
@@ -216,9 +262,72 @@ fn collect_transitive_dependents(file: &Path, base_graph: &ImportGraph) -> Vec<P
     discovered
 }
 
+fn resolve_import_target(
+    importer: &Path,
+    source: &str,
+    file_set: &HashSet<PathBuf>,
+    importer_extensions: &[&str],
+) -> Option<PathBuf> {
+    if source.is_empty() {
+        return None;
+    }
+
+    if !source.starts_with("./") && !source.starts_with("../") {
+        return None;
+    }
+
+    let importer_dir = importer.parent().unwrap_or(Path::new(""));
+    let base_candidate = normalize_relative_path(importer_dir.join(source));
+
+    if file_set.contains(&base_candidate) {
+        return Some(base_candidate);
+    }
+
+    if base_candidate.extension().is_some() {
+        return None;
+    }
+
+    for ext in importer_extensions {
+        let with_extension = base_candidate.with_extension(ext);
+        if file_set.contains(&with_extension) {
+            return Some(with_extension);
+        }
+    }
+
+    for ext in importer_extensions {
+        let index_path = base_candidate.join(format!("index.{ext}"));
+        if file_set.contains(&index_path) {
+            return Some(index_path);
+        }
+    }
+
+    None
+}
+
+fn normalize_relative_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(part) => normalized.push(part),
+            Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+
+    normalized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fs::InMemoryFileSystem;
+    use crate::languages::LanguageRegistry;
     use uuid::Uuid;
 
     fn expect_dependency_overlap(overlap: &Overlap) -> (WorkspaceId, &PathBuf, &PathBuf) {
@@ -319,6 +428,58 @@ mod tests {
         assert_eq!(changed_in, a_id);
         assert_eq!(changed_file, &PathBuf::from("src/auth.ts"));
         assert_eq!(affected_file, &PathBuf::from("src/router.ts"));
+    }
+
+    #[test]
+    fn build_import_graph_from_paths_resolves_relative_imports() {
+        let mut fs = InMemoryFileSystem::new();
+        fs.add_file(
+            PathBuf::from("src/shared.ts"),
+            b"export function authenticate(token: string): boolean { return token.length > 0; }\n"
+                .to_vec(),
+        );
+        fs.add_file(
+            PathBuf::from("src/api.ts"),
+            b"import { authenticate } from \"./shared\";\nexport function checkout(token: string): boolean { return authenticate(token); }\n"
+                .to_vec(),
+        );
+
+        let registry = LanguageRegistry::with_defaults();
+        let graph = build_import_graph_from_paths(
+            &fs,
+            &registry,
+            &[PathBuf::from("src/shared.ts"), PathBuf::from("src/api.ts")],
+            1024 * 1024,
+        );
+
+        assert!(
+            graph
+                .get_dependents(&PathBuf::from("src/shared.ts"))
+                .contains(&&PathBuf::from("src/api.ts"))
+        );
+    }
+
+    #[test]
+    fn normalize_relative_path_collapses_parent_and_cur_components() {
+        let path = PathBuf::from("src/./api/../lib/../main.rs");
+        assert_eq!(normalize_relative_path(path), PathBuf::from("src/main.rs"));
+    }
+
+    #[test]
+    fn resolve_import_target_handles_relative_files_extensions_and_index_paths() {
+        let importer = Path::new("src/api/handler.ts");
+        let mut files = HashSet::new();
+        files.insert(PathBuf::from("src/shared/util.ts"));
+        files.insert(PathBuf::from("src/shared/index.ts"));
+
+        let ext_match = resolve_import_target(importer, "../shared/util", &files, &["ts"]);
+        assert_eq!(ext_match, Some(PathBuf::from("src/shared/util.ts")));
+
+        let index_match = resolve_import_target(importer, "../shared", &files, &["ts"]);
+        assert_eq!(index_match, Some(PathBuf::from("src/shared/index.ts")));
+
+        let non_relative = resolve_import_target(importer, "react", &files, &["ts"]);
+        assert_eq!(non_relative, None);
     }
 
     #[test]

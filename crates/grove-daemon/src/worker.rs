@@ -1,18 +1,18 @@
 use crate::state::{GroveConfig, StateMessage};
 use chrono::Utc;
 use grove_lib::changeset::{ContentChange, build_workspace_changeset};
-use grove_lib::graph::{ImportGraph, compute_dependency_overlaps};
+use grove_lib::fs::GitObjectFileSystem;
+use grove_lib::graph::{ImportGraph, build_import_graph_from_paths, compute_dependency_overlaps};
 use grove_lib::languages::LanguageRegistry;
 use grove_lib::scorer;
 use grove_lib::{ChangeType, Workspace, WorkspaceChangeset, WorkspacePairAnalysis};
-use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 pub enum WorkerMessage {
@@ -192,147 +192,44 @@ pub(crate) fn build_base_graph_from_workspace(
     config: &GroveConfig,
     workspace: &Workspace,
 ) -> Result<(ImportGraph, String), WorkerError> {
+    use crate::git::GitRepo;
+
     let base_ref = if workspace.base_ref.is_empty() {
         config.base_branch.as_str()
     } else {
         workspace.base_ref.as_str()
     };
 
-    let base_commit = git_output_line(
-        &workspace.path,
-        ["rev-parse", base_ref],
-        "rev-parse base ref",
-    )?;
-
-    let files_output = git_output(
-        &workspace.path,
-        ["ls-tree", "-r", "--name-only", base_ref],
-        "ls-tree base branch",
-    )?;
-
-    let file_paths: Vec<PathBuf> = files_output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
+    let git = GitRepo::open(&workspace.path)?;
+    let base_commit = git.resolve_oid(base_ref)?.to_hex().to_string();
+    let base_tree = git.resolve_tree(base_ref)?;
+    let records = base_tree
+        .traverse()
+        .breadthfirst
+        .files()
+        .map_err(|err| WorkerError::Gix {
+            context: "tree traversal",
+            repo_path: workspace.path.clone(),
+            detail: err.to_string(),
+        })?;
+    let file_paths: Vec<PathBuf> = records
+        .into_iter()
+        .filter(|entry| !entry.mode.is_tree())
+        .map(|entry| PathBuf::from(entry.filepath.to_string()))
         .collect();
-    let file_set: HashSet<PathBuf> = file_paths.iter().cloned().collect();
 
+    let file_system =
+        GitObjectFileSystem::open(&workspace.path, base_ref).map_err(|err| WorkerError::Gix {
+            context: "git object filesystem",
+            repo_path: workspace.path.clone(),
+            detail: err.to_string(),
+        })?;
     let registry = LanguageRegistry::with_defaults();
-    let mut graph = ImportGraph::new();
     let max_file_size_bytes = config.max_file_size_kb.saturating_mul(1024);
-
-    for file_path in file_paths {
-        let Some(analyzer) = registry.analyzer_for_file(file_path.as_path()) else {
-            continue;
-        };
-
-        let show_spec = format!("{base_ref}:{}", file_path.to_string_lossy());
-        let content = match git_output_bytes(
-            &workspace.path,
-            ["show", show_spec.as_str()],
-            "show base file",
-        ) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                debug!(
-                    path = %file_path.display(),
-                    error = %err,
-                    "skipping file while building base graph"
-                );
-                continue;
-            }
-        };
-
-        if content.len() as u64 > max_file_size_bytes {
-            debug!(
-                path = %file_path.display(),
-                size = content.len(),
-                max = max_file_size_bytes,
-                "skipping oversized file while building base graph"
-            );
-            continue;
-        }
-
-        let exports = analyzer.extract_exports(&content).unwrap_or_default();
-        graph.set_exports(file_path.clone(), exports);
-
-        let imports = analyzer.extract_imports(&content).unwrap_or_default();
-        for import in imports {
-            if let Some(target_path) = resolve_import_target(
-                file_path.as_path(),
-                &import.source,
-                &file_set,
-                analyzer.file_extensions(),
-            ) {
-                graph.add_import(file_path.clone(), target_path, import.symbols);
-            }
-        }
-    }
+    let graph =
+        build_import_graph_from_paths(&file_system, &registry, &file_paths, max_file_size_bytes);
 
     Ok((graph, base_commit))
-}
-
-fn resolve_import_target(
-    importer: &Path,
-    source: &str,
-    file_set: &HashSet<PathBuf>,
-    importer_extensions: &[&str],
-) -> Option<PathBuf> {
-    if source.is_empty() {
-        return None;
-    }
-
-    // Dependency overlap tracking is currently path-based; resolve local imports.
-    if !source.starts_with("./") && !source.starts_with("../") {
-        return None;
-    }
-
-    let importer_dir = importer.parent().unwrap_or(Path::new(""));
-    let base_candidate = normalize_relative_path(importer_dir.join(source));
-
-    if file_set.contains(&base_candidate) {
-        return Some(base_candidate);
-    }
-
-    if base_candidate.extension().is_some() {
-        return None;
-    }
-
-    for ext in importer_extensions {
-        let with_extension = base_candidate.with_extension(ext);
-        if file_set.contains(&with_extension) {
-            return Some(with_extension);
-        }
-    }
-
-    for ext in importer_extensions {
-        let index_path = base_candidate.join(format!("index.{ext}"));
-        if file_set.contains(&index_path) {
-            return Some(index_path);
-        }
-    }
-
-    None
-}
-
-fn normalize_relative_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-            Component::RootDir | Component::Prefix(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-
-    normalized
 }
 
 fn extract_changeset(
@@ -665,29 +562,6 @@ mod tests {
         assert_eq!(parse_left_right_counts("3"), None);
         assert_eq!(parse_left_right_counts("a b"), None);
         assert_eq!(parse_left_right_counts("3 b"), None);
-    }
-
-    #[test]
-    fn normalize_relative_path_collapses_parent_and_cur_components() {
-        let path = PathBuf::from("src/./api/../lib/../main.rs");
-        assert_eq!(normalize_relative_path(path), PathBuf::from("src/main.rs"));
-    }
-
-    #[test]
-    fn resolve_import_target_handles_relative_files_extensions_and_index_paths() {
-        let importer = Path::new("src/api/handler.ts");
-        let mut files = HashSet::new();
-        files.insert(PathBuf::from("src/shared/util.ts"));
-        files.insert(PathBuf::from("src/shared/index.ts"));
-
-        let ext_match = resolve_import_target(importer, "../shared/util", &files, &["ts"]);
-        assert_eq!(ext_match, Some(PathBuf::from("src/shared/util.ts")));
-
-        let index_match = resolve_import_target(importer, "../shared", &files, &["ts"]);
-        assert_eq!(index_match, Some(PathBuf::from("src/shared/index.ts")));
-
-        let non_relative = resolve_import_target(importer, "react", &files, &["ts"]);
-        assert_eq!(non_relative, None);
     }
 
     #[test]
