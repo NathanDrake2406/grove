@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use grove_lib::{ChangeType, Hunk};
+use grove_lib::ChangeType;
 
 use crate::worker::{DiffFileStatus, WorkerError};
 
@@ -264,60 +264,6 @@ fn workspace_from_repo(repo: &gix::Repository) -> Option<grove_lib::Workspace> {
         last_activity: chrono::Utc::now(),
         metadata: grove_lib::WorkspaceMetadata::default(),
     })
-}
-
-/// Compute unified diff hunks from old/new content using the `similar` crate.
-///
-/// Equivalent to `git diff --unified=0` but computed in-process from blob content
-/// we already have, eliminating the need for a subprocess call.
-pub(crate) fn compute_hunks_from_content(old: Option<&[u8]>, new: Option<&[u8]>) -> Vec<Hunk> {
-    let old_str = old.map(|b| String::from_utf8_lossy(b)).unwrap_or_default();
-    let new_str = new.map(|b| String::from_utf8_lossy(b)).unwrap_or_default();
-
-    let diff = similar::TextDiff::from_lines(old_str.as_ref(), new_str.as_ref());
-    // grouped_ops(0) gives us --unified=0 equivalent (no context lines)
-    let groups = diff.grouped_ops(0);
-
-    let mut hunks = Vec::new();
-    for group in groups {
-        let mut old_start = u32::MAX;
-        let mut old_end = 0u32;
-        let mut new_start = u32::MAX;
-        let mut new_end = 0u32;
-
-        for op in &group {
-            let os = op.old_range().start as u32;
-            let oe = op.old_range().end as u32;
-            let ns = op.new_range().start as u32;
-            let ne = op.new_range().end as u32;
-
-            // 0-indexed to 1-indexed
-            old_start = old_start.min(os + 1);
-            old_end = old_end.max(oe);
-            new_start = new_start.min(ns + 1);
-            new_end = new_end.max(ne);
-        }
-
-        let old_lines = old_end.saturating_sub(old_start.saturating_sub(1));
-        let new_lines = new_end.saturating_sub(new_start.saturating_sub(1));
-
-        // Fix start for pure insertions/deletions at line 0
-        if old_start == u32::MAX {
-            old_start = 0;
-        }
-        if new_start == u32::MAX {
-            new_start = 0;
-        }
-
-        hunks.push(Hunk {
-            old_start,
-            old_lines,
-            new_start,
-            new_lines,
-        });
-    }
-
-    hunks
 }
 
 #[cfg(test)]
