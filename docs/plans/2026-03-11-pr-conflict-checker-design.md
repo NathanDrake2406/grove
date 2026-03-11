@@ -66,7 +66,7 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
 
 **CI output DTOs:** The JSON output format differs structurally from the internal types (`WorkspacePairAnalysis`, `Overlap`). Internal types use PascalCase scores, UUIDs, and serde's default tagged enum serialization. The CI output uses lowercase scores, branch name strings, and flat `{"type": "...", ...}` objects. A dedicated set of CI output structs handles the translation — they are *not* the same types with custom serialization. The CI command converts `Vec<WorkspacePairAnalysis>` into the output DTOs, replacing UUIDs with branch names (including nested fields like `changed_in` in dependency overlaps) via a `HashMap<WorkspaceId, String>` built at startup.
 
-**Pairwise scaling:** For N branches, N*(N-1)/2 pairs are analyzed. For large PR counts, this grows quadratically. v1 does not cap this — repos with 50+ open PRs against the same base branch are an edge case. If needed, a `--max-branches` flag can be added later.
+**Pairwise scaling:** For N branches, N*(N-1)/2 pairs are analyzed. The CLI itself does not cap branch count — it analyzes whatever it's given. The Action layer caps input at 50 branches by default (most recently updated first) via its `max-branches` input. This separation means the CLI is a correct tool for any input size, while the Action provides a sensible default for CI resource constraints.
 
 **Output format (JSON):**
 
@@ -131,6 +131,7 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
     }
   ],
   "merge_order": {
+    "status": "complete",
     "sequenced": ["feature/onboard", "feature/auth", "fix/payment"],
     "independent": []
   },
@@ -139,6 +140,13 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
 ```
 
 Score values are lowercase strings: `"green"`, `"yellow"`, `"red"`, `"black"` (custom serde serialization). All five overlap types are represented. The `merge_order` object separates sequenced branches from independent ones. The `skipped` array lists branches that were skipped (nonexistent, already merged) with reasons.
+
+**Merge order and timeouts:** The `merge_order.status` field is one of:
+- `"complete"` — all pairs analyzed successfully, merge order is fully trusted
+- `"partial"` — one or more pairs timed out, merge order is computed from available data but may be wrong. The `merge_order.incomplete_pairs` array lists which pairs lacked data.
+- `"unavailable"` — too many pairs timed out to produce a meaningful order
+
+The merge order algorithm in `merge_order.rs` assumes complete pair data. An omitted pair becomes "no edge" in the graph, which silently collapses to "independent" — a false-safe. The `status` field prevents consumers from trusting a partial result without knowing it's partial. The Action should display a warning when merge order is partial.
 
 **Analysis depth:** All 5 layers (file, hunk, symbol, dependency, schema) enabled by default. The dependency layer is the most expensive (requires full base graph construction) but provides the highest-value signal. Layers can be disabled via `--disable-layer` for repos where the cost is prohibitive. No config file for v1.
 
@@ -215,10 +223,10 @@ struct GitObjectFileSystem {
 
 Key design decisions:
 
-- **Paths are repo-relative** throughout `grove-lib`. The `FileSystem` trait already works with repo-relative `Path` references. `GitObjectFileSystem` maps these to git tree entries naturally. The existing `MmapFileSystem` converts repo-relative paths to absolute internally.
+- **Paths are repo-relative** throughout `grove-lib`. The `FileSystem` trait already works with repo-relative `Path` references (confirmed in `InMemoryFileSystem` tests: `PathBuf::from("src/main.rs")`). `GitObjectFileSystem` maps these to git tree entries naturally. There is no `MmapFileSystem` or `DiskFileSystem` — the daemon currently reads files via `std::fs::read` and `GitRepo` directly, not through the `FileSystem` trait. No disk-backed `FileSystem` impl is added in this work.
 - **`list_dir` returns direct children** of a tree entry, matching the existing trait contract. Recursive file discovery for base graph construction is handled by the caller (tree walking via `gix::traverse::tree`), not by `list_dir`.
-- **`read_file` resolves a path** through the commit's tree object to a blob, returning its contents. Binary files and files exceeding `max_file_size_kb` return an error.
-- **Two instances per analysis**: one `GitObjectFileSystem` pinned to the base branch commit (for base graph construction), one per branch tip (for overlay computation). The analysis pipeline doesn't know the difference — it just calls `FileSystem` methods.
+- **`read_file` resolves a path** through the commit's tree object to a blob, returning its raw contents. Size filtering and binary detection remain the caller's responsibility (as they are today in `worker.rs:395`), not the `FileSystem` impl's.
+- **Two instances per analysis**: one `GitObjectFileSystem` pinned to the base branch commit (for base graph construction), one per branch tip (for changeset extraction). The daemon's `build_base_graph_from_workspace` already reads from git objects via subprocess (`git show base_ref:path`); the refactored version replaces that with `GitObjectFileSystem`, unifying both callers.
 
 **Base graph construction orchestration:**
 
@@ -235,11 +243,19 @@ This is the same logic the daemon performs on startup, extracted into a reusable
 
 **Changeset extraction refactor:**
 
-The current `extract_changeset` in `grove-daemon/src/worker.rs:340` is tightly coupled to the daemon's context: it reads from the working tree via `std::fs::read`, uses `GitRepo` for blob access, and assumes a live worktree exists. For CI, changesets must be extracted purely from git objects (both old and new side from the object store, no disk reads).
+The current `extract_changeset` in `grove-daemon/src/worker.rs:340` is tightly coupled to the daemon's context: it reads the NEW side from disk via `std::fs::read` (to capture uncommitted working tree changes), uses `GitRepo` for OLD-side blob access, and assumes a live worktree exists.
 
-The shared logic — computing hunks from old/new content, extracting modified symbols, computing export deltas — is pure and reusable. This needs to be extracted into `grove-lib` as a `FileSystem`-based changeset builder that both the daemon and CI command can call. The daemon's `extract_changeset` then becomes a thin wrapper that provides disk-based file reading, while the CI command provides `GitObjectFileSystem`.
+Two layers need separation:
 
-This is the largest refactoring task — it moves the core of `grove-daemon/src/worker.rs` (changeset extraction, base graph construction, symbol extraction, export delta computation) into `grove-lib` behind the `FileSystem` abstraction.
+1. **Pure content-to-changeset logic** (moves to `grove-lib`): Given a list of `(path, change_type, old_bytes, new_bytes)` tuples, compute hunks, extract modified symbols, compute export deltas, and produce a `WorkspaceChangeset`. This is pure — no I/O, no `FileSystem` needed. Both the daemon and CI command call this with different content sources.
+
+2. **Content sourcing** (stays in callers):
+   - **Daemon**: reads OLD side from git objects (via `GitRepo`/`gix`), NEW side from disk (`std::fs::read`) to capture uncommitted changes. This is daemon-specific behavior that CI doesn't need.
+   - **CI command**: reads both OLD and NEW sides from git objects via `GitObjectFileSystem`. No disk reads.
+
+The `FileSystem` trait is used for base graph construction (enumerating and reading files from a commit tree). It is *not* used for changeset extraction, which operates on raw byte pairs.
+
+This is the largest refactoring task — it moves the pure core of `grove-daemon/src/worker.rs` (hunk computation, symbol extraction, export delta computation) into `grove-lib` as content-in/changeset-out functions.
 
 ## What stays unchanged (behavior)
 
