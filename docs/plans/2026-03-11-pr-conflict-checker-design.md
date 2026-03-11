@@ -141,12 +141,13 @@ grove ci analyze [--base main] branch1 branch2 ... branchN
 
 Score values are lowercase strings: `"green"`, `"yellow"`, `"red"`, `"black"` (custom serde serialization). All five overlap types are represented. The `merge_order` object separates sequenced branches from independent ones. The `skipped` array lists branches that were skipped (nonexistent, already merged) with reasons.
 
-**Merge order and timeouts:** The `merge_order.status` field is one of:
-- `"complete"` — all pairs analyzed successfully, merge order is fully trusted
-- `"partial"` — one or more pairs timed out, merge order is computed from available data but may be wrong. The `merge_order.incomplete_pairs` array lists which pairs lacked data.
-- `"unavailable"` — too many pairs timed out to produce a meaningful order
+**Merge order trustworthiness:** The `merge_order.status` field is one of:
+- `"complete"` — all pairs analyzed successfully, no cycles detected. Merge order is fully trusted.
+- `"cycle"` — all pairs analyzed, but the dependency graph has a cycle (`MergeSequence.has_cycle == true`). The order is an arbitrary fallback, not a topological sort. The `merge_order.cycle_note` field explains this.
+- `"partial"` — one or more pairs timed out. Merge order is computed from available data but may be wrong — a missing pair silently becomes "no edge" (independent), which is a false-safe. The `merge_order.incomplete_pairs` array lists which pairs lacked data.
+- `"unavailable"` — too many pairs timed out to produce a meaningful order.
 
-The merge order algorithm in `merge_order.rs` assumes complete pair data. An omitted pair becomes "no edge" in the graph, which silently collapses to "independent" — a false-safe. The `status` field prevents consumers from trusting a partial result without knowing it's partial. The Action should display a warning when merge order is partial.
+The Action should display a warning for any status other than `"complete"` and must not present a partial or cycle-fallback order as reliable guidance.
 
 **Analysis depth:** All 5 layers (file, hunk, symbol, dependency, schema) enabled by default. The dependency layer is the most expensive (requires full base graph construction) but provides the highest-value signal. Layers can be disabled via `--disable-layer` for repos where the cost is prohibitive. No config file for v1.
 
@@ -226,7 +227,7 @@ Key design decisions:
 - **Paths are repo-relative** throughout `grove-lib`. The `FileSystem` trait already works with repo-relative `Path` references (confirmed in `InMemoryFileSystem` tests: `PathBuf::from("src/main.rs")`). `GitObjectFileSystem` maps these to git tree entries naturally. There is no `MmapFileSystem` or `DiskFileSystem` — the daemon currently reads files via `std::fs::read` and `GitRepo` directly, not through the `FileSystem` trait. No disk-backed `FileSystem` impl is added in this work.
 - **`list_dir` returns direct children** of a tree entry, matching the existing trait contract. Recursive file discovery for base graph construction is handled by the caller (tree walking via `gix::traverse::tree`), not by `list_dir`.
 - **`read_file` resolves a path** through the commit's tree object to a blob, returning its raw contents. Size filtering and binary detection remain the caller's responsibility (as they are today in `worker.rs:395`), not the `FileSystem` impl's.
-- **Two instances per analysis**: one `GitObjectFileSystem` pinned to the base branch commit (for base graph construction), one per branch tip (for changeset extraction). The daemon's `build_base_graph_from_workspace` already reads from git objects via subprocess (`git show base_ref:path`); the refactored version replaces that with `GitObjectFileSystem`, unifying both callers.
+- **One instance for base graph construction**: a `GitObjectFileSystem` pinned to the base branch commit. Used to enumerate and read files for building the `ImportGraph`. The daemon's `build_base_graph_from_workspace` already reads from git objects via subprocess (`git show base_ref:path`); the refactored version replaces that with `GitObjectFileSystem`, unifying both callers. `FileSystem` is **not** used for changeset extraction — that operates on raw byte pairs provided by the caller (see "Changeset extraction refactor" below).
 
 **Base graph construction orchestration:**
 
@@ -293,7 +294,9 @@ Existing behavior is preserved. No user-visible changes to worktree management, 
 
 **`GitObjectFileSystem` (unit tests in `grove-lib`):**
 - Read files from git objects, verify content matches
-- Handle missing files, binary files, files exceeding size limit
+- Return `FsError::NotFound` for missing paths
+- Return raw bytes without filtering (size/binary filtering is the caller's responsibility, matching the existing `FileSystem` trait contract)
+- `list_dir` returns direct children of a tree entry
 
 **GitHub Action (manual testing for v1):**
 - Test on a real repo with open PRs
