@@ -599,6 +599,28 @@ struct GitRepo {
     root: PathBuf,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum CiGitError {
+    #[error("failed to resolve revision `{spec}`: {detail}")]
+    ResolveRevision { spec: String, detail: String },
+    #[error("failed to find git object `{oid}`: {detail}")]
+    FindObject { oid: String, detail: String },
+    #[error("failed to peel `{target}` to a tree: {detail}")]
+    PeelToTree { target: String, detail: String },
+    #[error("failed to compute merge base for `{left}` and `{right}`: {detail}")]
+    MergeBase {
+        left: String,
+        right: String,
+        detail: String,
+    },
+    #[error("failed to diff trees `{old_tree}` and `{new_tree}`: {detail}")]
+    DiffTreeToTree {
+        old_tree: String,
+        new_tree: String,
+        detail: String,
+    },
+}
+
 impl GitRepo {
     fn open(path: &Path) -> Result<Self, CommandError> {
         let repo = gix::open(path).map_err(|error| {
@@ -627,22 +649,31 @@ impl GitRepo {
         Uuid::new_v5(&Uuid::NAMESPACE_URL, canonical.to_string_lossy().as_bytes())
     }
 
-    fn resolve_oid(&self, spec: &str) -> Result<gix::ObjectId, String> {
+    fn resolve_oid(&self, spec: &str) -> Result<gix::ObjectId, CiGitError> {
         self.repo
             .rev_parse_single(spec.as_bytes())
             .map(|id| id.detach())
-            .map_err(|error| error.to_string())
+            .map_err(|error| CiGitError::ResolveRevision {
+                spec: spec.to_string(),
+                detail: error.to_string(),
+            })
     }
 
-    fn tree_from_oid(&self, oid: gix::ObjectId) -> Result<gix::Tree<'_>, String> {
+    fn tree_from_oid(&self, oid: gix::ObjectId) -> Result<gix::Tree<'_>, CiGitError> {
         self.repo
             .find_object(oid)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| CiGitError::FindObject {
+                oid: oid.to_hex().to_string(),
+                detail: error.to_string(),
+            })?
             .peel_to_tree()
-            .map_err(|error| error.to_string())
+            .map_err(|error| CiGitError::PeelToTree {
+                target: oid.to_hex().to_string(),
+                detail: error.to_string(),
+            })
     }
 
-    fn resolve_tree(&self, revision: &str) -> Result<gix::Tree<'_>, String> {
+    fn resolve_tree(&self, revision: &str) -> Result<gix::Tree<'_>, CiGitError> {
         let oid = self.resolve_oid(revision)?;
         self.tree_from_oid(oid)
     }
@@ -651,11 +682,15 @@ impl GitRepo {
         &self,
         left: gix::ObjectId,
         right: gix::ObjectId,
-    ) -> Result<gix::ObjectId, String> {
+    ) -> Result<gix::ObjectId, CiGitError> {
         self.repo
             .merge_base(left, right)
             .map(|id| id.detach())
-            .map_err(|error| error.to_string())
+            .map_err(|error| CiGitError::MergeBase {
+                left: left.to_hex().to_string(),
+                right: right.to_hex().to_string(),
+                detail: error.to_string(),
+            })
     }
 
     fn read_blob(&self, tree: &mut gix::Tree<'_>, path: &Path) -> Option<Vec<u8>> {
@@ -668,11 +703,15 @@ impl GitRepo {
         &self,
         old_tree: &gix::Tree<'_>,
         new_tree: &gix::Tree<'_>,
-    ) -> Result<Vec<DiffFileStatus>, String> {
+    ) -> Result<Vec<DiffFileStatus>, CiGitError> {
         let changes = self
             .repo
             .diff_tree_to_tree(Some(old_tree), Some(new_tree), None)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| CiGitError::DiffTreeToTree {
+                old_tree: old_tree.id.to_hex().to_string(),
+                new_tree: new_tree.id.to_hex().to_string(),
+                detail: error.to_string(),
+            })?;
 
         let mut statuses = Vec::new();
         for change in changes {
