@@ -162,21 +162,23 @@ Lives in the Grove repo (e.g. `action/` directory). Published for use as `uses: 
 1. Install Grove binary from GitHub Releases
 2. Checkout repo with full history (`fetch-depth: 0`)
 3. Query GitHub API for all open PRs targeting the same base branch
-4. Pipe branch names to `grove ci analyze --branches-from-stdin`
-5. Parse JSON, find pairs involving the triggering PR
-6. Post/update a bot comment on the triggering PR:
+4. **Fetch all PR head refs locally.** `grove ci analyze` can only diff refs that exist in the local checkout. The Action runs `git fetch origin <ref>` for each PR head ref (GitHub exposes PR heads as `refs/pull/<number>/head`). This ensures all branch tips are available as local refs before analysis.
+5. Pipe branch ref names to `grove ci analyze --branches-from-stdin`
+6. Parse JSON, find pairs involving the triggering PR
+7. Post/update a bot comment on the triggering PR:
    - Which other open PRs it conflicts with (with PR numbers, links, authors)
    - Conflict severity and overlap details
-   - Suggested merge order
-7. If no conflicts: configurable — post "all clear" or stay silent
+   - Suggested merge order (with warning if status is not `complete`)
+8. If no conflicts: configurable — post "all clear" or stay silent
 
 #### Scheduled (on `schedule`, e.g. cron)
 
 1. Same install + full checkout
 2. Query all open PRs targeting the base branch
-3. Run full matrix via `grove ci analyze`
-4. Post/update a dedicated issue (identified by a `grove-ci-matrix` label) with the complete conflict matrix
-5. Optionally comment on individual PRs whose conflict status changed since last run
+3. **Fetch all PR head refs** (same as PR-triggered step 4)
+4. Run full matrix via `grove ci analyze`
+5. Post/update a dedicated issue (identified by a `grove-ci-matrix` label) with the complete conflict matrix
+6. Optionally comment on individual PRs whose conflict status changed since last run
 
 On first scheduled run, the Action creates the tracking issue. On subsequent runs, it finds and updates the existing issue by label.
 
@@ -291,6 +293,14 @@ Existing behavior is preserved. No user-visible changes to worktree management, 
 - Test `--branches-from-stdin` path
 - Test with branches that have no overlap (all green)
 - Test with branches that have dependency-level conflicts (black)
+
+**Merge order trust contract (integration tests):**
+- All pairs green → `merge_order.status` is `"complete"`, all branches independent
+- Normal ordering constraints → `merge_order.status` is `"complete"`, order respects hints
+- Cyclic dependency graph → `merge_order.status` is `"cycle"`, `cycle_note` present
+- One pair times out → `merge_order.status` is `"partial"`, `incomplete_pairs` lists the timed-out pair, order still computed from available data
+- All pairs time out → `merge_order.status` is `"unavailable"`
+- Action integration: verify the Action renders a warning for any non-`complete` status
 
 **`GitObjectFileSystem` (unit tests in `grove-lib`):**
 - Read files from git objects, verify content matches
