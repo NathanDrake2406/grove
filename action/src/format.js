@@ -49,6 +49,12 @@ export function formatPrComment(prNumber, prs, result) {
         `Analyzed against ${relevantPairs.length} open ${relevantPairs.length === 1 ? "PR" : "PRs"} — all clear.`,
       );
     }
+
+    // Show merge order warnings even for clean PRs
+    if (result.merge_order && result.merge_order.status !== "complete") {
+      lines.push(...formatMergeOrder(result.merge_order));
+    }
+
     return { body: lines.join("\n"), hasConflicts: false };
   }
 
