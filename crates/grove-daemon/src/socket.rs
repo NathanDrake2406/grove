@@ -1,3 +1,4 @@
+// Unix socket communication
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
