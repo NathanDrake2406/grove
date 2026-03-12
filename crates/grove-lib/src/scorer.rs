@@ -1,3 +1,4 @@
+// cross-module analysis
 use crate::diff::{compute_file_overlaps, compute_hunk_overlaps};
 use crate::schema::compute_schema_overlaps;
 use crate::types::*;
