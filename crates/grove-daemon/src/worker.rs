@@ -1,20 +1,18 @@
 use crate::state::{GroveConfig, StateMessage};
 use chrono::Utc;
-use grove_lib::graph::{ImportGraph, compute_dependency_overlaps};
+use grove_lib::changeset::{ContentChange, build_workspace_changeset};
+use grove_lib::fs::GitObjectFileSystem;
+use grove_lib::graph::{ImportGraph, build_import_graph_from_paths, compute_dependency_overlaps};
 use grove_lib::languages::LanguageRegistry;
 use grove_lib::scorer;
-use grove_lib::{
-    ChangeType, ExportDelta, ExportedSymbol, FileChange, Hunk, LineRange, Signature, Symbol,
-    Workspace, WorkspaceChangeset, WorkspacePairAnalysis,
-};
-use std::collections::{BTreeMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use grove_lib::{ChangeType, Workspace, WorkspaceChangeset, WorkspacePairAnalysis};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, timeout};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 pub enum WorkerMessage {
@@ -194,147 +192,44 @@ pub(crate) fn build_base_graph_from_workspace(
     config: &GroveConfig,
     workspace: &Workspace,
 ) -> Result<(ImportGraph, String), WorkerError> {
+    use crate::git::GitRepo;
+
     let base_ref = if workspace.base_ref.is_empty() {
         config.base_branch.as_str()
     } else {
         workspace.base_ref.as_str()
     };
 
-    let base_commit = git_output_line(
-        &workspace.path,
-        ["rev-parse", base_ref],
-        "rev-parse base ref",
-    )?;
-
-    let files_output = git_output(
-        &workspace.path,
-        ["ls-tree", "-r", "--name-only", base_ref],
-        "ls-tree base branch",
-    )?;
-
-    let file_paths: Vec<PathBuf> = files_output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(PathBuf::from)
+    let git = GitRepo::open(&workspace.path)?;
+    let base_commit = git.resolve_oid(base_ref)?.to_hex().to_string();
+    let base_tree = git.resolve_tree(base_ref)?;
+    let records = base_tree
+        .traverse()
+        .breadthfirst
+        .files()
+        .map_err(|err| WorkerError::Gix {
+            context: "tree traversal",
+            repo_path: workspace.path.clone(),
+            detail: err.to_string(),
+        })?;
+    let file_paths: Vec<PathBuf> = records
+        .into_iter()
+        .filter(|entry| !entry.mode.is_tree())
+        .map(|entry| PathBuf::from(entry.filepath.to_string()))
         .collect();
-    let file_set: HashSet<PathBuf> = file_paths.iter().cloned().collect();
 
+    let file_system =
+        GitObjectFileSystem::open(&workspace.path, base_ref).map_err(|err| WorkerError::Gix {
+            context: "git object filesystem",
+            repo_path: workspace.path.clone(),
+            detail: err.to_string(),
+        })?;
     let registry = LanguageRegistry::with_defaults();
-    let mut graph = ImportGraph::new();
     let max_file_size_bytes = config.max_file_size_kb.saturating_mul(1024);
-
-    for file_path in file_paths {
-        let Some(analyzer) = registry.analyzer_for_file(file_path.as_path()) else {
-            continue;
-        };
-
-        let show_spec = format!("{base_ref}:{}", file_path.to_string_lossy());
-        let content = match git_output_bytes(
-            &workspace.path,
-            ["show", show_spec.as_str()],
-            "show base file",
-        ) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                debug!(
-                    path = %file_path.display(),
-                    error = %err,
-                    "skipping file while building base graph"
-                );
-                continue;
-            }
-        };
-
-        if content.len() as u64 > max_file_size_bytes {
-            debug!(
-                path = %file_path.display(),
-                size = content.len(),
-                max = max_file_size_bytes,
-                "skipping oversized file while building base graph"
-            );
-            continue;
-        }
-
-        let exports = analyzer.extract_exports(&content).unwrap_or_default();
-        graph.set_exports(file_path.clone(), exports);
-
-        let imports = analyzer.extract_imports(&content).unwrap_or_default();
-        for import in imports {
-            if let Some(target_path) = resolve_import_target(
-                file_path.as_path(),
-                &import.source,
-                &file_set,
-                analyzer.file_extensions(),
-            ) {
-                graph.add_import(file_path.clone(), target_path, import.symbols);
-            }
-        }
-    }
+    let graph =
+        build_import_graph_from_paths(&file_system, &registry, &file_paths, max_file_size_bytes);
 
     Ok((graph, base_commit))
-}
-
-fn resolve_import_target(
-    importer: &Path,
-    source: &str,
-    file_set: &HashSet<PathBuf>,
-    importer_extensions: &[&str],
-) -> Option<PathBuf> {
-    if source.is_empty() {
-        return None;
-    }
-
-    // Dependency overlap tracking is currently path-based; resolve local imports.
-    if !source.starts_with("./") && !source.starts_with("../") {
-        return None;
-    }
-
-    let importer_dir = importer.parent().unwrap_or(Path::new(""));
-    let base_candidate = normalize_relative_path(importer_dir.join(source));
-
-    if file_set.contains(&base_candidate) {
-        return Some(base_candidate);
-    }
-
-    if base_candidate.extension().is_some() {
-        return None;
-    }
-
-    for ext in importer_extensions {
-        let with_extension = base_candidate.with_extension(ext);
-        if file_set.contains(&with_extension) {
-            return Some(with_extension);
-        }
-    }
-
-    for ext in importer_extensions {
-        let index_path = base_candidate.join(format!("index.{ext}"));
-        if file_set.contains(&index_path) {
-            return Some(index_path);
-        }
-    }
-
-    None
-}
-
-fn normalize_relative_path(path: PathBuf) -> PathBuf {
-    let mut normalized = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-            Component::RootDir | Component::Prefix(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-
-    normalized
 }
 
 fn extract_changeset(
@@ -342,7 +237,7 @@ fn extract_changeset(
     registry: &LanguageRegistry,
     workspace: &Workspace,
 ) -> Result<WorkspaceChangeset, WorkerError> {
-    use crate::git::{GitRepo, compute_hunks_from_content};
+    use crate::git::GitRepo;
 
     let base_ref = if workspace.base_ref.is_empty() {
         config.base_branch.as_str()
@@ -391,7 +286,7 @@ fn extract_changeset(
     let mut base_tree_mut = git.resolve_tree(&merge_base)?;
     let mut head_tree_mut = git.resolve_tree("HEAD")?;
 
-    let mut files = Vec::new();
+    let mut changes = Vec::new();
     let max_file_size_bytes = config.max_file_size_kb * 1024;
 
     for status in statuses {
@@ -418,48 +313,24 @@ fn extract_changeset(
             }
         };
 
-        // Phase 2C: compute hunks in-process from content (was git diff --unified=0 subprocess)
-        let hunks = compute_hunks_from_content(old_content.as_deref(), new_content.as_deref());
-
-        let symbols_modified = extract_modified_symbols(
-            registry,
-            new_path,
-            new_content.as_deref(),
-            &hunks,
-            status.change_type,
-            max_file_size_bytes,
-        );
-
-        let old_exports = extract_exports(
-            registry,
-            old_path,
-            old_content.as_deref(),
-            max_file_size_bytes,
-        );
-        let new_exports = extract_exports(
-            registry,
-            new_path,
-            new_content.as_deref(),
-            max_file_size_bytes,
-        );
-        let exports_changed = compute_export_deltas(&old_exports, &new_exports);
-
-        files.push(FileChange {
+        changes.push(ContentChange {
             path: status.path,
+            old_path: status.old_path,
             change_type: status.change_type,
-            hunks,
-            symbols_modified,
-            exports_changed,
+            old_content,
+            new_content,
         });
     }
 
-    Ok(WorkspaceChangeset {
-        workspace_id: workspace.id,
+    Ok(build_workspace_changeset(
+        registry,
+        workspace.id,
         merge_base,
-        changed_files: files,
-        commits_ahead: ahead_behind.1,
-        commits_behind: ahead_behind.0,
-    })
+        ahead_behind.1,
+        ahead_behind.0,
+        changes,
+        max_file_size_bytes,
+    ))
 }
 
 fn parse_left_right_counts(value: &str) -> Option<(u32, u32)> {
@@ -474,147 +345,6 @@ pub(crate) struct DiffFileStatus {
     pub(crate) path: PathBuf,
     pub(crate) old_path: Option<PathBuf>,
     pub(crate) change_type: ChangeType,
-}
-
-fn extract_modified_symbols(
-    registry: &LanguageRegistry,
-    path: &Path,
-    content: Option<&[u8]>,
-    hunks: &[Hunk],
-    change_type: ChangeType,
-    max_file_size_bytes: u64,
-) -> Vec<Symbol> {
-    let Some(bytes) = content else {
-        return Vec::new();
-    };
-
-    if bytes.len() as u64 > max_file_size_bytes {
-        debug!(
-            path = %path.display(),
-            size = bytes.len(),
-            max = max_file_size_bytes,
-            "skipping symbol extraction for large file"
-        );
-        return Vec::new();
-    }
-
-    let Some(analyzer) = registry.analyzer_for_file(path) else {
-        return Vec::new();
-    };
-
-    let symbols = match analyzer.extract_symbols(bytes) {
-        Ok(symbols) => symbols,
-        Err(e) => {
-            debug!(path = %path.display(), error = %e, "symbol extraction failed");
-            return Vec::new();
-        }
-    };
-
-    match change_type {
-        ChangeType::Added => symbols,
-        ChangeType::Deleted => Vec::new(),
-        ChangeType::Modified | ChangeType::Renamed => {
-            if hunks.is_empty() {
-                return Vec::new();
-            }
-
-            symbols
-                .into_iter()
-                .filter(|symbol| symbol_in_hunks(symbol, hunks))
-                .collect()
-        }
-    }
-}
-
-fn symbol_in_hunks(symbol: &Symbol, hunks: &[Hunk]) -> bool {
-    hunks.iter().any(|hunk| {
-        let start = hunk.new_start;
-        let end = if hunk.new_lines == 0 {
-            hunk.new_start
-        } else {
-            hunk.new_start + hunk.new_lines.saturating_sub(1)
-        };
-        symbol.range.overlaps(&LineRange { start, end })
-    })
-}
-
-fn extract_exports(
-    registry: &LanguageRegistry,
-    path: &Path,
-    content: Option<&[u8]>,
-    max_file_size_bytes: u64,
-) -> Vec<ExportedSymbol> {
-    let Some(bytes) = content else {
-        return Vec::new();
-    };
-
-    if bytes.len() as u64 > max_file_size_bytes {
-        return Vec::new();
-    }
-
-    let Some(analyzer) = registry.analyzer_for_file(path) else {
-        return Vec::new();
-    };
-
-    analyzer.extract_exports(bytes).unwrap_or_default()
-}
-
-fn compute_export_deltas(
-    old_exports: &[ExportedSymbol],
-    new_exports: &[ExportedSymbol],
-) -> Vec<ExportDelta> {
-    let old_by_name: BTreeMap<&str, &ExportedSymbol> = old_exports
-        .iter()
-        .map(|exported| (exported.name.as_str(), exported))
-        .collect();
-    let new_by_name: BTreeMap<&str, &ExportedSymbol> = new_exports
-        .iter()
-        .map(|exported| (exported.name.as_str(), exported))
-        .collect();
-
-    let mut deltas = Vec::new();
-
-    for (name, new_symbol) in &new_by_name {
-        if let Some(old_symbol) = old_by_name.get(name) {
-            if old_symbol.signature != new_symbol.signature || old_symbol.kind != new_symbol.kind {
-                deltas.push(ExportDelta::SignatureChanged {
-                    symbol_name: (*name).to_string(),
-                    old: Signature {
-                        text: signature_text(old_symbol),
-                    },
-                    new: Signature {
-                        text: signature_text(new_symbol),
-                    },
-                });
-            }
-        } else {
-            deltas.push(ExportDelta::Added(exported_to_symbol(new_symbol)));
-        }
-    }
-
-    for (name, old_symbol) in &old_by_name {
-        if !new_by_name.contains_key(name) {
-            deltas.push(ExportDelta::Removed(exported_to_symbol(old_symbol)));
-        }
-    }
-
-    deltas
-}
-
-fn signature_text(exported: &ExportedSymbol) -> String {
-    exported
-        .signature
-        .clone()
-        .unwrap_or_else(|| format!("{:?}:{}", exported.kind, exported.name))
-}
-
-fn exported_to_symbol(exported: &ExportedSymbol) -> Symbol {
-    Symbol {
-        name: exported.name.clone(),
-        kind: exported.kind,
-        range: LineRange { start: 0, end: 0 },
-        signature: exported.signature.clone(),
-    }
 }
 
 pub(crate) fn git_output_line<const N: usize>(
@@ -728,7 +458,7 @@ pub(crate) fn canonical_pair(
 mod tests {
     use super::*;
     use chrono::Utc;
-    use grove_lib::{MergeOrder, OrthogonalityScore, SymbolKind, WorkspaceMetadata};
+    use grove_lib::{MergeOrder, OrthogonalityScore, WorkspaceMetadata};
     use tempfile::tempdir;
     use uuid::Uuid;
 
@@ -832,190 +562,6 @@ mod tests {
         assert_eq!(parse_left_right_counts("3"), None);
         assert_eq!(parse_left_right_counts("a b"), None);
         assert_eq!(parse_left_right_counts("3 b"), None);
-    }
-
-    #[test]
-    fn normalize_relative_path_collapses_parent_and_cur_components() {
-        let path = PathBuf::from("src/./api/../lib/../main.rs");
-        assert_eq!(normalize_relative_path(path), PathBuf::from("src/main.rs"));
-    }
-
-    #[test]
-    fn resolve_import_target_handles_relative_files_extensions_and_index_paths() {
-        let importer = Path::new("src/api/handler.ts");
-        let mut files = HashSet::new();
-        files.insert(PathBuf::from("src/shared/util.ts"));
-        files.insert(PathBuf::from("src/shared/index.ts"));
-
-        let ext_match = resolve_import_target(importer, "../shared/util", &files, &["ts"]);
-        assert_eq!(ext_match, Some(PathBuf::from("src/shared/util.ts")));
-
-        let index_match = resolve_import_target(importer, "../shared", &files, &["ts"]);
-        assert_eq!(index_match, Some(PathBuf::from("src/shared/index.ts")));
-
-        let non_relative = resolve_import_target(importer, "react", &files, &["ts"]);
-        assert_eq!(non_relative, None);
-    }
-
-    #[test]
-    fn symbol_in_hunks_detects_overlap_and_respects_zero_length_hunks() {
-        let symbol = Symbol {
-            name: "handler".to_string(),
-            kind: SymbolKind::Function,
-            range: LineRange { start: 10, end: 14 },
-            signature: None,
-        };
-        let overlaps = symbol_in_hunks(
-            &symbol,
-            &[Hunk {
-                old_start: 0,
-                old_lines: 0,
-                new_start: 12,
-                new_lines: 2,
-            }],
-        );
-        assert!(overlaps);
-
-        let no_overlap = symbol_in_hunks(
-            &symbol,
-            &[Hunk {
-                old_start: 0,
-                old_lines: 0,
-                new_start: 25,
-                new_lines: 0,
-            }],
-        );
-        assert!(!no_overlap);
-    }
-
-    #[test]
-    fn compute_export_deltas_reports_added_removed_and_signature_changes() {
-        let old_exports = vec![
-            ExportedSymbol {
-                name: "keep".to_string(),
-                kind: SymbolKind::Function,
-                signature: Some("fn keep()".to_string()),
-            },
-            ExportedSymbol {
-                name: "remove_me".to_string(),
-                kind: SymbolKind::Function,
-                signature: Some("fn remove_me()".to_string()),
-            },
-        ];
-        let new_exports = vec![
-            ExportedSymbol {
-                name: "keep".to_string(),
-                kind: SymbolKind::Function,
-                signature: Some("fn keep(v: i32)".to_string()),
-            },
-            ExportedSymbol {
-                name: "add_me".to_string(),
-                kind: SymbolKind::Function,
-                signature: Some("fn add_me()".to_string()),
-            },
-        ];
-
-        let deltas = compute_export_deltas(&old_exports, &new_exports);
-        assert!(
-            deltas
-                .iter()
-                .any(|d| matches!(d, ExportDelta::Added(sym) if sym.name == "add_me"))
-        );
-        assert!(
-            deltas
-                .iter()
-                .any(|d| matches!(d, ExportDelta::Removed(sym) if sym.name == "remove_me"))
-        );
-        assert!(
-            deltas
-                .iter()
-                .any(|d| matches!(d, ExportDelta::SignatureChanged { symbol_name, .. } if symbol_name == "keep"))
-        );
-    }
-
-    #[test]
-    fn signature_text_falls_back_when_signature_is_missing() {
-        let exported = ExportedSymbol {
-            name: "Count".to_string(),
-            kind: SymbolKind::Struct,
-            signature: None,
-        };
-        let text = signature_text(&exported);
-        assert!(text.contains("Struct"));
-        assert!(text.contains("Count"));
-    }
-
-    #[test]
-    fn extract_modified_symbols_handles_added_deleted_and_modified_cases() {
-        let registry = LanguageRegistry::with_defaults();
-        let content = br#"fn alpha() {}
-fn beta() {}
-"#;
-
-        let added = extract_modified_symbols(
-            &registry,
-            Path::new("src/lib.rs"),
-            Some(content),
-            &[],
-            ChangeType::Added,
-            1024 * 1024,
-        );
-        assert!(!added.is_empty());
-
-        let deleted = extract_modified_symbols(
-            &registry,
-            Path::new("src/lib.rs"),
-            Some(content),
-            &[],
-            ChangeType::Deleted,
-            1024 * 1024,
-        );
-        assert!(deleted.is_empty());
-
-        let modified_without_hunks = extract_modified_symbols(
-            &registry,
-            Path::new("src/lib.rs"),
-            Some(content),
-            &[],
-            ChangeType::Modified,
-            1024 * 1024,
-        );
-        assert!(modified_without_hunks.is_empty());
-
-        let modified_with_hunk = extract_modified_symbols(
-            &registry,
-            Path::new("src/lib.rs"),
-            Some(content),
-            &[Hunk {
-                old_start: 1,
-                old_lines: 1,
-                new_start: 1,
-                new_lines: 1,
-            }],
-            ChangeType::Modified,
-            1024 * 1024,
-        );
-        assert!(!modified_with_hunk.is_empty());
-    }
-
-    #[test]
-    fn extract_exports_returns_empty_for_unknown_or_oversized_files() {
-        let registry = LanguageRegistry::with_defaults();
-        let unknown = extract_exports(
-            &registry,
-            Path::new("assets/data.bin"),
-            Some(b"binary"),
-            1024,
-        );
-        assert!(unknown.is_empty());
-
-        let oversized = extract_exports(
-            &registry,
-            Path::new("src/lib.rs"),
-            Some(b"fn tiny() {}\n"),
-            1,
-        );
-        assert!(oversized.is_empty());
     }
 
     #[test]

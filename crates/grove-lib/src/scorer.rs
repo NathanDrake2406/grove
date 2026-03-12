@@ -64,8 +64,21 @@ pub fn score_pair(
     // Layer 5: Dependency overlap (computed externally, passed in)
     all_overlaps.extend(dependency_overlaps);
 
+    build_pair_analysis(a, b, all_overlaps, last_computed)
+}
+
+/// Build a pair analysis from a caller-provided overlap set.
+///
+/// This keeps score and merge-order policy centralized even when callers
+/// selectively disable analysis layers before combining overlaps.
+pub fn build_pair_analysis(
+    a: &WorkspaceChangeset,
+    b: &WorkspaceChangeset,
+    overlaps: Vec<Overlap>,
+    last_computed: DateTime<Utc>,
+) -> WorkspacePairAnalysis {
     // Score = max severity across all overlaps
-    let score = all_overlaps
+    let score = overlaps
         .iter()
         .map(|o| o.severity())
         .max()
@@ -84,7 +97,7 @@ pub fn score_pair(
         workspace_a: a.workspace_id,
         workspace_b: b.workspace_id,
         score,
-        overlaps: all_overlaps,
+        overlaps,
         merge_order_hint,
         last_computed,
     }
@@ -406,6 +419,14 @@ mod tests {
         super::score_pair(a, b, dependency_overlaps, deterministic_timestamp())
     }
 
+    fn build_pair_analysis(
+        a: &WorkspaceChangeset,
+        b: &WorkspaceChangeset,
+        overlaps: Vec<Overlap>,
+    ) -> WorkspacePairAnalysis {
+        super::build_pair_analysis(a, b, overlaps, deterministic_timestamp())
+    }
+
     fn make_changeset_with_id(id: Uuid, files: Vec<FileChange>) -> WorkspaceChangeset {
         WorkspaceChangeset {
             workspace_id: id,
@@ -445,6 +466,44 @@ mod tests {
             symbols_modified,
             exports_changed: vec![],
         }
+    }
+
+    #[test]
+    fn build_pair_analysis_matches_score_pair_policy() {
+        let a = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![make_file(
+                "src/shared.ts",
+                vec![Hunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                }],
+                vec![],
+            )],
+        );
+        let b = make_changeset_with_id(
+            Uuid::new_v4(),
+            vec![make_file(
+                "src/shared.ts",
+                vec![Hunk {
+                    old_start: 2,
+                    old_lines: 1,
+                    new_start: 2,
+                    new_lines: 1,
+                }],
+                vec![],
+            )],
+        );
+
+        let via_score_pair = score_pair(&a, &b, vec![]);
+        let overlaps = via_score_pair.overlaps.clone();
+        let rebuilt = build_pair_analysis(&a, &b, overlaps);
+
+        assert_eq!(rebuilt.score, via_score_pair.score);
+        assert_eq!(rebuilt.merge_order_hint, via_score_pair.merge_order_hint);
+        assert_eq!(rebuilt.overlaps.len(), via_score_pair.overlaps.len());
     }
 
     fn low_noise_case_violations(

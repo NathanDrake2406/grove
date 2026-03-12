@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "grove"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "clap",
@@ -1658,8 +1658,9 @@ dependencies = [
 
 [[package]]
 name = "grove-cli"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
+ "chrono",
  "clap",
  "colored",
  "crossterm",
@@ -1672,11 +1673,12 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]
 name = "grove-daemon"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "futures",
@@ -1700,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "grove-lib"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -1711,6 +1713,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "tempfile",
  "thiserror",
  "tree-sitter",
  "tree-sitter-c-sharp",

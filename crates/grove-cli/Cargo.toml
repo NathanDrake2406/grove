@@ -15,6 +15,8 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 gix = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

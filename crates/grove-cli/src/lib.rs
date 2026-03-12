@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::client::DaemonClient;
+use crate::commands::ci::CiAction;
 
 // === CLI Argument Parsing ===
 
@@ -52,6 +53,12 @@ pub enum Commands {
         action: DaemonAction,
     },
 
+    /// Stateless CI analysis commands
+    Ci {
+        #[command(subcommand)]
+        action: CiAction,
+    },
+
     /// Generate shell integration (eval "$(grove init zsh)")
     Init {
         /// Shell type: zsh, bash, or fish
@@ -83,6 +90,12 @@ pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Erro
             action: DaemonAction::Start,
         }) => {
             handle_daemon_start();
+            std::process::exit(0);
+        }
+        Some(Commands::Ci {
+            action: CiAction::Analyze(analyze_args),
+        }) => {
+            commands::ci::execute(analyze_args).await?;
             std::process::exit(0);
         }
         _ => {}
@@ -135,7 +148,7 @@ pub async fn run(args: CliArgs) -> Result<DaemonClient, Box<dyn std::error::Erro
             commands::conflicts::execute(&client, &a, &b, args.json).await?;
         }
         // Already handled above; included for exhaustive matching.
-        Some(Commands::Daemon { .. }) | Some(Commands::Init { .. }) => {
+        Some(Commands::Daemon { .. }) | Some(Commands::Ci { .. }) | Some(Commands::Init { .. }) => {
             unreachable!("handled above");
         }
     }
