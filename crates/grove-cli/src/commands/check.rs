@@ -1,3 +1,4 @@
+// CI analysis command
 use crate::client::DaemonClient;
 use crate::commands::CommandError;
 use std::collections::HashMap;
