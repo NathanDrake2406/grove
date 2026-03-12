@@ -3,7 +3,7 @@ use crate::schema::compute_schema_overlaps;
 use crate::types::*;
 use chrono::{DateTime, Utc};
 
-const HUNK_PROXIMITY_THRESHOLD: u32 = 5;
+const HUNK_PROXIMITY_THRESHOLD: u32 = 3;
 
 /// Compute symbol overlaps by comparing symbols_modified in files touched by both.
 ///
