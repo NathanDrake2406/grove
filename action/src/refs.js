@@ -1,17 +1,20 @@
 import * as core from "@actions/core";
 import * as exec from "@actions/exec";
+import { withRetry } from "./retry.js";
 
 export async function fetchPrRefs(octokit, repo, baseBranch, maxBranches) {
   core.info(`Listing open PRs targeting '${baseBranch}'`);
 
-  const prs = await octokit.paginate(octokit.rest.pulls.list, {
-    ...repo,
-    base: baseBranch,
-    state: "open",
-    sort: "updated",
-    direction: "desc",
-    per_page: 100,
-  });
+  const prs = await withRetry(() =>
+    octokit.paginate(octokit.rest.pulls.list, {
+      ...repo,
+      base: baseBranch,
+      state: "open",
+      sort: "updated",
+      direction: "desc",
+      per_page: 100,
+    }),
+  );
 
   const selected = prs.slice(0, maxBranches);
   core.info(`Found ${prs.length} open PRs, analyzing ${selected.length}`);

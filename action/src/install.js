@@ -3,6 +3,7 @@ import * as tc from "@actions/tool-cache";
 import * as http from "@actions/http-client";
 import path from "path";
 import fs from "fs";
+import { withRetry } from "./retry.js";
 
 const REPO_OWNER = "NathanDrake2406";
 const REPO_NAME = "grove";
@@ -41,7 +42,7 @@ async function resolveVersion(version) {
 
   const client = new http.HttpClient("grove-action");
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`;
-  const response = await client.getJson(url);
+  const response = await withRetry(() => client.getJson(url));
 
   if (response.statusCode !== 200 || !response.result?.tag_name) {
     throw new Error(`Failed to resolve latest grove version (status ${response.statusCode})`);
