@@ -39704,7 +39704,6 @@ async function runAnalysis(grovePath, inputs, refSpecs) {
 
   const stdin = refSpecs.join("\n") + "\n";
   let stdout = "";
-  let stderr = "";
 
   info(`Running: ${grovePath} ${args.join(" ")}`);
   info(`Stdin refs:\n${stdin.trimEnd()}`);
@@ -39713,18 +39712,12 @@ async function runAnalysis(grovePath, inputs, refSpecs) {
     input: Buffer.from(stdin),
     listeners: {
       stdout: (data) => { stdout += data.toString(); },
-      stderr: (data) => { stderr += data.toString(); },
     },
-    silent: true,
+    ignoreReturnCode: true,
   });
 
   if (exitCode !== 0) {
-    error(`grove stderr:\n${stderr}`);
     throw new Error(`grove ci analyze failed with exit code ${exitCode}`);
-  }
-
-  if (stderr) {
-    warning(`grove stderr:\n${stderr}`);
   }
 
   const result = JSON.parse(stdout);
