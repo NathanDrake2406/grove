@@ -1,3 +1,4 @@
+// Diff computation utilities
 use crate::types::*;
 use std::collections::HashMap;
 use std::path::Path;
