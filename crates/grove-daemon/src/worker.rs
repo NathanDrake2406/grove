@@ -1,3 +1,4 @@
+// Background analysis worker
 use crate::state::{GroveConfig, StateMessage};
 use chrono::Utc;
 use grove_lib::graph::{ImportGraph, compute_dependency_overlaps};
