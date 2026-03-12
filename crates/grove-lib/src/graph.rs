@@ -2,6 +2,8 @@ use crate::types::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+const MAX_GRAPH_DEPTH: usize = 100;
+
 /// The canonical import graph for the base branch.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ImportGraph {
