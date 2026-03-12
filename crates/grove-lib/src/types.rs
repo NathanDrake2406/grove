@@ -1,3 +1,4 @@
+// Core domain types
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
