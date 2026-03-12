@@ -1,3 +1,4 @@
+// Diff computation and hunk analysis
 use crate::types::*;
 use std::collections::HashMap;
 use std::path::Path;
