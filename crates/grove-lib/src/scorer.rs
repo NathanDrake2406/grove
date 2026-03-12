@@ -4,6 +4,7 @@ use crate::types::*;
 use chrono::{DateTime, Utc};
 
 const HUNK_PROXIMITY_THRESHOLD: u32 = 5;
+const MAX_SYMBOL_DEPTH: u32 = 10;
 
 /// Compute symbol overlaps by comparing symbols_modified in files touched by both.
 ///
