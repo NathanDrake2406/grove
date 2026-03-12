@@ -39566,7 +39566,34 @@ function _unique(values) {
     return Array.from(new Set(values));
 }
 //# sourceMappingURL=tool-cache.js.map
+;// CONCATENATED MODULE: ./src/retry.js
+
+
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_BASE_DELAY_MS = 1000;
+const RETRYABLE_STATUS_CODES = new Set([403, 429, 500, 502, 503]);
+
+async function withRetry(fn, { maxRetries = DEFAULT_MAX_RETRIES, baseDelayMs = DEFAULT_BASE_DELAY_MS } = {}) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const status = error.status ?? error.response?.status;
+      if (!RETRYABLE_STATUS_CODES.has(status) || attempt === maxRetries) {
+        throw error;
+      }
+      const delay = baseDelayMs * Math.pow(2, attempt);
+      warning(`GitHub API returned ${status}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastError;
+}
+
 ;// CONCATENATED MODULE: ./src/install.js
+
 
 
 
@@ -39610,7 +39637,7 @@ async function resolveVersion(version) {
 
   const client = new lib_HttpClient("grove-action");
   const url = `https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/releases/latest`;
-  const response = await client.getJson(url);
+  const response = await withRetry(() => client.getJson(url));
 
   if (response.statusCode !== 200 || !response.result?.tag_name) {
     throw new Error(`Failed to resolve latest grove version (status ${response.statusCode})`);
@@ -39643,17 +39670,20 @@ function resolveTarget() {
 
 
 
+
 async function fetchPrRefs(octokit, repo, baseBranch, maxBranches) {
   info(`Listing open PRs targeting '${baseBranch}'`);
 
-  const prs = await octokit.paginate(octokit.rest.pulls.list, {
-    ...repo,
-    base: baseBranch,
-    state: "open",
-    sort: "updated",
-    direction: "desc",
-    per_page: 100,
-  });
+  const prs = await withRetry(() =>
+    octokit.paginate(octokit.rest.pulls.list, {
+      ...repo,
+      base: baseBranch,
+      state: "open",
+      sort: "updated",
+      direction: "desc",
+      per_page: 100,
+    }),
+  );
 
   const selected = prs.slice(0, maxBranches);
   info(`Found ${prs.length} open PRs, analyzing ${selected.length}`);
@@ -39780,6 +39810,12 @@ function formatPrComment(prNumber, prs, result) {
         `Analyzed against ${relevantPairs.length} open ${relevantPairs.length === 1 ? "PR" : "PRs"} — all clear.`,
       );
     }
+
+    // Show merge order warnings even for clean PRs
+    if (result.merge_order && result.merge_order.status !== "complete") {
+      lines.push(...formatMergeOrder(result.merge_order));
+    }
+
     return { body: lines.join("\n"), hasConflicts: false };
   }
 
@@ -40001,6 +40037,7 @@ function labelForPr(prs, prNumber) {
 
 
 
+
 async function postPrComment(octokit, repo, prNumber, prs, result, commentOnClean) {
   const { body, hasConflicts } = formatPrComment(prNumber, prs, result);
 
@@ -40014,27 +40051,33 @@ async function postPrComment(octokit, repo, prNumber, prs, result, commentOnClea
 
   if (existing) {
     info(`Updating existing comment ${existing.id} on PR #${prNumber}`);
-    await octokit.rest.issues.updateComment({
-      ...repo,
-      comment_id: existing.id,
-      body,
-    });
+    await withRetry(() =>
+      octokit.rest.issues.updateComment({
+        ...repo,
+        comment_id: existing.id,
+        body,
+      }),
+    );
   } else {
     info(`Posting new comment on PR #${prNumber}`);
-    await octokit.rest.issues.createComment({
-      ...repo,
-      issue_number: prNumber,
-      body,
-    });
+    await withRetry(() =>
+      octokit.rest.issues.createComment({
+        ...repo,
+        issue_number: prNumber,
+        body,
+      }),
+    );
   }
 }
 
 async function findExistingComment(octokit, repo, prNumber) {
-  const comments = await octokit.paginate(octokit.rest.issues.listComments, {
-    ...repo,
-    issue_number: prNumber,
-    per_page: 100,
-  });
+  const comments = await withRetry(() =>
+    octokit.paginate(octokit.rest.issues.listComments, {
+      ...repo,
+      issue_number: prNumber,
+      per_page: 100,
+    }),
+  );
 
   return comments.find((c) => c.body?.includes(MARKER));
 }
@@ -40043,10 +40086,12 @@ async function deleteExistingComment(octokit, repo, prNumber) {
   const existing = await findExistingComment(octokit, repo, prNumber);
   if (existing) {
     info(`Deleting stale grove comment ${existing.id} on PR #${prNumber}`);
-    await octokit.rest.issues.deleteComment({
-      ...repo,
-      comment_id: existing.id,
-    });
+    await withRetry(() =>
+      octokit.rest.issues.deleteComment({
+        ...repo,
+        comment_id: existing.id,
+      }),
+    );
   }
 }
 
@@ -40054,55 +40099,67 @@ async function deleteExistingComment(octokit, repo, prNumber) {
 
 
 
+
 const MATRIX_LABEL = "grove-ci-matrix";
 
 async function updateMatrixIssue(octokit, repo, result, baseBranch) {
   const body = formatMatrixBody(result, baseBranch);
-  const existing = await findMatrixIssue(octokit, repo);
+  const existing = await findMatrixIssue(octokit, repo, baseBranch);
 
   if (existing) {
     info(`Updating matrix issue #${existing.number}`);
-    await octokit.rest.issues.update({
-      ...repo,
-      issue_number: existing.number,
-      body,
-    });
+    await withRetry(() =>
+      octokit.rest.issues.update({
+        ...repo,
+        issue_number: existing.number,
+        body,
+      }),
+    );
   } else {
     info("Creating matrix tracking issue");
     await ensureLabelExists(octokit, repo);
-    const { data: issue } = await octokit.rest.issues.create({
-      ...repo,
-      title: `Grove Conflict Matrix — ${baseBranch}`,
-      body,
-      labels: [MATRIX_LABEL],
-    });
+    const { data: issue } = await withRetry(() =>
+      octokit.rest.issues.create({
+        ...repo,
+        title: `Grove Conflict Matrix — ${baseBranch}`,
+        body,
+        labels: [MATRIX_LABEL],
+      }),
+    );
     info(`Created matrix issue #${issue.number}`);
   }
 }
 
-async function findMatrixIssue(octokit, repo) {
-  const { data: issues } = await octokit.rest.issues.listForRepo({
-    ...repo,
-    labels: MATRIX_LABEL,
-    state: "open",
-    per_page: 1,
-    sort: "created",
-    direction: "desc",
-  });
-  return issues[0] ?? null;
+async function findMatrixIssue(octokit, repo, baseBranch) {
+  const { data: issues } = await withRetry(() =>
+    octokit.rest.issues.listForRepo({
+      ...repo,
+      labels: MATRIX_LABEL,
+      state: "open",
+      per_page: 100,
+      sort: "created",
+      direction: "desc",
+    }),
+  );
+  const title = `Grove Conflict Matrix — ${baseBranch}`;
+  return issues.find((issue) => issue.title === title) ?? null;
 }
 
 async function ensureLabelExists(octokit, repo) {
   try {
-    await octokit.rest.issues.getLabel({ ...repo, name: MATRIX_LABEL });
+    await withRetry(() => octokit.rest.issues.getLabel({ ...repo, name: MATRIX_LABEL }));
   } catch (error) {
     if (error.status === 404) {
-      await octokit.rest.issues.createLabel({
-        ...repo,
-        name: MATRIX_LABEL,
-        color: "0e8a16",
-        description: "Grove CI conflict matrix tracking issue",
-      });
+      await withRetry(() =>
+        octokit.rest.issues.createLabel({
+          ...repo,
+          name: MATRIX_LABEL,
+          color: "0e8a16",
+          description: "Grove CI conflict matrix tracking issue",
+        }),
+      );
+    } else {
+      throw error;
     }
   }
 }
