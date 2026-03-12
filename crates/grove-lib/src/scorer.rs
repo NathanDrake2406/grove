@@ -39,8 +39,8 @@ pub fn compute_symbol_overlaps(a: &WorkspaceChangeset, b: &WorkspaceChangeset) -
     overlaps
 }
 
-/// Run all analysis layers (except dependency, which requires the import graph).
-/// Returns the pair analysis with all overlaps and the maximum score.
+/// Build the pair analysis from locally-computed layers (file, hunk, symbol, schema)
+/// plus pre-computed dependency overlaps. Returns the combined result with the maximum score.
 pub fn score_pair(
     a: &WorkspaceChangeset,
     b: &WorkspaceChangeset,

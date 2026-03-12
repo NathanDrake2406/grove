@@ -148,8 +148,9 @@ impl GraphOverlay {
 }
 
 /// Compute dependency-level overlaps between two workspace changesets.
-/// This is the most expensive layer: it traces export signature changes
-/// through the import graph to find affected files in the other workspace.
+/// This is the most expensive layer: it traces export changes (additions,
+/// removals, and signature changes) through the import graph to find
+/// affected files in the other workspace.
 pub fn compute_dependency_overlaps(
     a_changeset: &WorkspaceChangeset,
     b_changeset: &WorkspaceChangeset,
