@@ -81,6 +81,7 @@ fn analyze_repository(
             args.base
         ))
     })?;
+    tracing::info!(base_ref = %args.base, oid = %base_oid.to_hex(), "resolved base ref");
     let disabled_layers: HashSet<AnalysisLayer> = args.disable_layer.iter().copied().collect();
     let namespace = repo.workspace_namespace();
     let registry = LanguageRegistry::with_defaults();
@@ -88,6 +89,7 @@ fn analyze_repository(
     let base_graph = if disabled_layers.contains(&AnalysisLayer::Dependency) {
         ImportGraph::new()
     } else {
+        tracing::info!(base_ref = %args.base, "building base import graph");
         build_base_graph(repo, &args.base)?
     };
     let base_graph = Arc::new(base_graph);
@@ -115,6 +117,7 @@ fn analyze_repository(
             let left = &targets[index_a];
             let right = &targets[index_b];
 
+            tracing::info!(a = %left.label, b = %right.label, "starting pair analysis");
             let execution = if should_force_timeout(&left.ref_name, &right.ref_name) {
                 PairExecution::TimedOut
             } else {
@@ -129,10 +132,23 @@ fn analyze_repository(
 
             match execution {
                 PairExecution::Completed(analysis) => {
+                    tracing::info!(a = %left.label, b = %right.label, score = %format_score(analysis.score), "pair analysis complete");
                     pair_outputs.push(CiPairDto::from_analysis(&analysis, &label_by_id)?);
                     successful_analyses.push(analysis);
                 }
                 PairExecution::TimedOut => {
+                    tracing::warn!(a = %left.label, b = %right.label, "pair analysis timed out");
+                    pair_outputs.push(CiPairDto::timed_out(
+                        left.label.clone(),
+                        right.label.clone(),
+                    ));
+                    incomplete_pairs.push(CiIncompletePairDto {
+                        a: left.label.clone(),
+                        b: right.label.clone(),
+                    });
+                }
+                PairExecution::Panicked => {
+                    tracing::error!(a = %left.label, b = %right.label, "analysis thread panicked");
                     pair_outputs.push(CiPairDto::timed_out(
                         left.label.clone(),
                         right.label.clone(),
@@ -145,6 +161,13 @@ fn analyze_repository(
             }
         }
     }
+
+    tracing::info!(
+        pairs = pair_outputs.len(),
+        refs = targets.len(),
+        skipped = skipped.len(),
+        "analysis complete"
+    );
 
     let merge_order = build_merge_order_output(&targets, &successful_analyses, &incomplete_pairs);
 
@@ -251,10 +274,11 @@ fn prepare_target(
     let ref_oid = match repo.resolve_oid(&ref_spec.ref_name) {
         Ok(oid) => oid,
         Err(_) => {
+            tracing::warn!(r#ref = %ref_spec.ref_name, reason = "ref not found", "skipping ref");
             return Ok(PreparedTarget::Skipped(CiSkippedRefDto {
                 r#ref: ref_spec.ref_name,
                 label: ref_spec.label,
-                reason: "ref not found".to_string(),
+                reason: SkipReason::RefNotFound,
             }));
         }
     };
@@ -266,10 +290,11 @@ fn prepare_target(
         ))
     })?;
     if merge_base == ref_oid {
+        tracing::warn!(r#ref = %ref_spec.ref_name, reason = "no diff against base", "skipping ref");
         return Ok(PreparedTarget::Skipped(CiSkippedRefDto {
             r#ref: ref_spec.ref_name,
             label: ref_spec.label,
-            reason: "no diff against base".to_string(),
+            reason: SkipReason::NoDiffAgainstBase,
         }));
     }
 
@@ -283,13 +308,15 @@ fn prepare_target(
     )?;
 
     if changeset.changed_files.is_empty() {
+        tracing::warn!(r#ref = %ref_spec.ref_name, reason = "no diff against base", "skipping ref");
         return Ok(PreparedTarget::Skipped(CiSkippedRefDto {
             r#ref: ref_spec.ref_name,
             label: ref_spec.label,
-            reason: "no diff against base".to_string(),
+            reason: SkipReason::NoDiffAgainstBase,
         }));
     }
 
+    tracing::info!(r#ref = %ref_spec.ref_name, label = %ref_spec.label, "target prepared");
     Ok(PreparedTarget::Ready(AnalysisTarget {
         ref_name: ref_spec.ref_name,
         label: ref_spec.label,
@@ -393,17 +420,23 @@ fn analyze_pair_with_timeout(
 
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let analysis = analyze_pair(
-            changes_a.as_ref(),
-            changes_b.as_ref(),
-            base_graph.as_ref(),
-            &disabled_layers,
-        );
-        let _ = sender.send(analysis);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            analyze_pair(
+                changes_a.as_ref(),
+                changes_b.as_ref(),
+                base_graph.as_ref(),
+                &disabled_layers,
+            )
+        }));
+        let _ = sender.send(result);
     });
 
     match receiver.recv_timeout(timeout_duration) {
-        Ok(analysis) => PairExecution::Completed(analysis),
+        Ok(Ok(analysis)) => PairExecution::Completed(analysis),
+        Ok(Err(_panic)) => {
+            tracing::error!("analysis thread panicked or disconnected unexpectedly");
+            PairExecution::Panicked
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => PairExecution::TimedOut,
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => PairExecution::TimedOut,
     }
@@ -585,6 +618,7 @@ enum PreparedTarget {
 enum PairExecution {
     Completed(grove_lib::WorkspacePairAnalysis),
     TimedOut,
+    Panicked,
 }
 
 #[derive(Debug)]
@@ -1056,12 +1090,19 @@ enum MergeOrderStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SkipReason {
+    RefNotFound,
+    NoDiffAgainstBase,
+}
+
 #[derive(Debug, Serialize)]
 struct CiSkippedRefDto {
     #[serde(rename = "ref")]
     r#ref: String,
     label: String,
-    reason: String,
+    reason: SkipReason,
 }
 
 fn is_false(value: &bool) -> bool {
