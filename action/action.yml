@@ -1,0 +1,35 @@
+name: "Grove PR Conflict Checker"
+description: "Cross-PR conflict intelligence — detects symbol-level and dependency-level collisions between open pull requests"
+author: "NathanDrake2406"
+
+branding:
+  icon: "git-merge"
+  color: "green"
+
+inputs:
+  github-token:
+    description: "GitHub token for API access"
+    default: "${{ github.token }}"
+    required: true
+  base-branch:
+    description: "Base branch to analyze against"
+    default: "main"
+  disable-layers:
+    description: "Comma-separated layers to disable (e.g. 'dependency,schema')"
+    default: ""
+  comment-on-clean:
+    description: "Post a comment when no conflicts are found"
+    default: "false"
+  grove-version:
+    description: "Grove version to install (tag from GitHub Releases, e.g. 'v0.4.0')"
+    default: "latest"
+  max-branches:
+    description: "Maximum number of PR branches to analyze (most recently updated first)"
+    default: "50"
+  timeout:
+    description: "Per-pair analysis timeout in seconds"
+    default: "30"
+
+runs:
+  using: "node20"
+  main: "dist/index.js"
