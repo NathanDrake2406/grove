@@ -16,6 +16,9 @@ export async function fetchPrRefs(octokit, repo, baseBranch, maxBranches) {
   const selected = prs.slice(0, maxBranches);
   core.info(`Found ${prs.length} open PRs, analyzing ${selected.length}`);
 
+  core.info(`Fetching base branch '${baseBranch}'`);
+  await exec.exec("git", ["fetch", "origin", `refs/heads/${baseBranch}:refs/heads/${baseBranch}`]);
+
   const fetched = [];
   for (const pr of selected) {
     const localRef = `refs/remotes/origin/pr/${pr.number}`;
