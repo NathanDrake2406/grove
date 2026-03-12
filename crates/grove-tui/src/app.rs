@@ -1,3 +1,4 @@
+// TUI application state
 use crossterm::event::{KeyCode, KeyEvent};
 use grove_cli::client::DaemonClient;
 use grove_lib::{OrthogonalityScore, Workspace, WorkspacePairAnalysis};
