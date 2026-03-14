@@ -85,6 +85,82 @@ gr conflicts feat/auth feat/payments
 
 All read commands accept `--json` for machine-readable output.
 
+## GitHub Action
+
+Grove ships a GitHub Action that checks for conflicts between open PRs on every push. It fetches all open PRs targeting your base branch, runs pairwise analysis, and posts a comment on the triggering PR with any conflicts found.
+
+### Basic setup
+
+```yaml
+# .github/workflows/grove.yml
+name: Grove Conflict Check
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  conflicts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: NathanDrake2406/grove@main
+```
+
+When conflicts are detected, Grove posts a comment on the PR:
+
+| PR | Severity | Overlaps |
+|:---|:---------|:---------|
+| #42 (feat/payments) | :red_circle: Conflict | 2 symbol, 1 hunk |
+| #38 (feat/auth) | :yellow_circle: Caution | 3 file |
+
+With expandable details showing exactly which symbols, hunks, or dependencies collide.
+
+### Scheduled matrix
+
+You can also run Grove on a schedule to maintain a conflict matrix issue that tracks all PR-vs-PR conflicts:
+
+```yaml
+name: Grove Conflict Matrix
+on:
+  schedule:
+    - cron: "0 */6 * * *"  # every 6 hours
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+
+jobs:
+  matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: NathanDrake2406/grove@main
+```
+
+This creates (or updates) a single issue titled "Grove Conflict Matrix" with a table of all conflicting PR pairs and a suggested merge order.
+
+### Inputs
+
+| Input | Default | Description |
+|-------|---------|-------------|
+| `github-token` | `${{ github.token }}` | GitHub token for API access |
+| `base-branch` | `main` | Base branch to analyze against |
+| `grove-version` | `latest` | Grove version to install (e.g. `v0.4.0`) |
+| `max-branches` | `50` | Max PR branches to analyze (most recently updated first) |
+| `timeout` | `30` | Per-pair analysis timeout in seconds |
+| `disable-layers` | | Comma-separated layers to skip (e.g. `dependency,schema`) |
+| `comment-on-clean` | `false` | Post a comment even when no conflicts are found |
+
 ## Claude Code hook
 
 Grove integrates with [Claude Code](https://docs.anthropic.com/en/docs/claude-code) via a post-tool hook that runs `grove check` after every file edit. When a conflict is detected, Claude sees the warning in its tool output and can course-correct before the problem compounds.
