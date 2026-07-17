@@ -1,14 +1,14 @@
 # Grove
 
-Cross-worktree conflict intelligence for git. Detects file, hunk, symbol, dependency, and schema overlaps between parallel workstreams before merge time.
+Cross-worktree conflict intelligence for git. Detects file, hunk, symbol, dependency, and schema overlaps between parallel branches before merge time.
 
-Grove watches your git worktrees, continuously analyzes pairwise overlaps, and tells you which branches will conflict before you attempt to merge. Perfect for your multi-agents working in parallel worktrees ;)
+Grove watches your git worktrees, continuously analyzes pairwise overlaps, and tells you which branches will conflict before you merge. Perfect for your multi-agents working in parallel worktrees ;)
 
 ![Grove TUI dashboard](assets/demo.png)
 
 ## Why
 
-When multiple people (or agents) work in parallel branches, merge conflicts are discovered too late, at merge time. Grove shifts conflict detection left by analyzing worktree diffs against a shared base and scoring how likely they are to collide. You can setup your agents to check this automatically.
+When multiple people (or agents) work in parallel branches, you find out about merge conflicts at merge time, which is too late. Grove diffs each worktree against a shared base and scores how likely two of them are to collide. You can set up your agents to check this automatically.
 
 Five overlap layers, from coarse to precise:
 
@@ -52,22 +52,6 @@ grove conflicts feat/auth feat/payments         # compare two branches
 grove conflicts feat/auth feat/payments --json  # machine-readable
 ```
 
-## Shell integration
-
-Grove provides a `gr` shell wrapper that adds `gr switch` for quick worktree navigation:
-
-```sh
-# Add to your shell profile
-eval "$(grove init zsh)"    # or bash, fish
-
-# Switch to a worktree (cd's into it)
-gr switch feat/auth
-
-# Everything else passes through to grove
-gr status
-gr conflicts feat/auth feat/payments
-```
-
 ## Commands
 
 | Command | Description |
@@ -81,13 +65,13 @@ gr conflicts feat/auth feat/payments
 | `grove daemon stop` | Stop the daemon |
 | `grove daemon status` | Daemon health check |
 | `grove check` | Exit 0 if clean, exit 1 with conflict one-liners on stderr |
-| `grove init <shell>` | Emit shell integration (`zsh`, `bash`, `fish`) |
+| `grove ci analyze <refs...>` | Daemonless pairwise analysis of git refs, JSON on stdout (what the GitHub Action runs) |
 
 All read commands accept `--json` for machine-readable output.
 
 ## GitHub Action
 
-Grove ships a GitHub Action that checks for conflicts between open PRs on every push. It fetches all open PRs targeting your base branch, runs pairwise analysis, and posts a comment on the triggering PR with any conflicts found.
+Grove ships a GitHub Action that checks for conflicts between open PRs. It fetches all open PRs targeting your base branch, runs pairwise analysis, and posts a comment on the triggering PR with any conflicts found.
 
 ### Basic setup
 
@@ -109,7 +93,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: NathanDrake2406/grove@main
+      - uses: NathanDrake2406/grove/action@main
 ```
 
 When conflicts are detected, Grove posts a comment on the PR:
@@ -119,7 +103,7 @@ When conflicts are detected, Grove posts a comment on the PR:
 | #42 (feat/payments) | :red_circle: Conflict | 2 symbol, 1 hunk |
 | #38 (feat/auth) | :yellow_circle: Caution | 3 file |
 
-With expandable details showing exactly which symbols, hunks, or dependencies collide.
+Each pair gets an expandable section listing exactly which symbols, hunks, or dependencies collide.
 
 ### Scheduled matrix
 
@@ -144,10 +128,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: NathanDrake2406/grove@main
+      - uses: NathanDrake2406/grove/action@main
 ```
 
-This creates (or updates) a single issue titled "Grove Conflict Matrix" with a table of all conflicting PR pairs and a suggested merge order.
+This creates (or updates) a single issue titled "Grove Conflict Matrix — main" with a table of all conflicting PR pairs and a suggested merge order.
 
 ### Inputs
 
@@ -312,7 +296,7 @@ Block until all in-flight analyses finish (or timeout) instead of polling:
 
 `in_flight == 0` means all analyses are complete.
 
-## Performance
+## Testing
 
 93% test coverage across the workspace. The daemon is stress-tested against adversarial conditions:
 
@@ -321,7 +305,7 @@ Block until all in-flight analyses finish (or timeout) instead of polling:
 - **Adversarial input**: 22 malformed NDJSON protocol variants (binary garbage, truncated JSON, deeply nested objects, null bytes, 10,000-character method strings). NDJSON boundary testing at 1 MiB. 200-connection rapid connect/disconnect waves. Slowloris attack simulation across 20 simultaneous connections. Circuit breaker trip via 400-file creation storm.
 - **Scoring invariants**: Scales from 5 to 15 worktrees with overlapping modifications. All C(N,2) pairs complete within timeout, no Green scores with overlaps (monotonicity), all non-Green pairs have non-empty overlap lists.
 
-### Key defaults
+## Key defaults
 
 | Parameter | Default |
 |-----------|---------|
